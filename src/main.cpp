@@ -15,6 +15,7 @@
 #include <Wire.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #if __has_include("wifi_secret.h")
   #include "wifi_secret.h"
 #else
@@ -87,6 +88,10 @@ static bool gt911Found = false;
 static uint8_t currentPage = 0;
 static bool touchSeen = false;
 static char g_ipStr[20] = "---";   // IP-Adresse fuers Menue
+static int  g_dialScalePct = 100;  // Zifferblatt-Groesse in % (50..100)
+static bool g_redrawClock = false; // Flag: Uhr neu zeichnen (z.B. nach Web-Aenderung)
+static WebServer webServer(80);
+static void startWebServer();   // Forward-Deklaration (Definition vor setup())
 
 // Build-Zeit-Fallbacks falls inject_time.py nicht lief
 #ifndef RTC_BUILD_Y
@@ -209,10 +214,15 @@ static bool wifiNtpTick() {
 
   // Verbunden -> IP merken
   static char lastIp[20] = "";
+  static bool webStarted = false;
   snprintf(g_ipStr, sizeof(g_ipStr), "%s", WiFi.localIP().toString().c_str());
   if (strcmp(lastIp, g_ipStr) != 0) {
     strcpy(lastIp, g_ipStr);
     Serial.printf("WiFi verbunden, IP: %s\n", g_ipStr);
+  }
+  if (!webStarted) {
+    startWebServer();
+    webStarted = true;
   }
 
   if (!sntpStarted) {
@@ -630,12 +640,35 @@ static void presentFrame() {
   }
 }
 
+// Zifferblatt in den Frame kopieren, skaliert auf g_dialScalePct % und
+// zentriert auf schwarzem Grund (Nearest-Neighbor). Bei 100% = 1:1.
 static void copyVdoDialToFrame() {
   if (!ensureFrame()) {
     return;
   }
-  for (int i = 0; i < 480 * 480; i++) {
-    nativeFrame[i] = pgm_read_word(&VDO_DIAL_480_RGB565[i]);
+  int pct = g_dialScalePct;
+  if (pct < 30) pct = 30;
+  if (pct > 100) pct = 100;
+
+  if (pct == 100) {
+    for (int i = 0; i < 480 * 480; i++) {
+      nativeFrame[i] = pgm_read_word(&VDO_DIAL_480_RGB565[i]);
+    }
+    return;
+  }
+
+  // Hintergrund schwarz, dann skaliertes Zifferblatt zentriert einsetzen.
+  for (int i = 0; i < 480 * 480; i++) nativeFrame[i] = RGB565_BLACK;
+  int outSize = (480 * pct) / 100;
+  int offset = (480 - outSize) / 2;
+  for (int oy = 0; oy < outSize; oy++) {
+    int sy = (oy * 480) / outSize;
+    int dstRow = (offset + oy) * 480 + offset;
+    int srcRow = sy * 480;
+    for (int ox = 0; ox < outSize; ox++) {
+      int sx = (ox * 480) / outSize;
+      nativeFrame[dstRow + ox] = pgm_read_word(&VDO_DIAL_480_RGB565[srcRow + sx]);
+    }
   }
 }
 
@@ -877,16 +910,23 @@ static void drawVdoClock() {
   float minuteValue = now.tm_min + seconds / 60.0f;
   float hourValue = (now.tm_hour % 12) + minuteValue / 60.0f;
 
-  drawHand(hourValue, 12.0f, 118, 18, RGB565(24, 24, 22));
-  drawHand(hourValue, 12.0f, 118, 13, RGB565(222, 222, 214));
-  drawHand(minuteValue, 60.0f, 172, 15, RGB565(24, 24, 22));
-  drawHand(minuteValue, 60.0f, 172, 10, RGB565(226, 226, 218));
-  drawHand(seconds, 60.0f, 188, 4, RGB565(235, 24, 20));
+  // Zeiger + Nabe mit dem Zifferblatt mitskalieren
+  float s = g_dialScalePct / 100.0f;
+  if (s < 0.30f) s = 0.30f;
+  if (s > 1.0f) s = 1.0f;
+  #define SC(v) ((int)((v) * s + 0.5f))
 
-  fillCircleFast(240, 240, 26, RGB565(205, 205, 198));
-  fillCircleFast(240, 240, 15, RGB565(166, 122, 42));
-  fillCircleFast(240, 240, 9, RGB565(38, 30, 18));
-  fillCircleFast(240, 240, 5, RGB565_BLACK);
+  drawHand(hourValue, 12.0f, SC(118), SC(18), RGB565(24, 24, 22));
+  drawHand(hourValue, 12.0f, SC(118), SC(13), RGB565(222, 222, 214));
+  drawHand(minuteValue, 60.0f, SC(172), SC(15), RGB565(24, 24, 22));
+  drawHand(minuteValue, 60.0f, SC(172), SC(10), RGB565(226, 226, 218));
+  drawHand(seconds, 60.0f, SC(188), SC(4), RGB565(235, 24, 20));
+
+  fillCircleFast(240, 240, SC(26), RGB565(205, 205, 198));
+  fillCircleFast(240, 240, SC(15), RGB565(166, 122, 42));
+  fillCircleFast(240, 240, SC(9), RGB565(38, 30, 18));
+  fillCircleFast(240, 240, SC(5), RGB565_BLACK);
+  #undef SC
   presentFrame();
 }
 
@@ -917,6 +957,76 @@ static void drawMenuOverview() {
   drawTextCentered(240, 404, ipLine, RGB565(150, 200, 150), 2);
 
   presentFrame();
+}
+
+// -------- Einstellungen (Preferences) --------
+static void loadSettings() {
+  Preferences p;
+  p.begin("clock", true);
+  g_dialScalePct = p.getInt("scale", 100);
+  p.end();
+  if (g_dialScalePct < 30) g_dialScalePct = 30;
+  if (g_dialScalePct > 100) g_dialScalePct = 100;
+}
+
+static void saveDialScale(int pct) {
+  if (pct < 30) pct = 30;
+  if (pct > 100) pct = 100;
+  g_dialScalePct = pct;
+  Preferences p;
+  p.begin("clock", false);
+  p.putInt("scale", pct);
+  p.end();
+}
+
+// -------- Web-GUI --------
+static void handleWebRoot() {
+  struct tm now = {};
+  readClockTime(&now);
+  char timeStr[16];
+  snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
+
+  String html = F("<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>VDO Uhr</title><style>"
+    "body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:20px;text-align:center}"
+    "h1{color:#e0c040;font-weight:600}.card{background:#1c1c1c;border-radius:12px;padding:18px;margin:14px auto;max-width:420px}"
+    ".big{font-size:2.2em;letter-spacing:2px}input[type=range]{width:90%}"
+    "button{background:#e0c040;border:0;border-radius:8px;padding:12px 20px;font-size:1em;margin:6px;cursor:pointer}"
+    "a{color:#8cf}.val{font-size:1.6em;color:#e0c040}</style></head><body>");
+  html += F("<h1>VDO Quartz-Zeit</h1>");
+  html += "<div class='card'><div class='big'>" + String(timeStr) + "</div>";
+  html += "<div>IP " + String(g_ipStr) + "</div></div>";
+  html += F("<div class='card'><h3>Zifferblatt-Gr&ouml;&szlig;e</h3>"
+    "<form action='/set' method='get'>"
+    "<div class='val'><span id='v'>");
+  html += String(g_dialScalePct);
+  html += F("</span>%</div>"
+    "<input type='range' name='scale' min='30' max='100' step='1' value='");
+  html += String(g_dialScalePct);
+  html += F("' oninput=\"document.getElementById('v').innerText=this.value\">"
+    "<br><button type='submit'>&Uuml;bernehmen</button></form>"
+    "<div><a href='/set?scale=100'>100%</a> &middot; <a href='/set?scale=90'>90%</a> &middot; "
+    "<a href='/set?scale=80'>80%</a> &middot; <a href='/set?scale=70'>70%</a></div></div>");
+  html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p></body></html>");
+  webServer.send(200, "text/html", html);
+}
+
+static void handleWebSet() {
+  if (webServer.hasArg("scale")) {
+    saveDialScale(webServer.arg("scale").toInt());
+    g_redrawClock = true;
+    Serial.printf("Web: Zifferblatt-Groesse = %d%%\n", g_dialScalePct);
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+static void startWebServer() {
+  webServer.on("/", handleWebRoot);
+  webServer.on("/set", handleWebSet);
+  webServer.begin();
+  Serial.println("WebGUI: gestartet auf Port 80");
 }
 
 void setup() {
@@ -959,6 +1069,7 @@ void setup() {
   Serial.println("Display: native panel OK");
 
   gt911Init();
+  loadSettings();
   initTimeSource();
 
   // Backlight an
@@ -1003,6 +1114,17 @@ void loop() {
   // WiFi/NTP im Hintergrund (nicht-blockierend). Bei frischem Sync Uhr neu.
   if (wifiNtpTick() && currentPage == 0) {
     drawVdoClock();
+  }
+
+  // Web-GUI bedienen
+  if (WiFi.status() == WL_CONNECTED) {
+    webServer.handleClient();
+  }
+
+  // Neuzeichnen nach Web-Aenderung (z.B. Zifferblatt-Groesse)
+  if (g_redrawClock) {
+    g_redrawClock = false;
+    if (currentPage == 0) drawVdoClock();
   }
 
   if (currentPage == 0 && millis() - lastClockDraw >= 1000) {
