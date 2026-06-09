@@ -1206,7 +1206,7 @@ void loop() {
 #if FEATURE_TOUCH
   const uint32_t nowMs = millis();
   const bool touchFrame = readTouch(&x, &y);
-  const bool touchHeld = touchActive && currentPage == 5 && digitalRead(PIN_TOUCH_INT) == LOW;
+  const bool touchHeld = touchActive && (nowMs - touchLastSeenMs < 200);
   const bool touchNow = touchFrame || touchHeld;
   if (touchNow) {
     touchSeen = true;
