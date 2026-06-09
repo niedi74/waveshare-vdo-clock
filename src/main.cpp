@@ -14,11 +14,24 @@
   #define WIFI_PASSWORD ""
 #endif
 #include "hal_waveshare_28c.h"
+#include "qmi8658_imu.h"
 #include "vdo_dial_480_rgb565.h"
 #include <sys/time.h>
 #include <time.h>
 
 #define FEATURE_TOUCH 1
+
+// #region agent log
+static void agentDbgLog(const char *hypothesisId, const char *location, const char *message,
+                        uint32_t a = 0, uint32_t b = 0, uint32_t c = 0, uint32_t d = 0) {
+  Serial.printf("{\"sessionId\":\"bd0449\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
+                "\"message\":\"%s\",\"data\":{\"a\":%lu,\"b\":%lu,\"c\":%lu,\"d\":%lu},"
+                "\"timestamp\":%lu,\"runId\":\"pre-fix\"}\n",
+                hypothesisId, location, message,
+                (unsigned long)a, (unsigned long)b, (unsigned long)c, (unsigned long)d,
+                (unsigned long)millis());
+}
+// #endregion
 
 // ---- Touch / I2C ----
 #define PIN_TOUCH_INT      16
@@ -76,6 +89,7 @@ static float     g_rotSin       = 0.0f;
 static float     g_rotCos       = 1.0f;
 static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
+static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
 static bool      g_webStarted   = false;
 static bool      g_redrawPage   = false;
 static uint8_t   g_wifiProfile  = 0;
@@ -426,18 +440,42 @@ static bool gt911Probe() {
 static void gt911Init() {
   Serial.println("GT911: reset/probe INT low");
   gt911ResetAddressMode(false);
-  if (gt911Probe()) return;
+  if (gt911Probe()) {
+    // #region agent log
+    agentDbgLog("H1", "main.cpp:gt911Init", "probe_ok_int_low", gt911Found, gt911Addr, 0, 0);
+    // #endregion
+    return;
+  }
   Serial.println("GT911: reset/probe INT high");
   gt911ResetAddressMode(true);
-  if (gt911Probe()) return;
+  if (gt911Probe()) {
+    // #region agent log
+    agentDbgLog("H1", "main.cpp:gt911Init", "probe_ok_int_high", gt911Found, gt911Addr, 0, 0);
+    // #endregion
+    return;
+  }
   Serial.println("GT911: not found on 0x5D/0x14");
+  // #region agent log
+  agentDbgLog("H1", "main.cpp:gt911Init", "probe_fail", 0, 0, 0, 0);
+  // #endregion
 }
 
 static bool readTouch(uint16_t *x, uint16_t *y) {
+  static uint8_t s_lastFailReason = 0;
+  static uint32_t s_failLogAt = 0;
   uint8_t status = 0;
   if (!i2cRegRead16(gt911Addr, GT911_READ_XY, &status, 1)) {
     uint8_t other = (gt911Addr == GT911_ADDR_PRIMARY) ? GT911_ADDR_ALT : GT911_ADDR_PRIMARY;
-    if (!i2cRegRead16(other, GT911_READ_XY, &status, 1)) return false;
+    if (!i2cRegRead16(other, GT911_READ_XY, &status, 1)) {
+      // #region agent log
+      if (s_lastFailReason != 1 || millis() - s_failLogAt > 2000) {
+        s_lastFailReason = 1;
+        s_failLogAt = millis();
+        agentDbgLog("H2", "main.cpp:readTouch", "i2c_both_addr_fail", gt911Addr, other, 0, 0);
+      }
+      // #endregion
+      return false;
+    }
     gt911Addr  = other;
     gt911Found = true;
   }
@@ -451,12 +489,24 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
   uint8_t points = status & 0x0F;
   if (points == 0 || points > 5) {
     i2cRegWrite16(gt911Addr, GT911_READ_XY, &clear, 1);
+    // #region agent log
+    if (s_lastFailReason != 3 || millis() - s_failLogAt > 2000) {
+      s_lastFailReason = 3;
+      s_failLogAt = millis();
+      agentDbgLog("H2", "main.cpp:readTouch", "bad_points", status, points, gt911Addr, 0);
+    }
+    // #endregion
     return false;
   }
   uint8_t point[8] = {0};
   bool ok = i2cRegRead16(gt911Addr, GT911_READ_XY + 1, point, sizeof(point));
   i2cRegWrite16(gt911Addr, GT911_READ_XY, &clear, 1);
-  if (!ok) return false;
+  if (!ok) {
+    // #region agent log
+    agentDbgLog("H2", "main.cpp:readTouch", "point_read_fail", status, gt911Addr, 0, 0);
+    // #endregion
+    return false;
+  }
   // GT911 ab 0x814F: [TrackID, X-low, X-high, Y-low, Y-high, Size-low, ...]
   // -> X = point[1]|point[2]<<8, Y = point[3]|point[4]<<8 (war um 1 Byte verschoben)
   uint16_t rawX = (uint16_t)point[1] | ((uint16_t)point[2] << 8);
@@ -477,6 +527,9 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
   g_lastTouchX  = *x;
   g_lastTouchY  = *y;
   g_lastTouchMs = millis();
+  // #region agent log
+  agentDbgLog("H4", "main.cpp:readTouch", "touch_hit", *x, *y, status, points);
+  // #endregion
   return true;
 }
 
@@ -725,25 +778,26 @@ static void drawMenuTile(int x, int y, int w, int h, const char *label, uint16_t
 // Zone 0 (UHR)=108..168, Zone 1 (MOTOR)=168..228, Zone 2 (LAMBDA)=228..288,
 // Zone 3 (HUB)=288..348, Zone 4 (SETUP)=348..408.
 // Tiles are drawn 2px inset so the visual tile exactly fills its touch zone.
-#define MENU_ZONE_Y0  108
-#define MENU_ZONE_H    60
+#define MENU_ZONE_Y0  100
+#define MENU_ZONE_H    50    // 6 Tiles a 50px
 
 static void drawMenuOverview() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(80, 80, 75));
-  drawTextCentered(240, 50, "MENU", RGB565(235, 235, 225), 7);
-  // Tiles inset 2px from zone boundary so visual == touchable area
+  drawTextCentered(240, 50, "MENU", RGB565(235, 235, 225), 6);
+  // 6 Tiles, inset 2px from zone boundary so visual == touchable area
   drawMenuTile(88, MENU_ZONE_Y0 +   0 + 2, 304, MENU_ZONE_H - 4, "UHR",    RGB565(200, 40,  35));
-  drawMenuTile(88, MENU_ZONE_Y0 +  60 + 2, 304, MENU_ZONE_H - 4, "MOTOR",  RGB565(40,  150, 210));
-  drawMenuTile(88, MENU_ZONE_Y0 + 120 + 2, 304, MENU_ZONE_H - 4, "LAMBDA", RGB565(60,  185, 90));
-  drawMenuTile(88, MENU_ZONE_Y0 + 180 + 2, 304, MENU_ZONE_H - 4, "HUB",    RGB565(190, 90,  210));
-  drawMenuTile(88, MENU_ZONE_Y0 + 240 + 2, 304, MENU_ZONE_H - 4, "SETUP",  RGB565(210, 170, 45));
+  drawMenuTile(88, MENU_ZONE_Y0 +  50 + 2, 304, MENU_ZONE_H - 4, "MOTOR",  RGB565(40,  150, 210));
+  drawMenuTile(88, MENU_ZONE_Y0 + 100 + 2, 304, MENU_ZONE_H - 4, "LAMBDA", RGB565(60,  185, 90));
+  drawMenuTile(88, MENU_ZONE_Y0 + 150 + 2, 304, MENU_ZONE_H - 4, "HUB",    RGB565(190, 90,  210));
+  drawMenuTile(88, MENU_ZONE_Y0 + 200 + 2, 304, MENU_ZONE_H - 4, "IMU",    RGB565(200, 100, 50));
+  drawMenuTile(88, MENU_ZONE_Y0 + 250 + 2, 304, MENU_ZONE_H - 4, "SETUP",  RGB565(210, 170, 45));
   char ipLine[32];
   snprintf(ipLine, sizeof(ipLine), "IP %s", g_ipStr);
-  drawTextCentered(240, 420, ipLine, RGB565(150, 200, 150), 2);
+  drawTextCentered(240, 424, ipLine, RGB565(150, 200, 150), 2);
   if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
-    drawTextCentered(240, 444, currentWifiSsid(), RGB565(120, 150, 150), 2);
+    drawTextCentered(240, 446, currentWifiSsid(), RGB565(120, 150, 150), 2);
   }
   presentFrame();
 }
@@ -837,22 +891,56 @@ static void drawSetupPage() {
   drawTextCentered(240, 54, "SETUP", RGB565(230, 190, 70), 5);
   char buf[28];
   snprintf(buf, sizeof(buf), "%d %%", g_dialScalePct);
-  drawDataRow(112, "UHR",   buf, RGB565(235, 235, 225));
+  drawDataRow(110, "UHR",   buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d %%", g_brightnessPct);
-  drawDataRow(152, "HELL",  buf, RGB565(235, 235, 225));
+  drawDataRow(146, "HELL",  buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d DEG", g_rotationDeg);
-  drawDataRow(192, "ROT",   buf, RGB565(235, 235, 225));
+  drawDataRow(182, "ROT",   buf, RGB565(235, 235, 225));
   if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
     snprintf(buf, sizeof(buf), "%s", currentWifiSsid());
-    drawDataRow(232, "WIFI", buf,
+    drawDataRow(218, "WIFI", buf,
                 WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   } else {
-    drawDataRow(232, "WIFI", "AUS", RGB565(220, 130, 50));
+    drawDataRow(218, "WIFI", "AUS", RGB565(220, 130, 50));
   }
-  drawDataRow(272, "BLE",   g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
+  drawDataRow(254, "BLE",    g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
               g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawDataRow(312, "HUB",   g_bleHubName.c_str(), RGB565(150, 150, 150));
-  drawTextCentered(240, 370, "TIP MENU", RGB565(180, 180, 170), 2);
+  drawDataRow(290, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
+              g_featureBuzzer ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
+  drawDataRow(326, "HUB",    g_bleHubName.c_str(), RGB565(150, 150, 150));
+  drawTextCentered(240, 372, "TIP MENU", RGB565(180, 180, 170), 2);
+  presentFrame();
+}
+
+static void drawImuPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(200, 100, 50));
+  drawTextCentered(240, 52, "IMU", RGB565(220, 130, 60), 5);
+
+  char buf[16];
+  if (g_imuPresent) {
+    snprintf(buf, sizeof(buf), "%.1f", g_imuPitch);
+    drawDataRow(112, "PITCH", buf, RGB565(235, 235, 225));
+    snprintf(buf, sizeof(buf), "%.1f", g_imuRoll);
+    drawDataRow(152, "ROLL", buf, RGB565(235, 235, 225));
+    snprintf(buf, sizeof(buf), "%.2fg", g_imuGForce);
+    drawDataRow(192, "G-FORCE", buf, RGB565(235, 235, 225));
+
+    static bool buzzerOn = false;
+    const bool wantBuzz = g_featureBuzzer && qmi8658ShakeDetected(1.5f);
+    if (qmi8658ShakeDetected(1.5f)) {
+      drawTextCentered(240, 250, "SHAKE!", RGB565(255, 50, 50), 4);
+    } else {
+      drawTextCentered(240, 250, "OK", RGB565(60, 200, 90), 4);
+    }
+    if (wantBuzz != buzzerOn) {   // nur bei Zustandswechsel schalten
+      buzzerOn = wantBuzz;
+      hal_buzzer(buzzerOn);
+    }
+  } else {
+    drawTextCentered(240, 200, "KEIN IMU", RGB565(200, 60, 60), 4);
+  }
   presentFrame();
 }
 
@@ -863,6 +951,7 @@ static void drawCurrentPage() {
   else if (currentPage == 3) drawLambdaPage();
   else if (currentPage == 4) drawHubPage();
   else if (currentPage == 5) drawSetupPage();
+  else if (currentPage == 6) drawImuPage();
 }
 
 // -------- Preferences --------
@@ -876,6 +965,7 @@ static void loadSettings() {
   if (g_wifiProfile >= wifiProfileCount()) g_wifiProfile = 0;
   g_featureWifi   = p.getBool("feat_wifi", strlen(currentWifiSsid()) > 0);
   g_featureBle    = p.getBool("feat_ble",  false);
+  g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
   p.end();
   if (g_dialScalePct  < 30)  g_dialScalePct  = 30;
   if (g_dialScalePct  > 100) g_dialScalePct  = 100;
@@ -923,15 +1013,18 @@ static void saveRotation(int deg) {
   p.end();
 }
 
-static void saveFeatures(bool wifi, bool ble) {
+static void saveFeatures(bool wifi, bool ble, bool buzzer) {
   const bool wasBle = g_featureBle;
-  g_featureWifi = wifi;
-  g_featureBle  = ble;
+  g_featureWifi   = wifi;
+  g_featureBle    = ble;
+  g_featureBuzzer = buzzer;
   Preferences p;
   p.begin("clock", false);
-  p.putBool("feat_wifi", g_featureWifi);
-  p.putBool("feat_ble",  g_featureBle);
+  p.putBool("feat_wifi",   g_featureWifi);
+  p.putBool("feat_ble",    g_featureBle);
+  p.putBool("feat_buzzer", g_featureBuzzer);
   p.end();
+  if (!g_featureBuzzer) hal_buzzer(false);  // sofort aus wenn deaktiviert
   if (!g_featureWifi) {
     WiFi.disconnect();
     strcpy(g_ipStr, "---");
@@ -993,6 +1086,7 @@ static void handleWebRoot() {
     "<a href='/page?p=2'><button>Motor</button></a>"
     "<a href='/page?p=3'><button>Lambda</button></a>"
     "<a href='/page?p=4'><button>Hub</button></a>"
+    "<a href='/page?p=6'><button>IMU</button></a>"
     "<a href='/page?p=5'><button>Setup</button></a></div>");
 
   html += F("<div class='card'><h3>Funktionen</h3><form action='/features' method='get'>");
@@ -1001,7 +1095,10 @@ static void handleWebRoot() {
   html += F("> WLAN/Web aktiv</label></p><p><label>"
     "<input type='checkbox' name='ble' value='1' ");
   html += g_featureBle ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> BLE-Hub Daten aktiv</label></p>"
+  html += F(" onchange='this.form.submit()'> BLE-Hub Daten aktiv</label></p><p><label>"
+    "<input type='checkbox' name='buzzer' value='1' ");
+  html += g_featureBuzzer ? "checked" : "";
+  html += F(" onchange='this.form.submit()'> Buzzer (Shake-Alarm) aktiv</label></p>"
     "<button type='submit'>Speichern</button></form></div>");
 
   html += F("<div class='card'><h3>Spartan-Hub Live</h3>");
@@ -1061,11 +1158,13 @@ static void handleWebSet() {
 }
 
 static void handleWebFeatures() {
-  const bool wifi = webServer.hasArg("wifi");
-  const bool ble  = webServer.hasArg("ble");
-  saveFeatures(wifi, ble);
-  Serial.printf("Web: Funktionen wifi=%s ble=%s\n",
-                g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off");
+  const bool wifi   = webServer.hasArg("wifi");
+  const bool ble    = webServer.hasArg("ble");
+  const bool buzzer = webServer.hasArg("buzzer");
+  saveFeatures(wifi, ble, buzzer);
+  Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s\n",
+                g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off",
+                g_featureBuzzer ? "on" : "off");
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -1074,7 +1173,7 @@ static void handleWebPage() {
   if (webServer.hasArg("p")) {
     int page = webServer.arg("p").toInt();
     if (page < 0) page = 0;
-    if (page > 5) page = 5;
+    if (page > 6) page = 6;
     currentPage  = static_cast<uint8_t>(page);
     g_redrawPage = true;
     Serial.printf("Web: page=%u\n", currentPage);
@@ -1133,40 +1232,44 @@ static void manageWifiAp() {
 static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
   Serial.printf("setup long-press y=%u dur=%lu\n", y, (unsigned long)durMs);
 
-  if (y >= 340) {
+  // Zonen passend zu drawSetupPage (Zeilen-Mitte = Zonenstart + 18, Hoehe 36)
+  if (y >= 345) {                       // unten -> zurueck ins Menue
     currentPage = 1;
     drawMenuOverview();
-    Serial.println("setup long: menu");
+    Serial.println("setup tap: menu");
     return;
   }
 
-  if (y >= 94 && y < 134) {
+  if (y >= 92 && y < 128) {             // UHR (Zeile 110)
     int next = (g_dialScalePct < 85) ? 90 : (g_dialScalePct < 95 ? 100 : 80);
     saveDialScale(next);
     drawSetupPage();
-    Serial.printf("setup long: dial=%d%%\n", g_dialScalePct);
-  } else if (y >= 134 && y < 174) {
+    Serial.printf("setup tap: dial=%d%%\n", g_dialScalePct);
+  } else if (y >= 128 && y < 164) {     // HELL (Zeile 146)
     int next = (g_brightnessPct < 63) ? 75 : (g_brightnessPct < 88 ? 100 : 50);
     saveBrightness(next);
     drawSetupPage();
-    Serial.printf("setup long: brightness=%d%%\n", g_brightnessPct);
-  } else if (y >= 174 && y < 214) {
-    // Tap schaltet die 4 Presets durch (Feintuning per Web-GUI)
+    Serial.printf("setup tap: brightness=%d%%\n", g_brightnessPct);
+  } else if (y >= 164 && y < 200) {     // ROT (Zeile 182)
     int next = (g_rotationDeg < 90) ? 90 : (g_rotationDeg < 180 ? 180 : (g_rotationDeg < 270 ? 270 : 0));
     saveRotation(next);
     drawSetupPage();
     Serial.printf("setup tap: rotation=%d deg\n", g_rotationDeg);
-  } else if (y >= 214 && y < 254) {
+  } else if (y >= 200 && y < 236) {     // WIFI (Zeile 218)
     cycleWifiProfile();
     drawSetupPage();
-    Serial.printf("setup long: wifi profile=%u ssid=%s\n", g_wifiProfile, currentWifiSsid());
-  } else if (y >= 254 && y < 294) {
-    saveFeatures(g_featureWifi, !g_featureBle);
+    Serial.printf("setup tap: wifi profile=%u ssid=%s\n", g_wifiProfile, currentWifiSsid());
+  } else if (y >= 236 && y < 272) {     // BLE (Zeile 254)
+    saveFeatures(g_featureWifi, !g_featureBle, g_featureBuzzer);
     drawSetupPage();
-    Serial.printf("setup long: ble=%s\n", g_featureBle ? "on" : "off");
+    Serial.printf("setup tap: ble=%s\n", g_featureBle ? "on" : "off");
+  } else if (y >= 272 && y < 308) {     // BUZZER (Zeile 290)
+    saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
+    drawSetupPage();
+    Serial.printf("setup tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
   } else {
     drawSetupPage();
-    Serial.println("setup long: no action");
+    Serial.println("setup tap: no action");
   }
 }
 
@@ -1239,6 +1342,19 @@ void setup() {
   Serial.println("Display: HAL init...");
   hal_init();
   gt911Init();
+
+  // QMI8658 IMU erkennen + initialisieren (I2C laeuft via hal_init/Wire)
+  g_imuPresent = qmi8658Detect();
+  if (g_imuPresent) {
+    qmi8658Init();
+    Serial.println("IMU: QMI8658 found at 0x6B, initialized");
+  } else {
+    Serial.println("IMU: QMI8658 NOT found");
+  }
+  // #region agent log
+  agentDbgLog("H5", "main.cpp:setup", "post_imu_gt911", g_imuPresent, gt911Found, gt911Addr, 0);
+  // #endregion
+
   initTimeSource();
   hal_backlight(true);
   drawVdoClock();
@@ -1264,8 +1380,12 @@ void loop() {
   const bool touchNow = touchFrame || touchHeld;
   if (touchNow) {
     touchSeen = true;
-    touchLastSeenMs = nowMs;
     if (touchFrame) {
+      // WICHTIG: nur bei echtem Touch-Frame aktualisieren! Sonst haelt der
+      // touchHeld-Zeitfenster-Mechanismus sich selbst am Leben (touchHeld ->
+      // touchNow -> touchLastSeenMs=nowMs -> Fenster nie abgelaufen) und der
+      // Release-Zweig (Tap-Erkennung) feuert NIE.
+      touchLastSeenMs = nowMs;
       touchLastX = x;
       touchLastY = y;
     }
@@ -1287,6 +1407,10 @@ void loop() {
     const uint32_t durMs = touchLastSeenMs - touchStartMs;
     const uint16_t tapX = touchLastX ? touchLastX : touchStartX;
     const uint16_t tapY = touchLastY ? touchLastY : touchStartY;
+    // #region agent log
+    agentDbgLog("H4", "main.cpp:loop", "release_check",
+                durMs, nowMs - lastTouch, touchLongHandled ? 1u : 0u, currentPage);
+    // #endregion
     touchActive = false;
     if (!touchLongHandled && durMs < 600 && nowMs - lastTouch > 350) {
       lastTouch = nowMs;
@@ -1303,18 +1427,18 @@ void loop() {
         else if (tapY >= z0 +  zh && tapY < z0 + 2*zh) { currentPage = 2; drawMotorPage();  Serial.println("page: motor"); }
         else if (tapY >= z0 +2*zh && tapY < z0 + 3*zh) { currentPage = 3; drawLambdaPage(); Serial.println("page: lambda"); }
         else if (tapY >= z0 +3*zh && tapY < z0 + 4*zh) { currentPage = 4; drawHubPage();    Serial.println("page: hub"); }
-        else if (tapY >= z0 +4*zh && tapY < z0 + 5*zh) { currentPage = 5; drawSetupPage();  Serial.println("page: setup"); }
-        else { currentPage = 2; drawMotorPage(); Serial.println("page: motor fallback"); }
+        else if (tapY >= z0 +4*zh && tapY < z0 + 5*zh) { currentPage = 6; drawImuPage();    Serial.println("page: imu"); }
+        else if (tapY >= z0 +5*zh && tapY < z0 + 6*zh) { currentPage = 5; drawSetupPage();  Serial.println("page: setup"); }
+        else { currentPage = 0; drawVdoClock(); Serial.println("page: clock fallback"); }
       } else if (currentPage == 5) {
         // SETUP: kurzer Tap auf eine Zeile aendert die jeweilige Einstellung
-        // (Zifferblatt/Helligkeit/Rotation/WLAN/BLE). Tap unten (y>=340) =
-        // zurueck ins Menue. Long-Press war zu unzuverlaessig (INT-Pin), Tap
-        // funktioniert sicher.
+        // (Zifferblatt/Helligkeit/Rotation/WLAN/BLE/Buzzer). Tap unten = Menue.
         handleSetupLongPress(tapY, durMs);
       } else {
-        // Data pages: short tap advances to next page, wraps to clock.
-        currentPage++;
-        if (currentPage > 5) currentPage = 0;
+        // Data pages (Motor/Lambda/Hub/IMU): Tap -> naechste, dann zurueck zur Uhr.
+        if      (currentPage == 4) currentPage = 6;  // Hub -> IMU
+        else if (currentPage == 6) currentPage = 0;  // IMU -> Uhr
+        else currentPage++;                          // Motor->Lambda->Hub
         drawCurrentPage();
         Serial.printf("page: next %u\n", currentPage);
       }
@@ -1329,15 +1453,17 @@ void loop() {
       if (serialLine.length() > 0) {
         String cmd = serialLine; serialLine = "";
         cmd.trim(); cmd.toLowerCase();
-        if      (cmd == "ble:on")  { saveFeatures(g_featureWifi, true); }
-        else if (cmd == "ble:off") { saveFeatures(g_featureWifi, false); }
+        if      (cmd == "ble:on")  { saveFeatures(g_featureWifi, true, g_featureBuzzer); }
+        else if (cmd == "ble:off") { saveFeatures(g_featureWifi, false, g_featureBuzzer); }
+        else if (cmd == "buzzer:on")  { saveFeatures(g_featureWifi, g_featureBle, true); }
+        else if (cmd == "buzzer:off") { saveFeatures(g_featureWifi, g_featureBle, false); }
         else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
-        else if (cmd == "wifi:off")  { saveFeatures(false, g_featureBle); g_redrawPage = true; }
+        else if (cmd == "wifi:off")  { saveFeatures(false, g_featureBle, g_featureBuzzer); g_redrawPage = true; }
         else if (cmd == "rot:+") { saveRotation(g_rotationDeg + 1); g_redrawPage = true; }
         else if (cmd == "rot:-") { saveRotation(g_rotationDeg - 1); g_redrawPage = true; }
         else if (cmd.startsWith("rot:")) { saveRotation(cmd.substring(4).toInt()); g_redrawPage = true; }
         else if (cmd == "clock")   { currentPage = 0; drawVdoClock(); }
-        else { Serial.println("Commands: ble:on | ble:off | wifi:next | wifi:off | rot:+ | rot:- | rot:NN | clock"); }
+        else { Serial.println("Commands: ble:on|off | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
@@ -1371,6 +1497,12 @@ void loop() {
   // Data pages: update at 2 Hz
   if (currentPage >= 2 && currentPage <= 5 && millis() - lastDraw >= 500) {
     lastDraw = millis();
+    drawCurrentPage();
+  }
+  // IMU page: read sensor + redraw at ~10 Hz
+  if (currentPage == 6 && millis() - lastDraw >= 100) {
+    lastDraw = millis();
+    qmi8658Read();
     drawCurrentPage();
   }
 

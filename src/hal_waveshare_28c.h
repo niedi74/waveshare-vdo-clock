@@ -19,6 +19,7 @@
 #define HAL_EXIO_LCD_RST (1 << 0)
 #define HAL_EXIO_TP_RST  (1 << 1)
 #define HAL_EXIO_LCD_CS  (1 << 2)
+#define HAL_EXIO_BUZZER  (1 << 7)  // PCA9554 Pin 8 = Bit 7 (Buzzer)
 
 #define HAL_PIN_DE     40
 #define HAL_PIN_VSYNC  39
@@ -69,8 +70,30 @@ static bool hal_pca_write(uint8_t reg, uint8_t val) {
   return false;
 }
 
+static uint8_t hal_pca_read(uint8_t reg) {
+  uint8_t val = 0;
+  Wire.beginTransmission(HAL_PCA9554_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) == 0) {
+    if (Wire.requestFrom((int)HAL_PCA9554_ADDR, 1) == 1) {
+      val = Wire.read();
+    }
+  }
+  return val;
+}
+
+static void hal_buzzer(bool on) {
+  // KEIN Read-Modify-Write! Ein fehlschlagender PCA-Read wuerde 0 liefern
+  // und CS/RST/TP_RST loeschen -> Touch (TP_RST) und Display tot. Stattdessen
+  // immer den bekannten Betriebs-Zustand schreiben + Buzzer-Bit oben drauf.
+  const uint8_t base = HAL_EXIO_LCD_RST | HAL_EXIO_TP_RST | HAL_EXIO_LCD_CS;
+  hal_pca_write(HAL_PCA_OUTPUT, on ? (base | HAL_EXIO_BUZZER) : base);
+}
+
 static void hal_expander_init() {
-  hal_pca_write(HAL_PCA_CONFIG, 0xF8);
+  // 0x78: Bit0-2 = Output (LCD RST/CS, TP RST), Bit7 = Output (Buzzer),
+  // Bit3-6 = Input. Buzzer-Bit muss Output sein, sonst schaltet er nicht.
+  hal_pca_write(HAL_PCA_CONFIG, 0x78);
   hal_pca_write(HAL_PCA_OUTPUT, HAL_EXIO_LCD_RST | HAL_EXIO_TP_RST | HAL_EXIO_LCD_CS);
   delay(80);
   hal_pca_write(HAL_PCA_OUTPUT, HAL_EXIO_LCD_CS);
