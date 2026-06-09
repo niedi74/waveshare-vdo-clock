@@ -75,8 +75,44 @@ static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_webStarted   = false;
 static bool      g_redrawPage   = false;
+static uint8_t   g_wifiProfile  = 0;
 static WebServer webServer(80);
 static void startWebServer();   // forward declaration
+static void reconnectWifiProfile();
+static void cycleWifiProfile();
+
+struct WifiProfile {
+  const char* ssid;
+  const char* pass;
+};
+
+static const WifiProfile WIFI_PROFILES[] = {
+  { WIFI_SSID, WIFI_PASSWORD },
+#ifdef WIFI_SSID_2
+  { WIFI_SSID_2, WIFI_PASSWORD_2 },
+#endif
+#ifdef WIFI_SSID_3
+  { WIFI_SSID_3, WIFI_PASSWORD_3 },
+#endif
+};
+
+static uint8_t wifiProfileCount() {
+  return (uint8_t)(sizeof(WIFI_PROFILES) / sizeof(WIFI_PROFILES[0]));
+}
+
+static const char* currentWifiSsid() {
+  uint8_t count = wifiProfileCount();
+  if (count == 0) return "";
+  if (g_wifiProfile >= count) g_wifiProfile = 0;
+  return WIFI_PROFILES[g_wifiProfile].ssid;
+}
+
+static const char* currentWifiPassword() {
+  uint8_t count = wifiProfileCount();
+  if (count == 0) return "";
+  if (g_wifiProfile >= count) g_wifiProfile = 0;
+  return WIFI_PROFILES[g_wifiProfile].pass;
+}
 
 // Build-time fallbacks (inject_time.py provides these)
 #ifndef RTC_BUILD_Y
@@ -170,14 +206,14 @@ static bool wifiNtpTick() {
   static bool     ntpSynced   = false;
   static uint32_t lastTry     = 0;
 
-  if (!g_featureWifi || strlen(WIFI_SSID) == 0) return false;
+  if (!g_featureWifi || strlen(currentWifiSsid()) == 0) return false;
 
   if (WiFi.status() != WL_CONNECTED) {
     if (millis() - lastTry > 30000) {
       lastTry = millis();
       WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-      Serial.println("WiFi: Reconnect-Versuch");
+      WiFi.begin(currentWifiSsid(), currentWifiPassword());
+      Serial.printf("WiFi: Reconnect-Versuch zu '%s'\n", currentWifiSsid());
     }
     if (g_ipStr[0] == '-') strcpy(g_ipStr, "...");
     return false;
@@ -662,6 +698,9 @@ static void drawMenuOverview() {
   char ipLine[32];
   snprintf(ipLine, sizeof(ipLine), "IP %s", g_ipStr);
   drawTextCentered(240, 420, ipLine, RGB565(150, 200, 150), 2);
+  if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
+    drawTextCentered(240, 444, currentWifiSsid(), RGB565(120, 150, 150), 2);
+  }
   presentFrame();
 }
 
@@ -759,8 +798,13 @@ static void drawSetupPage() {
   drawDataRow(152, "HELL",  buf, RGB565(235, 235, 225));
   drawDataRow(192, "TOUCH", FEATURE_TOUCH ? (touchSeen ? "AKTIV" : "WARTET") : "AUS",
               FEATURE_TOUCH && touchSeen ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawDataRow(232, "WIFI",  g_featureWifi ? (WiFi.status() == WL_CONNECTED ? "OK" : "AN") : "AUS",
-              g_featureWifi && WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
+    snprintf(buf, sizeof(buf), "%s", currentWifiSsid());
+    drawDataRow(232, "WIFI", buf,
+                WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  } else {
+    drawDataRow(232, "WIFI", "AUS", RGB565(220, 130, 50));
+  }
   drawDataRow(272, "BLE",   g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
               g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   drawDataRow(312, "HUB",   g_bleHubName.c_str(), RGB565(150, 150, 150));
@@ -783,7 +827,9 @@ static void loadSettings() {
   p.begin("clock", true);
   g_dialScalePct  = p.getInt("scale",     100);
   g_brightnessPct = p.getInt("bright",    100);
-  g_featureWifi   = p.getBool("feat_wifi", strlen(WIFI_SSID) > 0);
+  g_wifiProfile   = p.getUChar("wifi_prof", 0);
+  if (g_wifiProfile >= wifiProfileCount()) g_wifiProfile = 0;
+  g_featureWifi   = p.getBool("feat_wifi", strlen(currentWifiSsid()) > 0);
   g_featureBle    = p.getBool("feat_ble",  false);
   p.end();
   if (g_dialScalePct  < 30)  g_dialScalePct  = 30;
@@ -821,6 +867,14 @@ static void saveFeatures(bool wifi, bool ble) {
   p.putBool("feat_wifi", g_featureWifi);
   p.putBool("feat_ble",  g_featureBle);
   p.end();
+  if (!g_featureWifi) {
+    WiFi.disconnect();
+    strcpy(g_ipStr, "---");
+    g_webStarted = false;
+    Serial.println("WiFi: AUS");
+  } else if (WiFi.status() != WL_CONNECTED && strlen(currentWifiSsid()) > 0) {
+    reconnectWifiProfile();
+  }
   if (!g_featureBle) {
     if (bleClient && bleClient->isConnected()) bleClient->disconnect();
     g_bleConn    = false;
@@ -965,9 +1019,9 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     drawSetupPage();
     Serial.printf("setup long: brightness=%d%%\n", g_brightnessPct);
   } else if (y >= 214 && y < 254) {
-    saveFeatures(!g_featureWifi, g_featureBle);
+    cycleWifiProfile();
     drawSetupPage();
-    Serial.printf("setup long: wifi=%s\n", g_featureWifi ? "on" : "off");
+    Serial.printf("setup long: wifi profile=%u ssid=%s\n", g_wifiProfile, currentWifiSsid());
   } else if (y >= 254 && y < 294) {
     saveFeatures(g_featureWifi, !g_featureBle);
     drawSetupPage();
@@ -976,6 +1030,36 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     drawSetupPage();
     Serial.println("setup long: no action");
   }
+}
+
+static void saveWifiProfile(uint8_t idx) {
+  uint8_t count = wifiProfileCount();
+  if (count == 0) return;
+  if (idx >= count) idx = 0;
+  g_wifiProfile = idx;
+  g_featureWifi = true;
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("wifi_prof", g_wifiProfile);
+  p.putBool("feat_wifi", true);
+  p.end();
+}
+
+static void reconnectWifiProfile() {
+  if (strlen(currentWifiSsid()) == 0) return;
+  g_featureWifi = true;
+  strcpy(g_ipStr, "...");
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(currentWifiSsid(), currentWifiPassword());
+  Serial.printf("WiFi: Profil %u -> '%s'\n", g_wifiProfile, currentWifiSsid());
+}
+
+static void cycleWifiProfile() {
+  uint8_t count = wifiProfileCount();
+  if (count == 0) return;
+  saveWifiProfile((uint8_t)((g_wifiProfile + 1) % count));
+  reconnectWifiProfile();
 }
 
 void setup() {
@@ -999,10 +1083,10 @@ void setup() {
   // WiFi and BLE MUST init before the RGB panel. WiFi/BLE PHY init temporarily
   // disables the flash cache; if the RGB VSYNC ISR (in flash) fires during that
   // window the CPU faults. With no panel running yet there is no VSYNC ISR.
-  if (g_featureWifi && strlen(WIFI_SSID) > 0) {
+  if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", WIFI_SSID);
+    WiFi.begin(currentWifiSsid(), currentWifiPassword());
+    Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", currentWifiSsid());
   }
 
   if (g_featureBle) {
@@ -1035,25 +1119,31 @@ void loop() {
 
 #if FEATURE_TOUCH
   const uint32_t nowMs = millis();
-  const bool touchNow = readTouch(&x, &y);
+  const bool touchFrame = readTouch(&x, &y);
+  const bool touchHeld = touchActive && currentPage == 5 && digitalRead(PIN_TOUCH_INT) == LOW;
+  const bool touchNow = touchFrame || touchHeld;
   if (touchNow) {
     touchSeen = true;
     touchLastSeenMs = nowMs;
-    touchLastX = x;
-    touchLastY = y;
+    if (touchFrame) {
+      touchLastX = x;
+      touchLastY = y;
+    }
     if (!touchActive) {
       touchActive = true;
       touchLongHandled = false;
       touchStartMs = nowMs;
       touchStartX = x;
       touchStartY = y;
+      touchLastX = x;
+      touchLastY = y;
     }
     if (currentPage == 5 && !touchLongHandled && nowMs - touchStartMs >= 600) {
       touchLongHandled = true;
       lastTouch = nowMs;
       handleSetupLongPress(touchLastY, nowMs - touchStartMs);
     }
-  } else if (touchActive && nowMs - touchLastSeenMs > 180) {
+  } else if (touchActive && nowMs - touchLastSeenMs > (currentPage == 5 ? 700UL : 180UL)) {
     const uint32_t durMs = touchLastSeenMs - touchStartMs;
     const uint16_t tapX = touchLastX ? touchLastX : touchStartX;
     const uint16_t tapY = touchLastY ? touchLastY : touchStartY;
@@ -1095,8 +1185,10 @@ void loop() {
         cmd.trim(); cmd.toLowerCase();
         if      (cmd == "ble:on")  { saveFeatures(g_featureWifi, true); }
         else if (cmd == "ble:off") { saveFeatures(g_featureWifi, false); }
+        else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
+        else if (cmd == "wifi:off")  { saveFeatures(false, g_featureBle); g_redrawPage = true; }
         else if (cmd == "clock")   { currentPage = 0; drawVdoClock(); }
-        else { Serial.println("Commands: ble:on | ble:off | clock"); }
+        else { Serial.println("Commands: ble:on | ble:off | wifi:next | wifi:off | clock"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
