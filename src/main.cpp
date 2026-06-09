@@ -215,8 +215,7 @@ static bool wifiNtpTick() {
   if (WiFi.status() != WL_CONNECTED) {
     if (millis() - lastTry > 30000) {
       lastTry = millis();
-      WiFi.disconnect();
-      WiFi.begin(currentWifiSsid(), currentWifiPassword());
+      WiFi.begin(currentWifiSsid(), currentWifiPassword());  // kein disconnect() davor
       Serial.printf("WiFi: Reconnect-Versuch zu '%s'\n", currentWifiSsid());
     }
     if (g_ipStr[0] == '-') strcpy(g_ipStr, "...");
@@ -458,8 +457,10 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
   bool ok = i2cRegRead16(gt911Addr, GT911_READ_XY + 1, point, sizeof(point));
   i2cRegWrite16(gt911Addr, GT911_READ_XY, &clear, 1);
   if (!ok) return false;
-  uint16_t rawX = (uint16_t)point[2] | ((uint16_t)point[3] << 8);
-  uint16_t rawY = (uint16_t)point[4] | ((uint16_t)point[5] << 8);
+  // GT911 ab 0x814F: [TrackID, X-low, X-high, Y-low, Y-high, Size-low, ...]
+  // -> X = point[1]|point[2]<<8, Y = point[3]|point[4]<<8 (war um 1 Byte verschoben)
+  uint16_t rawX = (uint16_t)point[1] | ((uint16_t)point[2] << 8);
+  uint16_t rawY = (uint16_t)point[3] | ((uint16_t)point[4] << 8);
   if (g_rotationDeg == 0) {
     *x = rawX;
     *y = rawY;
@@ -975,6 +976,17 @@ static void handleWebRoot() {
   html += "<div class='card'><div class='big'>" + String(timeStr) + "</div>";
   html += "<div>IP " + String(g_ipStr) + "</div></div>";
 
+  // WLAN-Profil umschalten
+  html += F("<div class='card'><h3>WLAN</h3>");
+  html += "<div>Aktiv: <b>" + String(currentWifiSsid()) + "</b> &middot; " +
+          String(WiFi.status() == WL_CONNECTED ? "verbunden" : "nicht verbunden") + "</div>";
+  for (uint8_t i = 0; i < wifiProfileCount(); i++) {
+    html += "<a href='/wifi?prof=" + String(i) + "'><button" +
+            String(i == g_wifiProfile ? " style='background:#6c6'" : "") + ">" +
+            String(WIFI_PROFILES[i].ssid) + "</button></a>";
+  }
+  html += F("</div>");
+
   html += F("<div class='card'><h3>Display-Seite</h3>"
     "<a href='/page?p=0'><button>Uhr</button></a>"
     "<a href='/page?p=1'><button>Menu</button></a>"
@@ -1071,13 +1083,51 @@ static void handleWebPage() {
   webServer.send(303);
 }
 
+static void reconnectWifiProfile();    // fwd
+static void saveWifiProfile(uint8_t);  // fwd
+
+// WLAN-Profil per Web umschalten: /wifi?prof=N
+static void handleWebWifi() {
+  if (webServer.hasArg("prof")) {
+    int idx = webServer.arg("prof").toInt();
+    if (idx < 0) idx = 0;
+    saveWifiProfile((uint8_t)idx);
+    reconnectWifiProfile();
+    Serial.printf("Web: WLAN-Profil -> %d (%s)\n", idx, currentWifiSsid());
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
 static void startWebServer() {
   webServer.on("/",        handleWebRoot);
   webServer.on("/set",     handleWebSet);
   webServer.on("/features",handleWebFeatures);
   webServer.on("/page",    handleWebPage);
+  webServer.on("/wifi",    handleWebWifi);
   webServer.begin();
   Serial.println("WebGUI: gestartet auf Port 80");
+}
+
+// Fallback-Setup-AP: nur AN wenn keine STA-Verbindung besteht, damit das
+// Display im verbundenen Normalbetrieb stabil bleibt (kein AP-Dauerbeacon).
+static bool     g_apOn = false;
+static void manageWifiAp() {
+  if (!g_featureWifi) return;
+  const bool conn = (WiFi.status() == WL_CONNECTED);
+  if (conn && g_apOn) {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    g_apOn = false;
+    Serial.println("WiFi: STA verbunden -> Setup-AP aus");
+  } else if (!conn && !g_apOn && millis() > 15000) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP("VDO-Clock-Setup", "vdoclock");
+    g_apOn = true;
+    Serial.printf("WiFi: Setup-AP an -> http://%s  (SSID VDO-Clock-Setup / vdoclock)\n",
+                  WiFi.softAPIP().toString().c_str());
+    if (!g_webStarted) { startWebServer(); g_webStarted = true; }
+  }
 }
 
 static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
@@ -1101,9 +1151,11 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     drawSetupPage();
     Serial.printf("setup long: brightness=%d%%\n", g_brightnessPct);
   } else if (y >= 174 && y < 214) {
-    saveRotation(g_rotationDeg + 1);
+    // Tap schaltet die 4 Presets durch (Feintuning per Web-GUI)
+    int next = (g_rotationDeg < 90) ? 90 : (g_rotationDeg < 180 ? 180 : (g_rotationDeg < 270 ? 270 : 0));
+    saveRotation(next);
     drawSetupPage();
-    Serial.printf("setup long: rotation=%d deg\n", g_rotationDeg);
+    Serial.printf("setup tap: rotation=%d deg\n", g_rotationDeg);
   } else if (y >= 214 && y < 254) {
     cycleWifiProfile();
     drawSetupPage();
@@ -1170,6 +1222,8 @@ void setup() {
   // disables the flash cache; if the RGB VSYNC ISR (in flash) fires during that
   // window the CPU faults. With no panel running yet there is no VSYNC ISR.
   if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
+    WiFi.persistent(false);  // keine WiFi-Flash-Schreibzugriffe -> kein Cache-Disable
+    WiFi.setSleep(true);     // Modem-Sleep: weniger PSRAM-Bus-Konkurrenz
     WiFi.mode(WIFI_STA);
     WiFi.begin(currentWifiSsid(), currentWifiPassword());
     Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", currentWifiSsid());
@@ -1251,8 +1305,14 @@ void loop() {
         else if (tapY >= z0 +3*zh && tapY < z0 + 4*zh) { currentPage = 4; drawHubPage();    Serial.println("page: hub"); }
         else if (tapY >= z0 +4*zh && tapY < z0 + 5*zh) { currentPage = 5; drawSetupPage();  Serial.println("page: setup"); }
         else { currentPage = 2; drawMotorPage(); Serial.println("page: motor fallback"); }
+      } else if (currentPage == 5) {
+        // SETUP: kurzer Tap auf eine Zeile aendert die jeweilige Einstellung
+        // (Zifferblatt/Helligkeit/Rotation/WLAN/BLE). Tap unten (y>=340) =
+        // zurueck ins Menue. Long-Press war zu unzuverlaessig (INT-Pin), Tap
+        // funktioniert sicher.
+        handleSetupLongPress(tapY, durMs);
       } else {
-        // Data/setup pages: short tap advances to next page, wraps to clock.
+        // Data pages: short tap advances to next page, wraps to clock.
         currentPage++;
         if (currentPage > 5) currentPage = 0;
         drawCurrentPage();
@@ -1284,6 +1344,9 @@ void loop() {
     }
   }
 
+  // Fallback-Setup-AP verwalten (nur AN wenn keine STA-Verbindung)
+  manageWifiAp();
+
   // WiFi/NTP background tick; redraw clock on fresh sync
   if (wifiNtpTick() && currentPage == 0) drawVdoClock();
 
@@ -1303,6 +1366,7 @@ void loop() {
   if (currentPage == 0 && millis() - lastDraw >= 1000) {
     lastDraw = millis();
     drawVdoClock();
+    hal_restart();  // DMA-Resync gegen WiFi/BLE-bedingten Bildversatz/Schwarz
   }
   // Data pages: update at 2 Hz
   if (currentPage >= 2 && currentPage <= 5 && millis() - lastDraw >= 500) {

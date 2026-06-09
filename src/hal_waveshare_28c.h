@@ -260,6 +260,12 @@ void hal_present() {
   }
 }
 
+// RGB-DMA bei Bedarf neu synchronisieren (recovert ein durch WiFi/BLE
+// verschobenes/schwarzes Bild beim naechsten VSYNC, ohne Neu-Init).
+void hal_restart() {
+  if (hal_panel) esp_lcd_rgb_panel_restart(hal_panel);
+}
+
 void hal_fill(uint16_t color) {
   uint16_t *fb = hal_fb();
   if (!fb) return;
