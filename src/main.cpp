@@ -802,6 +802,16 @@ static void saveDialScale(int pct) {
   p.end();
 }
 
+static void saveBrightness(int pct) {
+  if (pct < 5)   pct = 5;
+  if (pct > 100) pct = 100;
+  g_brightnessPct = pct;
+  Preferences p;
+  p.begin("clock", false);
+  p.putInt("bright", pct);
+  p.end();
+}
+
 static void saveFeatures(bool wifi, bool ble) {
   const bool wasBle = g_featureBle;
   g_featureWifi = wifi;
@@ -934,6 +944,40 @@ static void startWebServer() {
   Serial.println("WebGUI: gestartet auf Port 80");
 }
 
+static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
+  Serial.printf("setup long-press y=%u dur=%lu\n", y, (unsigned long)durMs);
+
+  if (y >= 340) {
+    currentPage = 1;
+    drawMenuOverview();
+    Serial.println("setup long: menu");
+    return;
+  }
+
+  if (y >= 94 && y < 134) {
+    int next = (g_dialScalePct < 85) ? 90 : (g_dialScalePct < 95 ? 100 : 80);
+    saveDialScale(next);
+    drawSetupPage();
+    Serial.printf("setup long: dial=%d%%\n", g_dialScalePct);
+  } else if (y >= 134 && y < 174) {
+    int next = (g_brightnessPct < 63) ? 75 : (g_brightnessPct < 88 ? 100 : 50);
+    saveBrightness(next);
+    drawSetupPage();
+    Serial.printf("setup long: brightness=%d%%\n", g_brightnessPct);
+  } else if (y >= 214 && y < 254) {
+    saveFeatures(!g_featureWifi, g_featureBle);
+    drawSetupPage();
+    Serial.printf("setup long: wifi=%s\n", g_featureWifi ? "on" : "off");
+  } else if (y >= 254 && y < 294) {
+    saveFeatures(g_featureWifi, !g_featureBle);
+    drawSetupPage();
+    Serial.printf("setup long: ble=%s\n", g_featureBle ? "on" : "off");
+  } else {
+    drawSetupPage();
+    Serial.println("setup long: no action");
+  }
+}
+
 void setup() {
   // Cold-Boot Robustness: let power rails settle before touching I2C/display.
   delay(500);
@@ -981,33 +1025,63 @@ void loop() {
   static uint32_t lastTouch = 0;
   static uint32_t lastDraw  = 0;
   static String   serialLine;
+  static bool     touchActive = false;
+  static bool     touchLongHandled = false;
+  static uint32_t touchStartMs = 0;
+  static uint32_t touchLastSeenMs = 0;
+  static uint16_t touchStartX = 0, touchStartY = 0;
+  static uint16_t touchLastX = 0, touchLastY = 0;
   uint16_t x = 0, y = 0;
 
 #if FEATURE_TOUCH
-  if (readTouch(&x, &y) && millis() - lastTouch > 350) {
-    lastTouch = millis();
+  const uint32_t nowMs = millis();
+  const bool touchNow = readTouch(&x, &y);
+  if (touchNow) {
     touchSeen = true;
-    Serial.printf("touch x=%u y=%u page=%u\n", x, y, currentPage);
-    if (currentPage == 0) {
-      currentPage = 1;
-      drawMenuOverview();
-      Serial.println("page: menu");
-    } else if (currentPage == 1) {
-      // Route by y-position — zones match MENU_ZONE_Y0 / MENU_ZONE_H exactly
-      const uint16_t z0 = MENU_ZONE_Y0;
-      const uint16_t zh = MENU_ZONE_H;
-      if      (y >= z0       && y < z0 +   zh) { currentPage = 0; drawVdoClock();   Serial.println("page: clock"); }
-      else if (y >= z0 +  zh && y < z0 + 2*zh) { currentPage = 2; drawMotorPage();  Serial.println("page: motor"); }
-      else if (y >= z0 +2*zh && y < z0 + 3*zh) { currentPage = 3; drawLambdaPage(); Serial.println("page: lambda"); }
-      else if (y >= z0 +3*zh && y < z0 + 4*zh) { currentPage = 4; drawHubPage();    Serial.println("page: hub"); }
-      else if (y >= z0 +4*zh && y < z0 + 5*zh) { currentPage = 5; drawSetupPage();  Serial.println("page: setup"); }
-      else { currentPage = 2; drawMotorPage(); Serial.println("page: motor fallback"); }
-    } else {
-      // Data pages: advance to next, wrap back to clock after SETUP
-      currentPage++;
-      if (currentPage > 5) currentPage = 0;
-      drawCurrentPage();
-      Serial.printf("page: next %u\n", currentPage);
+    touchLastSeenMs = nowMs;
+    touchLastX = x;
+    touchLastY = y;
+    if (!touchActive) {
+      touchActive = true;
+      touchLongHandled = false;
+      touchStartMs = nowMs;
+      touchStartX = x;
+      touchStartY = y;
+    }
+    if (currentPage == 5 && !touchLongHandled && nowMs - touchStartMs >= 600) {
+      touchLongHandled = true;
+      lastTouch = nowMs;
+      handleSetupLongPress(touchLastY, nowMs - touchStartMs);
+    }
+  } else if (touchActive && nowMs - touchLastSeenMs > 180) {
+    const uint32_t durMs = touchLastSeenMs - touchStartMs;
+    const uint16_t tapX = touchLastX ? touchLastX : touchStartX;
+    const uint16_t tapY = touchLastY ? touchLastY : touchStartY;
+    touchActive = false;
+    if (!touchLongHandled && durMs < 600 && nowMs - lastTouch > 350) {
+      lastTouch = nowMs;
+      Serial.printf("touch x=%u y=%u page=%u dur=%lu\n", tapX, tapY, currentPage, (unsigned long)durMs);
+      if (currentPage == 0) {
+        currentPage = 1;
+        drawMenuOverview();
+        Serial.println("page: menu");
+      } else if (currentPage == 1) {
+        // Route by y-position: zones match MENU_ZONE_Y0 / MENU_ZONE_H exactly.
+        const uint16_t z0 = MENU_ZONE_Y0;
+        const uint16_t zh = MENU_ZONE_H;
+        if      (tapY >= z0       && tapY < z0 +   zh) { currentPage = 0; drawVdoClock();   Serial.println("page: clock"); }
+        else if (tapY >= z0 +  zh && tapY < z0 + 2*zh) { currentPage = 2; drawMotorPage();  Serial.println("page: motor"); }
+        else if (tapY >= z0 +2*zh && tapY < z0 + 3*zh) { currentPage = 3; drawLambdaPage(); Serial.println("page: lambda"); }
+        else if (tapY >= z0 +3*zh && tapY < z0 + 4*zh) { currentPage = 4; drawHubPage();    Serial.println("page: hub"); }
+        else if (tapY >= z0 +4*zh && tapY < z0 + 5*zh) { currentPage = 5; drawSetupPage();  Serial.println("page: setup"); }
+        else { currentPage = 2; drawMotorPage(); Serial.println("page: motor fallback"); }
+      } else {
+        // Data/setup pages: short tap advances to next page, wraps to clock.
+        currentPage++;
+        if (currentPage > 5) currentPage = 0;
+        drawCurrentPage();
+        Serial.printf("page: next %u\n", currentPage);
+      }
     }
   }
 #endif
