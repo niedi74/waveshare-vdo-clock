@@ -388,14 +388,35 @@ static void rtcWrite(const struct tm *t) {
 }
 
 static bool readClockTime(struct tm *now) {
-  // Prefer SNTP (Europe/Berlin via configTzTime) — RTC can be stale after OTA.
+  // Single time source for WebGUI and drawVdoClock: SNTP (TZ via configTzTime) first.
+  // PCF85063 is fallback only before NTP; never prefer stale RTC when SNTP is valid.
   time_t t = time(nullptr);
   if (t > 1700000000) {
     localtime_r(&t, now);
     return true;
   }
   if (rtcRead(now)) return true;
+  memset(now, 0, sizeof(*now));
   return false;
+}
+
+static bool tmSameMinute(const struct tm *a, const struct tm *b) {
+  return a->tm_year == b->tm_year && a->tm_mon == b->tm_mon && a->tm_mday == b->tm_mday
+      && a->tm_hour == b->tm_hour && a->tm_min == b->tm_min
+      && abs(a->tm_sec - b->tm_sec) <= 2;
+}
+
+static bool syncRtcFromNtp(const struct tm *ntpLocal) {
+  struct tm rtcNow = {};
+  if (rtcRead(&rtcNow) && tmSameMinute(&rtcNow, ntpLocal)) return false;
+  rtcWrite(ntpLocal);
+  g_lastRtcSyncMs = millis();
+  g_ntpSynced = true;
+  g_ntpResyncRequested = false;
+  Serial.printf("NTP -> RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
+                ntpLocal->tm_year + 1900, ntpLocal->tm_mon + 1, ntpLocal->tm_mday,
+                ntpLocal->tm_hour, ntpLocal->tm_min, ntpLocal->tm_sec);
+  return true;
 }
 
 static void initTimeSource() {
@@ -467,18 +488,13 @@ static bool wifiNtpTick() {
   if (t > 1700000000) {
     struct tm now;
     localtime_r(&t, &now);
-    const bool firstSync = !g_ntpSynced;
+    const bool wasSynced = g_ntpSynced;
     const bool resyncDue = (millis() - g_lastRtcSyncMs) > 3600000UL;
-    if (firstSync || resyncDue || g_ntpResyncRequested) {
-      rtcWrite(&now);
-      g_lastRtcSyncMs = millis();
-      g_ntpSynced = true;
-      g_ntpResyncRequested = false;
-      Serial.printf("NTP: %s -> RTC gestellt: %04d-%02d-%02d %02d:%02d:%02d\n",
-                    firstSync ? "synchronisiert" : "RTC resync",
-                    now.tm_year + 1900, now.tm_mon + 1, now.tm_mday,
-                    now.tm_hour, now.tm_min, now.tm_sec);
-      return firstSync;
+    const bool resyncReq = g_ntpResyncRequested;
+    const bool rtcUpdated = syncRtcFromNtp(&now);
+    if (rtcUpdated || !wasSynced || resyncDue || resyncReq) {
+      if (!wasSynced) Serial.println("NTP: synchronisiert");
+      return true;
     }
   }
   return false;
@@ -749,6 +765,16 @@ class SpartanScanCB : public NimBLEScanCallbacks {
 static SpartanClientCB spartanClientCB;
 static SpartanScanCB   spartanScanCB;
 
+static bool bleTryConnectSavedMac() {
+  if (g_bleConn || bleDoConnect || g_bleDiscoveryScan) return false;
+  const char* macStr = bleSavedMacForMode();
+  if (!macStr[0]) return false;
+  bleTarget = NimBLEAddress(std::string(macStr), BLE_ADDR_RANDOM);
+  bleDoConnect = true;
+  Serial.printf("BLE: Direktconnect %s (%s)\n", macStr, bleConnModeLabel());
+  return true;
+}
+
 static void bleStartScan() {
   if (g_bleConn || bleDoConnect || g_bleDiscoveryScan) return;
   auto* s = NimBLEDevice::getScan();
@@ -829,7 +855,7 @@ static void bleTick() {
   if (bleDoConnect) { bleConnect(); return; }
   if (!g_bleConn && !g_bleDiscoveryScan && bleNextScanAt != 0 && millis() >= bleNextScanAt) {
     bleNextScanAt = 0;
-    bleStartScan();
+    if (!bleTryConnectSavedMac()) bleStartScan();
   }
 }
 
@@ -1239,9 +1265,9 @@ static void copyVdoDialToFrame() {
 
 static void drawVdoClock() {
   if (!ensureFrame()) return;
-  copyVdoDialToFrame();
   struct tm now = {};
-  readClockTime(&now);
+  if (!readClockTime(&now)) return;
+  copyVdoDialToFrame();
   float seconds     = now.tm_sec;
   float minuteValue = now.tm_min + seconds / 60.0f;
   float hourValue   = (now.tm_hour % 12) + minuteValue / 60.0f;
@@ -2012,11 +2038,13 @@ static void handleWebRoot() {
             "syncBleSetup(d);"
             "if(d.page!==lastPreviewPage){lastPreviewPage=d.page;refreshPreview().then(()=>syncPreviewValues(d));}"
             "else syncPreviewValues(d);}"
-            "async function scanWifi(){const rows=document.getElementById('scanRows');rows.innerHTML='<tr><td colspan=3>Scan laeuft...</td></tr>';try{const r=await fetch('/scan');const d=await r.json();rows.innerHTML=d.networks.map(n=>`<tr><td>${n.ssid}</td><td>${n.rssi}</td><td>${n.connected?'verbunden':''}</td></tr>`).join('')||'<tr><td colspan=3>Keine Netze</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=3>Scan fehlgeschlagen</td></tr>';}}"
-            "async function scanBle(){const rows=document.getElementById('bleScanRows');rows.innerHTML='<tr><td colspan=5>Scan laeuft...</td></tr>';try{const r=await fetch('/ble/scan');if(!r.ok){rows.innerHTML='<tr><td colspan=5>Scan fehlgeschlagen (HTTP '+r.status+')</td></tr>';return;}const d=await r.json();if(d.error==='ble_off'){rows.innerHTML='<tr><td colspan=5>BLE aus – Setup: BLE aktivieren</td></tr>';return;}if(d.error==='scan_failed'){rows.innerHTML='<tr><td colspan=5>BLE-Scan konnte nicht gestartet werden</td></tr>';return;}"
+            "async function fetchWithTimeout(url,ms){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);try{return await fetch(url,{signal:c.signal});}finally{clearTimeout(t);}}"
+            "async function scanWifi(){const rows=document.getElementById('scanRows');rows.innerHTML='<tr><td colspan=3>Scan laeuft...</td></tr>';try{const r=await fetchWithTimeout('/scan',12000);const d=await r.json();rows.innerHTML=d.networks.map(n=>`<tr><td>${n.ssid}</td><td>${n.rssi}</td><td>${n.connected?'verbunden':''}</td></tr>`).join('')||'<tr><td colspan=3>Keine Netze</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=3>Scan fehlgeschlagen</td></tr>';}}"
+            "async function scanBle(){const rows=document.getElementById('bleScanRows');rows.innerHTML='<tr><td colspan=5>Scan laeuft (bis 8s)...</td></tr>';try{const r=await fetchWithTimeout('/ble/scan',15000);if(!r.ok){rows.innerHTML='<tr><td colspan=5>Scan fehlgeschlagen (HTTP '+r.status+')</td></tr>';return;}const d=await r.json();if(d.error==='ble_off'){rows.innerHTML='<tr><td colspan=5>BLE aus – Setup: BLE aktivieren</td></tr>';return;}if(d.error==='scan_failed'){rows.innerHTML='<tr><td colspan=5>BLE-Scan konnte nicht gestartet werden</td></tr>';return;}"
             "const typ=n=>[n.spartan?'Hub':'',n.nus?'NUS':''].filter(Boolean).join(',')||'–';"
             "const list=Array.isArray(d.devices)?d.devices:[];"
-            "rows.innerHTML=list.map(n=>`<tr><td>${n.name}</td><td>${n.mac}</td><td>${n.rssi}</td><td>${typ(n)}</td><td><a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=hub'><button>Hub</button></a> <a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=direct'><button>123</button></a></td></tr>`).join('')||'<tr><td colspan=5>Keine Geraete</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=5>Scan fehlgeschlagen</td></tr>';}}"
+            "const hdr=list.length?`<tr><td colspan=5 class=sub>${list.length} Geraet(e) gefunden</td></tr>`:'';"
+            "rows.innerHTML=hdr+list.map(n=>`<tr><td>${n.name||'---'}</td><td>${n.mac}</td><td>${n.rssi}</td><td>${typ(n)}</td><td><a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=hub'><button>Hub</button></a> <a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=direct'><button>123</button></a></td></tr>`).join('')||'<tr><td colspan=5>Keine Geraete</td></tr>';}catch(e){const msg=(e&&e.name==='AbortError')?'Timeout (>15s) – ESP antwortet nicht':'Scan fehlgeschlagen';rows.innerHTML='<tr><td colspan=5>'+msg+'</td></tr>';}}"
             "function syncBleSetup(d){const m=document.getElementById('bleModeLabel');if(m)m.textContent=d.ble_mode_label||'?';const m2=document.getElementById('bleModeLabel2');if(m2)m2.textContent=d.ble_mode_label||'?';const mac=document.getElementById('bleMacLabel');if(mac)mac.textContent=d.ble_target_mac||'---';const hub=document.getElementById('bleHubMacLabel');if(hub)hub.textContent=d.ble_mac_hub||'---';const dir=document.getElementById('bleDirectMacLabel');if(dir)dir.textContent=d.ble_mac_123||'---';const tz=document.getElementById('tzLabel');if(tz&&d.tz_label)tz.textContent=d.tz_label;}"
             "async function live(){try{const r=await fetch('/api/status');const d=await r.json();document.getElementById('liveBox').textContent=JSON.stringify(d,null,2);syncDashboard(d);}catch(e){document.getElementById('liveBox').textContent='Live-Status nicht erreichbar';}}"
             "const otaForm=document.getElementById('otaForm');"
@@ -2036,10 +2064,24 @@ static void handleWebRoot() {
 }
 
 static String bleBuildScanJson() {
-  String json = F("{\"devices\":[");
-  for (uint8_t i = 0; i < g_bleScanCount; i++) {
+  uint8_t order[BLE_SCAN_MAX];
+  const uint8_t n = g_bleScanCount;
+  for (uint8_t i = 0; i < n; i++) order[i] = i;
+  for (uint8_t i = 0; i + 1 < n; i++) {
+    for (uint8_t j = i + 1; j < n; j++) {
+      if (g_bleScanList[order[j]].rssi > g_bleScanList[order[i]].rssi) {
+        const uint8_t t = order[i];
+        order[i] = order[j];
+        order[j] = t;
+      }
+    }
+  }
+  String json = F("{\"count\":");
+  json += String(n);
+  json += F(",\"devices\":[");
+  for (uint8_t i = 0; i < n; i++) {
     if (i > 0) json += ',';
-    const BleScanEntry& e = g_bleScanList[i];
+    const BleScanEntry& e = g_bleScanList[order[i]];
     json += F("{\"name\":\"");
     json += jsonEscape(String(e.name));
     json += F("\",\"mac\":\"");
@@ -2069,13 +2111,10 @@ static void handleWebBleScan() {
   webServer.client().setTimeout(30000);
 
   bleDoConnect = false;
-  auto* scanDev = NimBLEDevice::getScan();
-  scanDev->stop();
-  bleWaitScanStopped(scanDev, 500);
-  if (bleClient && bleClient->isConnected()) bleClient->disconnect();
   bleAbortDiscoveryScan();
   const bool started = bleStartDiscoveryScan();
-  const uint32_t waitUntil = millis() + BLE_DISCOVERY_SCAN_MS + 2000;
+  auto* scanDev = NimBLEDevice::getScan();
+  const uint32_t waitUntil = millis() + BLE_DISCOVERY_SCAN_MS + 2500;
   while (started && millis() < waitUntil) {
     webServer.handleClient();
     if (!g_bleDiscoveryScan && !scanDev->isScanning()) break;
@@ -2757,11 +2796,10 @@ void loop() {
     drawCurrentPage();
   }
 
-  // Clock: update every second
+  // Clock: update every second (same readClockTime/SNTP path as /api/status)
   if (currentPage == 0 && millis() - lastDraw >= 1000) {
     lastDraw = millis();
     drawVdoClock();
-    hal_restart();  // DMA-Resync gegen WiFi/BLE-bedingten Bildversatz/Schwarz
   }
   // Data pages: update at 2 Hz
   if (currentPage >= 2 && currentPage <= 5 && millis() - lastDraw >= 500) {
