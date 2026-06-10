@@ -13,3 +13,4 @@ CMakeLists.txt
 dependencies.lock
 managed_components/
 sdkconfig*
+!sdkconfig.defaults
