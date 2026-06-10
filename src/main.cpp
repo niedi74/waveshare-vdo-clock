@@ -1419,9 +1419,9 @@ static void handleWebRoot() {
   html += String(g_dialScalePct);
   html += F("</span>%</b><button type='submit'>Uebernehmen</button></div><input type='range' name='scale' min='30' max='100' step='1' value='");
   html += String(g_dialScalePct);
-  html += F("' oninput=\"scaleVal.innerText=this.value\"></form></div><div class='card'><h3>Rotation</h3><div class='row'><b>");
+  html += F("' oninput=\"scaleVal.innerText=this.value\"></form><div class='row'><span><a href='/set?scale_delta=-5'><button>-5%</button></a><a href='/set?scale_delta=-1'><button>-1%</button></a><a href='/set?scale_delta=1'><button>+1%</button></a><a href='/set?scale_delta=5'><button>+5%</button></a></span></div></div><div class='card'><h3>Rotation</h3><div class='row'><b>");
   html += String(g_rotationDeg);
-  html += F("&deg;</b><span><a href='/set?rot_delta=-5'><button>-5&deg;</button></a><a href='/set?rot_delta=-1'><button>-1&deg;</button></a><a href='/set?rot_delta=1'><button>+1&deg;</button></a><a href='/set?rot_delta=5'><button>+5&deg;</button></a></span></div></div></section>");
+  html += F("&deg;</b><span><a href='/set?rot_delta=-5'><button>-5&deg;</button></a><a href='/set?rot_delta=-1'><button>-1&deg;</button></a><a href='/set?rot_delta=1'><button>+1&deg;</button></a><a href='/set?rot_delta=5'><button>+5&deg;</button></a></span></div><div class='row'><span><a href='/set?rot=0'><button>0&deg;</button></a><a href='/set?rot=90'><button>90&deg;</button></a><a href='/set?rot=180'><button>180&deg;</button></a><a href='/set?rot=270'><button>270&deg;</button></a></span></div></div></section>");
 
   html += F("<section class='page' id='p3'><div class='card'><h2>Live</h2><pre id='liveBox'>Lade /api/status ...</pre></div></section>");
 
@@ -1592,6 +1592,11 @@ static void handleWebRestart() {
 static void handleWebSet() {
   if (webServer.hasArg("scale")) {
     saveDialScale(webServer.arg("scale").toInt());
+    g_redrawPage = true;
+    Serial.printf("Web: Zifferblatt-Groesse = %d%%\n", g_dialScalePct);
+  }
+  if (webServer.hasArg("scale_delta")) {
+    saveDialScale(g_dialScalePct + webServer.arg("scale_delta").toInt());
     g_redrawPage = true;
     Serial.printf("Web: Zifferblatt-Groesse = %d%%\n", g_dialScalePct);
   }
