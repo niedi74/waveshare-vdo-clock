@@ -43,10 +43,26 @@
 #define RGB565_BLACK RGB565(0, 0, 0)
 #endif
 
-// -------- Spartan3-Hub BLE-Client --------
-#define SPARTAN_MAC    "30:30:f9:1d:d0:fd"
-#define SPARTAN_SVC    "7f510001-5a6b-4d2a-9f20-14a7f3e20000"
-#define SPARTAN_STATUS "7f510002-5a6b-4d2a-9f20-14a7f3e20000"
+// -------- Spartan3-Hub / 123TUNE+ BLE-Client --------
+#define SPARTAN_MAC     "30:30:f9:1d:d0:fd"
+#define SPARTAN_NAME    "Spartan3-Hub"
+#define SPARTAN_SVC     "7f510001-5a6b-4d2a-9f20-14a7f3e20000"
+#define SPARTAN_STATUS  "7f510002-5a6b-4d2a-9f20-14a7f3e20000"
+#define NUS_SVC         "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define NUS_RX          "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+#define NUS_TX          "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+#define DEFAULT_123_MAC "ef:a8:b2:de:e0:9e"
+#define BLE_SCAN_MAX    8
+
+enum BleConnMode : uint8_t { BLE_MODE_DIRECT_123 = 0, BLE_MODE_SPARTAN_HUB = 1 };
+
+struct BleScanEntry {
+  char mac[18];
+  char name[24];
+  int8_t rssi;
+  bool spartan;
+  bool nus;
+};
 
 static float g_lambda = 0, g_rpm = 0, g_adv = 0, g_map = 0;
 static float g_battVolt = 0, g_speedKmh = 0;
@@ -61,6 +77,12 @@ static NimBLEClient*      bleClient    = nullptr;
 static NimBLEAddress      bleTarget;
 static volatile bool      bleDoConnect = false;
 static uint32_t           bleNextScanAt = 0;
+static BleConnMode        g_bleConnMode = BLE_MODE_SPARTAN_HUB;
+static char               g_bleTargetMac[18] = DEFAULT_123_MAC;
+static BleScanEntry       g_bleScanList[BLE_SCAN_MAX];
+static uint8_t            g_bleScanCount = 0;
+static volatile bool      g_bleDiscoveryScan = false;
+static uint8_t            g_blePickIndex = 0;
 
 // ---- GT911 touch state ----
 static uint8_t  gt911Addr = GT911_ADDR_PRIMARY;
@@ -368,7 +390,92 @@ static bool wifiNtpTick() {
   return false;
 }
 
-// -------- BLE Spartan3-Hub client --------
+// -------- BLE Spartan3-Hub / 123TUNE+ client --------
+static const char* bleConnModeLabel() {
+  return g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "HUB" : "123 dir";
+}
+
+static bool macEquals(const String& a, const char* b) {
+  String x = a; x.toLowerCase();
+  String y = String(b); y.toLowerCase();
+  return x == y;
+}
+
+static void clearBleLiveValues() {
+  g_lambda = g_rpm = g_adv = g_map = 0;
+  g_battVolt = g_speedKmh = 0;
+  g_g123Volt = g_g123Temp = g_g123Coil = 0;
+  g_lambdaValid = g_battValid = g_speedValid = g_g123Valid = false;
+  g_bleRxCnt = 0;
+  g_bleLastRx = 0;
+}
+
+static void disconnectBleForModeChange() {
+  bleDoConnect = false;
+  g_bleConn = false;
+  g_bleHubName = "---";
+  clearBleLiveValues();
+  NimBLEDevice::getScan()->stop();
+  if (bleClient && bleClient->isConnected()) bleClient->disconnect();
+  bleNextScanAt = millis() + 2000;
+}
+
+static void saveBleConnMode(BleConnMode mode) {
+  g_bleConnMode = mode;
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("ble_mode", static_cast<uint8_t>(g_bleConnMode));
+  p.end();
+}
+
+static void saveBleTargetMac(const char* mac) {
+  strncpy(g_bleTargetMac, mac, sizeof(g_bleTargetMac) - 1);
+  g_bleTargetMac[sizeof(g_bleTargetMac) - 1] = 0;
+  Preferences p;
+  p.begin("clock", false);
+  p.putString("ble_mac", g_bleTargetMac);
+  p.end();
+}
+
+static void cycleBleConnMode() {
+  BleConnMode next = g_bleConnMode == BLE_MODE_SPARTAN_HUB ?
+                     BLE_MODE_DIRECT_123 : BLE_MODE_SPARTAN_HUB;
+  if (next == g_bleConnMode) return;
+  saveBleConnMode(next);
+  disconnectBleForModeChange();
+  Serial.printf("BLE: Quelle -> %s\n", bleConnModeLabel());
+}
+
+static int bleHexNib(uint8_t c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return 0;
+}
+
+static void decode123Frame(const uint8_t* d, size_t n) {
+  if (n < 3) return;
+  int hi  = bleHexNib(d[1]);
+  int lo  = bleHexNib(d[2]);
+  int raw = (hi << 4) | lo;
+  switch (d[0]) {
+    case 0x30: g_rpm = hi * 800.0f + lo * 50.0f; break;
+    case 0x31: g_adv = hi * 3.2f   + lo * 0.2f;  break;
+    case 0x32: g_map = (float)raw;               break;
+    case 0x33:
+      g_g123Temp = (float)(raw - 30);
+      g_g123Valid = true;
+      break;
+    case 0x41:
+      g_battVolt = raw / 4.54f;
+      g_battValid = g_battVolt > 0.5f;
+      break;
+    default: break;
+  }
+  g_bleRxCnt++;
+  g_bleLastRx = millis();
+}
+
 static void parseSpartanPayload(const String& p) {
   if (!(p.startsWith("L") && p.indexOf('R') > 1)) return;
   int posR = p.indexOf('R');
@@ -410,17 +517,21 @@ static void parseSpartanPayload(const String& p) {
   g_bleLastRx = millis();
 }
 
-static void bleNotifyCB(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
+static void bleNotifyHubCB(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
   String s;
   s.reserve(len + 1);
   for (size_t i = 0; i < len; i++) s += (char)data[i];
   parseSpartanPayload(s);
 }
 
+static void bleNotify123CB(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
+  decode123Frame(data, len);
+}
+
 class SpartanClientCB : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient*) override {
     g_bleConn = true;
-    Serial.println("BLE: mit Spartan-Hub verbunden");
+    Serial.printf("BLE: verbunden (%s)\n", bleConnModeLabel());
   }
   void onDisconnect(NimBLEClient*, int reason) override {
     g_bleConn = false;
@@ -433,21 +544,63 @@ class SpartanClientCB : public NimBLEClientCallbacks {
   }
 };
 
-class SpartanScanCB : public NimBLEScanCallbacks {
-  void onResult(const NimBLEAdvertisedDevice* dev) override {
-    String addr = dev->getAddress().toString().c_str();
-    addr.toLowerCase();
-    String name = dev->getName().c_str();
-    g_bleHubName = name.length() > 0 ? name : "---";
-    if (addr == SPARTAN_MAC ||
-        dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC))) {
-      bleTarget    = dev->getAddress();
-      bleDoConnect = true;
-      NimBLEDevice::getScan()->stop();
-      Serial.printf("BLE: Spartan-Hub gefunden (%s / %s)\n", addr.c_str(), name.c_str());
+static void bleScanListAdd(const NimBLEAdvertisedDevice* dev) {
+  if (g_bleScanCount >= BLE_SCAN_MAX) return;
+  String addr = dev->getAddress().toString().c_str();
+  addr.toLowerCase();
+  for (uint8_t i = 0; i < g_bleScanCount; i++) {
+    if (macEquals(addr, g_bleScanList[i].mac)) {
+      g_bleScanList[i].rssi = dev->getRSSI();
+      return;
     }
   }
+  BleScanEntry& e = g_bleScanList[g_bleScanCount++];
+  strncpy(e.mac, addr.c_str(), sizeof(e.mac) - 1);
+  e.mac[sizeof(e.mac) - 1] = 0;
+  String name = dev->getName().c_str();
+  strncpy(e.name, name.length() > 0 ? name.c_str() : "---", sizeof(e.name) - 1);
+  e.name[sizeof(e.name) - 1] = 0;
+  e.rssi = dev->getRSSI();
+  e.spartan = dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC)) || name == SPARTAN_NAME;
+  e.nus = dev->isAdvertisingService(NimBLEUUID(NUS_SVC));
+}
+
+static bool bleScanMatchesTarget(const NimBLEAdvertisedDevice* dev, String& addr, String& name) {
+  addr = dev->getAddress().toString().c_str();
+  addr.toLowerCase();
+  name = dev->getName().c_str();
+  if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
+    return name == SPARTAN_NAME ||
+           addr == SPARTAN_MAC ||
+           macEquals(addr, g_bleTargetMac) ||
+           dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC));
+  }
+  return macEquals(addr, g_bleTargetMac);
+}
+
+class SpartanScanCB : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* dev) override {
+    String addr, name;
+    if (g_bleDiscoveryScan) {
+      bleScanListAdd(dev);
+      return;
+    }
+    if (!bleScanMatchesTarget(dev, addr, name)) return;
+    g_bleHubName = name.length() > 0 ? name :
+                   (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? SPARTAN_NAME : "123");
+    bleTarget    = dev->getAddress();
+    bleDoConnect = true;
+    NimBLEDevice::getScan()->stop();
+    Serial.printf("BLE: %s gefunden (%s / %s)\n",
+                  g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "Hub" : "123",
+                  addr.c_str(), name.c_str());
+  }
   void onScanEnd(const NimBLEScanResults&, int) override {
+    if (g_bleDiscoveryScan) {
+      g_bleDiscoveryScan = false;
+      Serial.printf("BLE: Discovery %u Geraete\n", g_bleScanCount);
+      return;
+    }
     if (!g_bleConn && !bleDoConnect) bleNextScanAt = millis() + 15000;
   }
 };
@@ -456,14 +609,31 @@ static SpartanClientCB spartanClientCB;
 static SpartanScanCB   spartanScanCB;
 
 static void bleStartScan() {
-  if (g_bleConn || bleDoConnect) return;
+  if (g_bleConn || bleDoConnect || g_bleDiscoveryScan) return;
   auto* s = NimBLEDevice::getScan();
   s->setScanCallbacks(&spartanScanCB);
-  s->setActiveScan(false);
+  s->setActiveScan(g_bleConnMode == BLE_MODE_DIRECT_123);
   s->setInterval(160);
   s->setWindow(30);
-  s->start(3000, false);
-  Serial.println("BLE: Scan nach Spartan-Hub...");
+  s->start(g_bleConnMode == BLE_MODE_DIRECT_123 ? 10000 : 3000, false);
+  Serial.printf("BLE: Scan nach %s...\n", bleConnModeLabel());
+}
+
+static void bleStartDiscoveryScan() {
+  if (!g_featureBle || g_bleDiscoveryScan) return;
+  if (bleClient && bleClient->isConnected()) bleClient->disconnect();
+  bleDoConnect = false;
+  g_bleConn = false;
+  g_bleScanCount = 0;
+  g_bleDiscoveryScan = true;
+  auto* s = NimBLEDevice::getScan();
+  s->stop();
+  s->setScanCallbacks(&spartanScanCB);
+  s->setActiveScan(true);
+  s->setInterval(100);
+  s->setWindow(99);
+  s->start(10000, false);
+  Serial.println("BLE: Discovery-Scan...");
 }
 
 static void bleConnect() {
@@ -472,22 +642,34 @@ static void bleConnect() {
     bleClient = NimBLEDevice::createClient();
     bleClient->setClientCallbacks(&spartanClientCB, false);
   }
+  if (g_bleConnMode == BLE_MODE_DIRECT_123) {
+    bleClient->setConnectionParams(16, 32, 0, 400);
+  }
   if (!bleClient->connect(bleTarget, true, false, false)) {
     Serial.println("BLE: Connect fehlgeschlagen");
     bleNextScanAt = millis() + 15000;
     return;
   }
-  auto* svc = bleClient->getService(SPARTAN_SVC);
-  if (!svc) { Serial.println("BLE: kein Service"); bleNextScanAt = millis() + 15000; return; }
-  auto* status = svc->getCharacteristic(SPARTAN_STATUS);
-  if (!status) { Serial.println("BLE: kein Status-Char"); bleNextScanAt = millis() + 15000; return; }
-  bool ok = status->subscribe(true, bleNotifyCB, true);
-  Serial.printf("BLE: Subscribe %s\n", ok ? "OK" : "FAIL");
+  if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
+    auto* svc = bleClient->getService(SPARTAN_SVC);
+    if (!svc) { Serial.println("BLE: kein Hub-Service"); bleNextScanAt = millis() + 15000; return; }
+    auto* status = svc->getCharacteristic(SPARTAN_STATUS);
+    if (!status) { Serial.println("BLE: kein Hub-Status"); bleNextScanAt = millis() + 15000; return; }
+    bool ok = status->subscribe(true, bleNotifyHubCB, true);
+    Serial.printf("BLE: Hub-Subscribe %s\n", ok ? "OK" : "FAIL");
+    return;
+  }
+  auto* svc = bleClient->getService(NUS_SVC);
+  if (!svc) { Serial.println("BLE: kein NUS-Service"); bleNextScanAt = millis() + 15000; return; }
+  auto* tx = svc->getCharacteristic(NUS_TX);
+  if (!tx) { Serial.println("BLE: kein NUS-TX"); bleNextScanAt = millis() + 15000; return; }
+  bool ok = tx->subscribe(true, bleNotify123CB, true);
+  Serial.printf("BLE: 123-Subscribe %s\n", ok ? "OK" : "FAIL");
 }
 
 static void bleTick() {
   if (bleDoConnect) { bleConnect(); return; }
-  if (!g_bleConn && bleNextScanAt != 0 && millis() >= bleNextScanAt) {
+  if (!g_bleConn && !g_bleDiscoveryScan && bleNextScanAt != 0 && millis() >= bleNextScanAt) {
     bleNextScanAt = 0;
     bleStartScan();
   }
@@ -902,7 +1084,8 @@ static void drawMotorPage() {
   else drawDataRow(278, "123T", na, cv);
   if (fresh && g_battValid) { snprintf(buf, sizeof(buf), "%.1fV", g_battVolt); drawDataRow(318, "BATT", buf, cv); }
   else drawDataRow(318, "BATT", na, cv);
-  const char* st = g_bleConn ? (fresh ? "LIVE" : "WARTE") : "KEIN HUB";
+  const char* st = g_bleConn ? (fresh ? "LIVE" : "WARTE") :
+                   (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "KEIN HUB" : "KEIN 123");
   drawTextCentered(240, 370, st, g_bleConn && fresh ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
   presentFrame();
 }
@@ -927,7 +1110,8 @@ static void drawLambdaPage() {
     char sp[16]; snprintf(sp, sizeof(sp), "%d km/h", (int)g_speedKmh);
     drawTextCentered(240, 318, sp, RGB565(180, 180, 180), 3);
   }
-  const char* st = g_bleConn ? (bleFresh() ? "LIVE" : "WARTE") : "KEIN HUB";
+  const char* st = g_bleConn ? (bleFresh() ? "LIVE" : "WARTE") :
+                   (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "KEIN HUB" : "KEIN 123");
   drawTextCentered(240, 370, st, g_bleConn && bleFresh() ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
   presentFrame();
 }
@@ -936,20 +1120,22 @@ static void drawHubPage() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(150, 70, 180));
-  drawTextCentered(240, 54, "HUB", RGB565(205, 120, 230), 5);
-  drawTextCentered(240, 84, g_bleHubName.c_str(), RGB565(150, 150, 150), 2);
+  drawTextCentered(240, 54, "BLE", RGB565(205, 120, 230), 5);
+  drawTextCentered(240, 84, bleConnModeLabel(), RGB565(150, 150, 150), 2);
   char buf[24];
-  drawDataRow(112, "BLE",   g_bleConn ? "OK" : "SCAN",
+  drawDataRow(112, "ZIEL",  g_bleConnMode == BLE_MODE_SPARTAN_HUB ? g_bleHubName.c_str() : g_bleTargetMac,
+              RGB565(235, 235, 225));
+  drawDataRow(148, "BLE",   g_bleConn ? "OK" : "SCAN",
               g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   snprintf(buf, sizeof(buf), "%lu", (unsigned long)g_bleRxCnt);
-  drawDataRow(152, "RX",    buf, RGB565(235, 235, 225));
+  drawDataRow(188, "RX",    buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%lu MS", g_bleLastRx ? (unsigned long)(millis() - g_bleLastRx) : 0UL);
-  drawDataRow(192, "AGE",   buf, RGB565(235, 235, 225));
+  drawDataRow(228, "AGE",   buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%.1f V", g_battVolt);
-  drawDataRow(232, "BATT",  g_battValid  ? buf : "---", RGB565(235, 235, 225));
+  drawDataRow(268, "BATT",  g_battValid  ? buf : "---", RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%.0f KMH", g_speedKmh);
-  drawDataRow(272, "SPEED", g_speedValid ? buf : "---", RGB565(235, 235, 225));
-  drawDataRow(312, "IP",    g_ipStr, RGB565(150, 200, 150));
+  drawDataRow(308, "SPEED", g_speedValid ? buf : "---", RGB565(235, 235, 225));
+  drawDataRow(348, "IP",    g_ipStr, RGB565(150, 200, 150));
   drawTextCentered(240, 370, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
@@ -977,7 +1163,8 @@ static void drawSetupPage() {
               g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   drawDataRow(290, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
               g_featureBuzzer ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
-  drawDataRow(326, "HUB",    g_bleHubName.c_str(), RGB565(150, 150, 150));
+  drawDataRow(326, "QUELLE", bleConnModeLabel(),
+              g_bleConnMode == BLE_MODE_SPARTAN_HUB ? RGB565(80, 160, 240) : RGB565(235, 150, 60));
   drawTextCentered(240, 372, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
@@ -1036,6 +1223,11 @@ static void loadSettings() {
   g_featureWifi   = p.getBool("feat_wifi", strlen(currentWifiSsid()) > 0);
   g_featureBle    = p.getBool("feat_ble",  false);
   g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
+  g_bleConnMode   = p.getUChar("ble_mode", BLE_MODE_SPARTAN_HUB) == BLE_MODE_DIRECT_123 ?
+                    BLE_MODE_DIRECT_123 : BLE_MODE_SPARTAN_HUB;
+  String mac = p.getString("ble_mac", DEFAULT_123_MAC);
+  strncpy(g_bleTargetMac, mac.c_str(), sizeof(g_bleTargetMac) - 1);
+  g_bleTargetMac[sizeof(g_bleTargetMac) - 1] = 0;
   p.end();
   if (g_dialScalePct  < 30)  g_dialScalePct  = 30;
   if (g_dialScalePct  > 100) g_dialScalePct  = 100;
@@ -1430,9 +1622,18 @@ static void handleWebRoot() {
   html += g_featureWifi ? F("checked") : F("");
   html += F("> WLAN/Web aktiv</label></p><p><label><input type='checkbox' name='ble' value='1' ");
   html += g_featureBle ? F("checked") : F("");
-  html += F("> BLE-Hub Daten aktiv</label></p><p><label><input type='checkbox' name='buzzer' value='1' ");
+  html += F("> BLE Daten aktiv</label></p><p><label><input type='checkbox' name='buzzer' value='1' ");
   html += g_featureBuzzer ? F("checked") : F("");
   html += F("> Buzzer aktiv</label></p><button type='submit'>Speichern</button></form></div>"
+            "<div class='card'><h2>BLE Quelle</h2><div class='row'><span>Aktiv: <b id='bleModeLabel'>");
+  html += String(bleConnModeLabel());
+  html += F("</b></span><span><a href='/ble/mode?m=hub'><button");
+  if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) html += F(" style='background:#54d273'");
+  html += F(">Spartan Hub</button></a><a href='/ble/mode?m=direct'><button");
+  if (g_bleConnMode == BLE_MODE_DIRECT_123) html += F(" style='background:#54d273'");
+  html += F(">123 direkt</button></a></span></div><p class='sub'>Ziel-MAC: <span id='bleMacLabel'>");
+  html += String(g_bleTargetMac);
+  html += F("</span></p><button onclick='scanBle()'>&#128269; BLE Scan</button><table><thead><tr><th>Name</th><th>MAC</th><th>RSSI</th><th></th></tr></thead><tbody id='bleScanRows'><tr><td colspan='4'>Noch kein Scan</td></tr></tbody></table></div>"
             "<div class='card'><h2>OTA Firmware</h2><p class='sub'>Kaputte Updates rollen automatisch zur vorherigen Firmware zurueck. PC-Backup: backups/esp32s3_vdo_backup_2026-06-10.bin (esptool).</p>"
             "<form id='otaForm' method='POST' action='/update' enctype='multipart/form-data'><input class='file' type='file' name='update' accept='.bin,application/octet-stream' required><button type='submit' id='otaBtn'>Firmware hochladen</button>"
             "<div class='ota-progress' id='otaProgress' hidden><div class='ota-track'><div class='ota-bar' id='otaBar'></div></div><p id='otaStatus' class='sub'>Upload laeuft...</p></div></form></div>"
@@ -1469,9 +1670,12 @@ static void handleWebRoot() {
             "set('dashPage',String(d.page));set('dashPageLabel',pageNames[d.page]||'?');set('dashRx',String(d.ble_rx||0));"
             "const ble=document.getElementById('dashBle');if(ble){ble.textContent=d.ble_enabled?(d.ble_connected?'verbunden':'scan/wartet'):'aus';"
             "ble.className=d.ble_enabled&&d.ble_connected?'ok':'warn';}"
+            "syncBleSetup(d);"
             "if(d.page!==lastPreviewPage){lastPreviewPage=d.page;refreshPreview().then(()=>syncPreviewValues(d));}"
             "else syncPreviewValues(d);}"
             "async function scanWifi(){const rows=document.getElementById('scanRows');rows.innerHTML='<tr><td colspan=3>Scan laeuft...</td></tr>';try{const r=await fetch('/scan');const d=await r.json();rows.innerHTML=d.networks.map(n=>`<tr><td>${n.ssid}</td><td>${n.rssi}</td><td>${n.connected?'verbunden':''}</td></tr>`).join('')||'<tr><td colspan=3>Keine Netze</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=3>Scan fehlgeschlagen</td></tr>';}}"
+            "async function scanBle(){const rows=document.getElementById('bleScanRows');rows.innerHTML='<tr><td colspan=4>Scan laeuft...</td></tr>';try{const r=await fetch('/ble/scan');const d=await r.json();rows.innerHTML=d.devices.map(n=>`<tr><td>${n.name}</td><td>${n.mac}</td><td>${n.rssi}</td><td><a href='/ble/select?mac=${encodeURIComponent(n.mac)}'><button>Waehlen</button></a></td></tr>`).join('')||'<tr><td colspan=4>Keine Geraete</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=4>Scan fehlgeschlagen</td></tr>';}}"
+            "function syncBleSetup(d){const m=document.getElementById('bleModeLabel');if(m)m.textContent=d.ble_mode_label||'?';const mac=document.getElementById('bleMacLabel');if(mac)mac.textContent=d.ble_target_mac||'---';}"
             "async function live(){try{const r=await fetch('/api/status');const d=await r.json();document.getElementById('liveBox').textContent=JSON.stringify(d,null,2);syncDashboard(d);}catch(e){document.getElementById('liveBox').textContent='Live-Status nicht erreichbar';}}"
             "const otaForm=document.getElementById('otaForm');"
             "function otaShow(pct,msg){const bar=document.getElementById('otaBar');const st=document.getElementById('otaStatus');const box=document.getElementById('otaProgress');if(box)box.hidden=false;if(bar)bar.style.width=Math.max(0,Math.min(100,pct))+'%';if(st)st.textContent=msg||'Upload laeuft...';}"
@@ -1487,6 +1691,83 @@ static void handleWebRoot() {
             "xhr.onerror=()=>{clearInterval(poll);otaShow(0,'Netzwerkfehler');if(btn)btn.disabled=false;};xhr.send(fd);});}"
             "live();liveTimer=setInterval(live,1000);handTimer=setInterval(updateHands,250);</script><p class='sub'>VW T2b Cockpit &middot; ESP32-S3 2.8C</p></main></body></html>");
   webServer.send(200, "text/html", html);
+}
+
+static void handleWebBleScan() {
+  if (webOtaRejectBusy()) return;
+  if (!g_featureBle) {
+    webServer.send(409, "application/json", F("{\"devices\":[],\"error\":\"ble_off\"}"));
+    return;
+  }
+  bleStartDiscoveryScan();
+  uint32_t waitUntil = millis() + 11000;
+  while (g_bleDiscoveryScan && millis() < waitUntil) {
+    webServer.handleClient();
+    delay(10);
+    yield();
+  }
+  String json = F("{\"devices\":[");
+  for (uint8_t i = 0; i < g_bleScanCount; i++) {
+    if (i > 0) json += ',';
+    const BleScanEntry& e = g_bleScanList[i];
+    json += F("{\"name\":\"");
+    json += jsonEscape(String(e.name));
+    json += F("\",\"mac\":\"");
+    json += jsonEscape(String(e.mac));
+    json += F("\",\"rssi\":");
+    json += String(e.rssi);
+    json += F(",\"spartan\":");
+    json += e.spartan ? F("true") : F("false");
+    json += F(",\"nus\":");
+    json += e.nus ? F("true") : F("false");
+    json += '}';
+  }
+  json += F("]}");
+  webServer.send(200, "application/json", json);
+}
+
+static void handleWebBleSelect() {
+  if (webOtaRejectBusy()) return;
+  if (!webServer.hasArg("mac")) {
+    webServer.send(400, "text/plain", "mac required");
+    return;
+  }
+  String mac = webServer.arg("mac");
+  mac.toLowerCase();
+  BleConnMode mode = BLE_MODE_DIRECT_123;
+  if (webServer.hasArg("mode")) {
+    const String m = webServer.arg("mode");
+    if (m == "hub" || m == "gateway") mode = BLE_MODE_SPARTAN_HUB;
+  } else {
+    for (uint8_t i = 0; i < g_bleScanCount; i++) {
+      if (macEquals(mac, g_bleScanList[i].mac)) {
+        mode = g_bleScanList[i].spartan ? BLE_MODE_SPARTAN_HUB : BLE_MODE_DIRECT_123;
+        break;
+      }
+    }
+  }
+  saveBleTargetMac(mac.c_str());
+  saveBleConnMode(mode);
+  disconnectBleForModeChange();
+  Serial.printf("Web: BLE Ziel -> %s (%s)\n", g_bleTargetMac, bleConnModeLabel());
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+static void handleWebBleMode() {
+  if (webOtaRejectBusy()) return;
+  BleConnMode next = BLE_MODE_SPARTAN_HUB;
+  if (webServer.hasArg("m")) {
+    const String m = webServer.arg("m");
+    if (m == "direct" || m == "123") next = BLE_MODE_DIRECT_123;
+  }
+  if (next != g_bleConnMode) {
+    saveBleConnMode(next);
+    disconnectBleForModeChange();
+    Serial.printf("Web: BLE Quelle -> %s\n", bleConnModeLabel());
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
 }
 
 static void handleWebScan() {
@@ -1546,7 +1827,15 @@ static void handleWebStatus() {
   json += g_bleConn ? F("true") : F("false");
   json += F(",\"ble_rx\":");
   json += String((unsigned long)g_bleRxCnt);
-  json += F(",\"page\":");
+  json += F(",\"ble_mode\":\"");
+  json += g_bleConnMode == BLE_MODE_SPARTAN_HUB ? F("hub") : F("direct");
+  json += F("\",\"ble_mode_label\":\"");
+  json += bleConnModeLabel();
+  json += F("\",\"ble_target_mac\":\"");
+  json += jsonEscape(String(g_bleTargetMac));
+  json += F("\",\"ble_target_name\":\"");
+  json += jsonEscape(g_bleHubName);
+  json += F("\",\"page\":");
   json += String(currentPage);
   json += F(",\"page_label\":\"");
   json += webPageLabel(currentPage);
@@ -1662,6 +1951,9 @@ static void startWebServer() {
   webServer.on("/page",    handleWebPage);
   webServer.on("/wifi",    handleWebWifi);
   webServer.on("/scan",    HTTP_GET, handleWebScan);
+  webServer.on("/ble/scan", HTTP_GET, handleWebBleScan);
+  webServer.on("/ble/select", HTTP_GET, handleWebBleSelect);
+  webServer.on("/ble/mode", HTTP_GET, handleWebBleMode);
   webServer.on("/api/status", HTTP_GET, handleWebStatus);
   webServer.on("/api/ota/progress", HTTP_GET, handleWebOtaProgress);
   webServer.on("/api/preview", HTTP_GET, handleWebPreview);
@@ -1752,6 +2044,10 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
     drawSetupPage();
     Serial.printf("setup tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
+  } else if (y >= 308 && y < 344) {     // QUELLE (Zeile 326)
+    cycleBleConnMode();
+    drawSetupPage();
+    Serial.printf("setup tap: ble_source=%s\n", bleConnModeLabel());
   } else {
     drawSetupPage();
     Serial.println("setup tap: no action");
@@ -1953,7 +2249,12 @@ void loop() {
         else if (cmd == "rot:-") { saveRotation(g_rotationDeg - 1); g_redrawPage = true; }
         else if (cmd.startsWith("rot:")) { saveRotation(cmd.substring(4).toInt()); g_redrawPage = true; }
         else if (cmd == "clock")   { currentPage = 0; drawVdoClock(); }
-        else { Serial.println("Commands: ble:on|off | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock"); }
+        else if (cmd == "ble:hub") { saveBleConnMode(BLE_MODE_SPARTAN_HUB); disconnectBleForModeChange(); g_redrawPage = true; }
+        else if (cmd == "ble:123" || cmd == "ble:direct") {
+          saveBleConnMode(BLE_MODE_DIRECT_123); disconnectBleForModeChange(); g_redrawPage = true;
+        }
+        else if (cmd == "ble:scan") { bleStartDiscoveryScan(); }
+        else { Serial.println("Commands: ble:on|off|hub|123|scan | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
