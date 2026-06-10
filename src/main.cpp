@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Update.h>
 #include <NimBLEDevice.h>
 #if __has_include("wifi_secret.h")
   #include "wifi_secret.h"
@@ -1008,90 +1009,170 @@ static void saveFeatures(bool wifi, bool ble, bool buzzer) {
 }
 
 // -------- Web-GUI --------
+static String jsonEscape(const String& value) {
+  String out;
+  out.reserve(value.length() + 4);
+  for (size_t i = 0; i < value.length(); i++) {
+    const char c = value[i];
+    if (c == '\\' || c == '"') {
+      out += '\\';
+      out += c;
+    } else if (c == '\n') {
+      out += F("\\n");
+    } else if (c == '\r') {
+      out += F("\\r");
+    } else if (c == '\t') {
+      out += F("\\t");
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 static void handleWebRoot() {
   struct tm now = {};
   readClockTime(&now);
   char timeStr[16];
   snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
 
-  String html = F("<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
+  String html;
+  html.reserve(12288);
+  html += F("<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>VDO Uhr</title><style>"
-    "body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:20px;text-align:center}"
-    "h1{color:#e0c040;font-weight:600}.card{background:#1c1c1c;border-radius:12px;padding:18px;margin:14px auto;max-width:420px}"
-    ".big{font-size:2.2em;letter-spacing:2px}input[type=range]{width:90%}"
-    "button{background:#e0c040;border:0;border-radius:8px;padding:12px 20px;font-size:1em;margin:6px;cursor:pointer}"
-    "a{color:#8cf}.val{font-size:1.6em;color:#e0c040}</style></head><body>");
-  html += F("<h1>VDO Quartz-Zeit</h1>");
-  html += "<div class='card'><div class='big'>" + String(timeStr) + "</div>";
-  html += "<div>IP " + String(g_ipStr) + "</div></div>";
+    "<title>VDO Cockpit</title><style>"
+    ":root{color-scheme:dark;--bg:#070707;--panel:#151515;--line:#2b2b2b;--gold:#e0c040;--muted:#9a9a9a;--ok:#54d273;--warn:#e7a944}"
+    "*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:radial-gradient(circle at top,#202020,#070707 60%);color:#eee;margin:0;padding:16px}"
+    "main{max-width:760px;margin:0 auto}h1{margin:10px 0 4px;color:var(--gold);font-weight:700}.sub{color:var(--muted);margin-bottom:16px}"
+    ".tabs{display:flex;gap:7px;overflow:auto;margin-bottom:12px}.tabs label{background:#202020;border:1px solid var(--line);border-radius:999px;padding:10px 13px;white-space:nowrap;cursor:pointer}"
+    "input.tab{display:none}.page{display:none}.card{background:rgba(21,21,21,.95);border:1px solid var(--line);border-radius:18px;padding:17px;margin:12px 0;box-shadow:0 10px 30px #0005}"
+    "#t0:checked~.tabs label[for=t0],#t1:checked~.tabs label[for=t1],#t2:checked~.tabs label[for=t2],#t3:checked~.tabs label[for=t3],#t4:checked~.tabs label[for=t4]{background:var(--gold);color:#161100;border-color:var(--gold)}"
+    "#t0:checked~#p0,#t1:checked~#p1,#t2:checked~#p2,#t3:checked~#p3,#t4:checked~#p4{display:block}"
+    ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.metric{background:#0c0c0c;border:1px solid #262626;border-radius:14px;padding:14px;text-align:left}"
+    ".metric b{display:block;font-size:1.7rem;color:#fff}.metric span{color:var(--muted);font-size:.9rem}.ok{color:var(--ok)}.warn{color:var(--warn)}"
+    "button{background:var(--gold);border:0;border-radius:10px;padding:11px 15px;margin:5px 4px;color:#171200;font-weight:700;cursor:pointer}a{color:#9bd1ff;text-decoration:none}"
+    "input[type=range]{width:100%}.row{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}.pill{border:1px solid #333;border-radius:999px;padding:6px 10px;color:#ccc}"
+    ".dial{width:min(72vw,310px);aspect-ratio:1;border-radius:50%;margin:12px auto;background:radial-gradient(circle,#29251a 0 8%,#d7d0bd 9% 10%,#111 11% 58%,#2a2a2a 59% 60%,#050505 61%);border:8px solid #2c2c2c;position:relative;box-shadow:inset 0 0 30px #000,0 10px 30px #0007}"
+    ".dial:before{content:'';position:absolute;left:50%;top:16%;width:4px;height:38%;background:#eae6da;transform-origin:50% 100%;transform:translateX(-50%) rotate(28deg);border-radius:4px}.dial:after{content:'';position:absolute;left:50%;top:11%;width:2px;height:43%;background:#df2722;transform-origin:50% 100%;transform:translateX(-50%) rotate(130deg);border-radius:4px}"
+    "table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #292929;text-align:left}.file{width:100%;padding:12px;background:#0d0d0d;border:1px solid #333;border-radius:10px;color:#eee}</style></head><body><main>");
+  html += F("<h1>VDO Cockpit</h1><div class='sub'>ESP32-S3 WebGUI &middot; IP ");
+  html += String(g_ipStr);
+  html += F(" &middot; ");
+  html += String(timeStr);
+  html += F("</div><input class='tab' id='t0' name='tab' type='radio' checked><input class='tab' id='t1' name='tab' type='radio'><input class='tab' id='t2' name='tab' type='radio'><input class='tab' id='t3' name='tab' type='radio'><input class='tab' id='t4' name='tab' type='radio'>"
+            "<nav class='tabs'><label for='t0'>Dashboard</label><label for='t1'>WLAN</label><label for='t2'>Display</label><label for='t3'>Live</label><label for='t4'>Setup</label></nav>");
 
-  // WLAN-Profil umschalten
-  html += F("<div class='card'><h3>WLAN</h3>");
-  html += "<div>Aktiv: <b>" + String(currentWifiSsid()) + "</b> &middot; " +
-          String(WiFi.status() == WL_CONNECTED ? "verbunden" : "nicht verbunden") + "</div>";
+  html += F("<section class='page' id='p0'><div class='card'><div class='grid'>");
+  html += "<div class='metric'><span>RPM</span><b>" + String((int)g_rpm) + "</b></div>";
+  html += "<div class='metric'><span>ADV</span><b>" + String(g_adv, 1) + "&deg;</b></div>";
+  html += "<div class='metric'><span>Lambda</span><b>" + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) + "</b></div>";
+  html += "<div class='metric'><span>Volt</span><b>" + String(g_battValid ? String(g_battVolt, 1) : String("---")) + "</b></div>";
+  html += F("</div></div><div class='card row'><div><b>BLE Hub</b><br><span class='");
+  html += g_bleConn ? "ok" : "warn";
+  html += "'>" + String(g_featureBle ? (g_bleConn ? "verbunden" : "scan/wartet") : "aus") + "</span></div>";
+  html += "<div class='pill'>Seite " + String(currentPage) + "</div><div class='pill'>RX " + String((unsigned long)g_bleRxCnt) + "</div></div></section>";
+
+  html += F("<section class='page' id='p1'><div class='card'><h2>WLAN</h2><div>Aktiv: <b>");
+  html += String(currentWifiSsid());
+  html += F("</b> &middot; ");
+  html += WiFi.status() == WL_CONNECTED ? F("<span class='ok'>verbunden</span>") : F("<span class='warn'>nicht verbunden</span>");
+  html += F("</div><div>");
   for (uint8_t i = 0; i < wifiProfileCount(); i++) {
-    html += "<a href='/wifi?prof=" + String(i) + "'><button" +
-            String(i == g_wifiProfile ? " style='background:#6c6'" : "") + ">" +
-            String(WIFI_PROFILES[i].ssid) + "</button></a>";
+    html += "<a href='/wifi?prof=" + String(i) + "'><button";
+    if (i == g_wifiProfile) html += F(" style='background:#54d273'");
+    html += ">" + String(WIFI_PROFILES[i].ssid) + "</button></a>";
   }
-  html += F("</div>");
+  html += F("</div><button onclick='scanWifi()'>&#128269; Scan</button><table><thead><tr><th>SSID</th><th>RSSI</th><th>Status</th></tr></thead><tbody id='scanRows'><tr><td colspan='3'>Noch kein Scan</td></tr></tbody></table></div></section>");
 
-  html += F("<div class='card'><h3>Display-Seite</h3>"
-    "<a href='/page?p=0'><button>Uhr</button></a>"
-    "<a href='/page?p=1'><button>Menu</button></a>"
-    "<a href='/page?p=2'><button>Motor</button></a>"
-    "<a href='/page?p=3'><button>Lambda</button></a>"
-    "<a href='/page?p=4'><button>Hub</button></a>"
-    "<a href='/page?p=6'><button>IMU</button></a>"
-    "<a href='/page?p=5'><button>Setup</button></a></div>");
-
-  html += F("<div class='card'><h3>Funktionen</h3><form action='/features' method='get'>");
-  html += "<p><label><input type='checkbox' name='wifi' value='1' ";
-  html += g_featureWifi ? "checked" : "";
-  html += F("> WLAN/Web aktiv</label></p><p><label>"
-    "<input type='checkbox' name='ble' value='1' ");
-  html += g_featureBle ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> BLE-Hub Daten aktiv</label></p><p><label>"
-    "<input type='checkbox' name='buzzer' value='1' ");
-  html += g_featureBuzzer ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> Buzzer (Shake-Alarm) aktiv</label></p>"
-    "<button type='submit'>Speichern</button></form></div>");
-
-  html += F("<div class='card'><h3>Spartan-Hub Live</h3>");
-  if (!g_featureBle) {
-    html += F("<div>BLE: <b>aus</b></div>");
-  } else if (g_bleConn) {
-    html += F("<div>BLE: <b>verbunden</b></div>");
-    html += "<div>Lambda: " + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) + "</div>";
-    html += "<div>RPM: " + String((int)g_rpm) + " &nbsp; ADV: " + String(g_adv, 1) + "</div>";
-    html += "<div>Batt: " + String(g_battValid ? String(g_battVolt, 1) + " V" : String("---")) + "</div>";
-  } else {
-    html += F("<div>BLE: scanning/wartet</div>");
-  }
-  html += "<div>RX: " + String((unsigned long)g_bleRxCnt) + "</div></div>";
-
-  html += F("<div class='card'><h3>Zifferblatt-Gr&ouml;&szlig;e</h3>"
-    "<form action='/set' method='get'>"
-    "<div class='val'><span id='v'>");
+  html += F("<section class='page' id='p2'><div class='card'><h2>Display</h2><div class='dial'></div><div class='grid'>"
+            "<a href='/page?p=0'><button>Uhr</button></a><a href='/page?p=1'><button>Menu</button></a><a href='/page?p=2'><button>Motor</button></a><a href='/page?p=3'><button>Lambda</button></a><a href='/page?p=4'><button>Hub</button></a><a href='/page?p=6'><button>IMU</button></a><a href='/page?p=5'><button>Setup</button></a></div></div>"
+            "<div class='card'><h3>Zifferblatt-Groesse</h3><form action='/set' method='get'><div class='row'><b><span id='scaleVal'>");
   html += String(g_dialScalePct);
-  html += F("</span>%</div>"
-    "<input type='range' name='scale' min='30' max='100' step='1' value='");
+  html += F("</span>%</b><button type='submit'>Uebernehmen</button></div><input type='range' name='scale' min='30' max='100' step='1' value='");
   html += String(g_dialScalePct);
-  html += F("' oninput=\"document.getElementById('v').innerText=this.value\">"
-    "<br><button type='submit'>&Uuml;bernehmen</button></form>"
-    "<div><a href='/set?scale=100'>100%</a> &middot; <a href='/set?scale=90'>90%</a> &middot; "
-    "<a href='/set?scale=80'>80%</a> &middot; <a href='/set?scale=70'>70%</a></div></div>");
-  html += F("<div class='card'><h3>Display-Rotation</h3><div class='val'>");
+  html += F("' oninput=\"scaleVal.innerText=this.value\"></form></div><div class='card'><h3>Rotation</h3><div class='row'><b>");
   html += String(g_rotationDeg);
-  html += F("&deg;</div><a href='/set?rot_delta=-1'><button>- 1&deg;</button></a>"
-            "<a href='/set?rot_delta=1'><button>+ 1&deg;</button></a><br>"
-            "<a href='/set?rot_delta=-5'><button>- 5&deg;</button></a>"
-            "<a href='/set?rot_delta=5'><button>+ 5&deg;</button></a>"
-            "<div><a href='/set?rot=0'>0&deg;</a> &middot; <a href='/set?rot=90'>90&deg;</a> &middot; "
-            "<a href='/set?rot=180'>180&deg;</a> &middot; <a href='/set?rot=270'>270&deg;</a></div></div>");
-  html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p></body></html>");
+  html += F("&deg;</b><span><a href='/set?rot_delta=-5'><button>-5&deg;</button></a><a href='/set?rot_delta=-1'><button>-1&deg;</button></a><a href='/set?rot_delta=1'><button>+1&deg;</button></a><a href='/set?rot_delta=5'><button>+5&deg;</button></a></span></div></div></section>");
+
+  html += F("<section class='page' id='p3'><div class='card'><h2>Live</h2><pre id='liveBox'>Lade /api/status ...</pre></div></section>");
+
+  html += F("<section class='page' id='p4'><div class='card'><h2>Setup</h2><form action='/features' method='get'>"
+            "<p><label><input type='checkbox' name='wifi' value='1' ");
+  html += g_featureWifi ? F("checked") : F("");
+  html += F("> WLAN/Web aktiv</label></p><p><label><input type='checkbox' name='ble' value='1' ");
+  html += g_featureBle ? F("checked") : F("");
+  html += F("> BLE-Hub Daten aktiv</label></p><p><label><input type='checkbox' name='buzzer' value='1' ");
+  html += g_featureBuzzer ? F("checked") : F("");
+  html += F("> Buzzer aktiv</label></p><button type='submit'>Speichern</button></form></div>"
+            "<div class='card'><h2>OTA Firmware</h2><form method='POST' action='/update' enctype='multipart/form-data'><input class='file' type='file' name='update' accept='.bin,application/octet-stream'><button type='submit'>Firmware hochladen</button></form></div>"
+            "<div class='card'><h2>Restart</h2><a href='/restart'><button>ESP32 neu starten</button></a></div></section>");
+
+  html += F("<script>"
+            "async function scanWifi(){const rows=document.getElementById('scanRows');rows.innerHTML='<tr><td colspan=3>Scan laeuft...</td></tr>';try{const r=await fetch('/scan');const d=await r.json();rows.innerHTML=d.networks.map(n=>`<tr><td>${n.ssid}</td><td>${n.rssi}</td><td>${n.connected?'verbunden':''}</td></tr>`).join('')||'<tr><td colspan=3>Keine Netze</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=3>Scan fehlgeschlagen</td></tr>';}}"
+            "async function live(){try{const r=await fetch('/api/status');const d=await r.json();document.getElementById('liveBox').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('liveBox').textContent='Live-Status nicht erreichbar';}}"
+            "live();setInterval(live,2000);</script><p class='sub'>VW T2b Cockpit &middot; ESP32-S3 2.8C</p></main></body></html>");
   webServer.send(200, "text/html", html);
+}
+
+static void handleWebScan() {
+  int count = WiFi.scanNetworks();
+  String json = F("{\"networks\":[");
+  const String connectedSsid = WiFi.SSID();
+  for (int i = 0; i < count; i++) {
+    if (i > 0) json += ',';
+    const String ssid = WiFi.SSID(i);
+    json += F("{\"ssid\":\"");
+    json += jsonEscape(ssid);
+    json += F("\",\"rssi\":");
+    json += String(WiFi.RSSI(i));
+    json += F(",\"connected\":");
+    json += (WiFi.status() == WL_CONNECTED && ssid == connectedSsid) ? F("true") : F("false");
+    json += '}';
+  }
+  json += F("]}");
+  WiFi.scanDelete();
+  webServer.send(200, "application/json", json);
+}
+
+static void handleWebStatus() {
+  String json;
+  json.reserve(512);
+  json += F("{\"time\":");
+  json += String((unsigned long)time(nullptr));
+  json += F(",\"ip\":\"");
+  json += jsonEscape(String(g_ipStr));
+  json += F("\",\"rpm\":");
+  json += String(g_rpm, 0);
+  json += F(",\"adv\":");
+  json += String(g_adv, 1);
+  json += F(",\"lambda\":");
+  json += String(g_lambda, 3);
+  json += F(",\"lambda_valid\":");
+  json += g_lambdaValid ? F("true") : F("false");
+  json += F(",\"volt\":");
+  json += String(g_battVolt, 2);
+  json += F(",\"volt_valid\":");
+  json += g_battValid ? F("true") : F("false");
+  json += F(",\"ble_enabled\":");
+  json += g_featureBle ? F("true") : F("false");
+  json += F(",\"ble_connected\":");
+  json += g_bleConn ? F("true") : F("false");
+  json += F(",\"ble_rx\":");
+  json += String((unsigned long)g_bleRxCnt);
+  json += F(",\"page\":");
+  json += String(currentPage);
+  json += F(",\"scale\":");
+  json += String(g_dialScalePct);
+  json += F(",\"rotation\":");
+  json += String(g_rotationDeg);
+  json += '}';
+  webServer.send(200, "application/json", json);
+}
+
+static void handleWebRestart() {
+  webServer.send(200, "text/html", F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Restart</title></head><body><h1>ESP32 startet neu...</h1></body></html>"));
+  delay(500);
+  ESP.restart();
 }
 
 static void handleWebSet() {
@@ -1161,6 +1242,39 @@ static void startWebServer() {
   webServer.on("/features",handleWebFeatures);
   webServer.on("/page",    handleWebPage);
   webServer.on("/wifi",    handleWebWifi);
+  webServer.on("/scan",    HTTP_GET, handleWebScan);
+  webServer.on("/api/status", HTTP_GET, handleWebStatus);
+  webServer.on("/restart", HTTP_GET, handleWebRestart);
+  webServer.on("/update", HTTP_POST, []() {
+    const bool ok = !Update.hasError();
+    webServer.sendHeader("Connection", "close");
+    webServer.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
+    if (ok) {
+      delay(500);
+      ESP.restart();
+    }
+  }, []() {
+    HTTPUpload& upload = webServer.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("OTA: Start %s\n", upload.filename.c_str());
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) {
+        Serial.printf("OTA: Erfolg, %u Bytes\n", upload.totalSize);
+      } else {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+      Update.end();
+      Serial.println("OTA: abgebrochen");
+    }
+  });
   webServer.begin();
   Serial.println("WebGUI: gestartet auf Port 80");
 }
