@@ -10,6 +10,7 @@
 #include <NimBLEDevice.h>
 #include "esp_task_wdt.h"
 #include "esp_ota_ops.h"
+#include "esp_sntp.h"
 #if __has_include("wifi_secret.h")
   #include "wifi_secret.h"
 #else
@@ -53,6 +54,7 @@
 #define NUS_RX          "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 #define NUS_TX          "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 #define DEFAULT_123_MAC "ef:a8:b2:de:e0:9e"
+#define DEFAULT_HUB_MAC DEFAULT_123_MAC  // gleiches Geraet moeglich (Hub/BM6/123)
 #define BLE_SCAN_MAX    32
 #define BLE_DISCOVERY_SCAN_MS 5000
 
@@ -102,8 +104,8 @@ static const int DIAL_SCALE_DEFAULT = 115;  // sweet spot: fills display, chrome
 static const int DIAL_SCALE_MIN     = 30;
 static const int DIAL_SCALE_MAX     = 120;
 static const int DIAL_CENTER        = 240;
-static const int DIAL_CENTER_OFF_X_DEFAULT = -4;  // source bitmap visual center correction
-static const int DIAL_CENTER_OFF_Y_DEFAULT = -2;
+static const int DIAL_CENTER_OFF_X_DEFAULT = 4;   // bitmap optical center @115% (hands stay at 240,240)
+static const int DIAL_CENTER_OFF_Y_DEFAULT = -9;
 static const uint16_t DIAL_FACE_BG  = RGB565(52, 47, 45);
 static int       g_dialScalePct = DIAL_SCALE_DEFAULT;
 static int       g_dialCenterOffsetX = DIAL_CENTER_OFF_X_DEFAULT;
@@ -281,6 +283,72 @@ static const char* currentWifiPassword() {
 #define RTC_BUILD_ID  0
 #endif
 
+// ---- Timezone / NTP ----
+struct TimezoneEntry {
+  const char* label;
+  const char* posix;
+};
+
+static const TimezoneEntry TIMEZONES[] = {
+  { "Europe/Berlin (CET/CEST)", "CET-1CEST,M3.5.0,M10.5.0/3" },
+  { "UTC",                      "UTC0" },
+  { "Europe/London (GMT/BST)",  "GMT0BST,M3.5.0/1,M10.5.0" },
+  { "America/New_York (EST/EDT)","EST5EDT,M3.2.0,M11.1.0" },
+  { "America/Los_Angeles (PST/PDT)", "PST8PDT,M3.2.0,M11.1.0" },
+  { "Asia/Tokyo (JST)",         "JST-9" },
+};
+static const uint8_t TIMEZONE_COUNT =
+    (uint8_t)(sizeof(TIMEZONES) / sizeof(TIMEZONES[0]));
+static const uint8_t TIMEZONE_DEFAULT = 0;  // Europe/Berlin
+
+static uint8_t  g_timezoneIdx      = TIMEZONE_DEFAULT;
+static bool     g_sntpStarted      = false;
+static bool     g_ntpSynced        = false;
+static bool     g_ntpResyncRequested = false;
+static uint32_t g_lastRtcSyncMs    = 0;
+
+static uint8_t timezoneCount() { return TIMEZONE_COUNT; }
+
+static const char* timezoneLabel(uint8_t idx) {
+  if (idx >= TIMEZONE_COUNT) idx = TIMEZONE_DEFAULT;
+  return TIMEZONES[idx].label;
+}
+
+static const char* timezonePosix(uint8_t idx) {
+  if (idx >= TIMEZONE_COUNT) idx = TIMEZONE_DEFAULT;
+  return TIMEZONES[idx].posix;
+}
+
+static const char* currentTimezonePosix() {
+  return timezonePosix(g_timezoneIdx);
+}
+
+static void applyTimezone() {
+  const char* tz = currentTimezonePosix();
+  setenv("TZ", tz, 1);
+  tzset();
+  configTzTime(tz, "pool.ntp.org", "time.nist.gov", "de.pool.ntp.org");
+}
+
+static void requestNtpResync() {
+  g_ntpResyncRequested = true;
+  g_ntpSynced = false;
+  if (g_sntpStarted && esp_sntp_enabled()) sntp_restart();
+}
+
+static void saveTimezone(uint8_t idx) {
+  if (idx >= TIMEZONE_COUNT) idx = TIMEZONE_DEFAULT;
+  if (idx == g_timezoneIdx) return;
+  g_timezoneIdx = idx;
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("tz_idx", g_timezoneIdx);
+  p.end();
+  applyTimezone();
+  requestNtpResync();
+  Serial.printf("TZ: %s (%s)\n", timezoneLabel(g_timezoneIdx), currentTimezonePosix());
+}
+
 // ---- PCF85063 helpers ----
 static uint8_t decToBcd(uint8_t v) { return (uint8_t)((v / 10 * 16) + (v % 10)); }
 static uint8_t bcdToDec(uint8_t v) { return (uint8_t)((v / 16 * 10) + (v % 16)); }
@@ -320,9 +388,14 @@ static void rtcWrite(const struct tm *t) {
 }
 
 static bool readClockTime(struct tm *now) {
-  if (rtcRead(now)) return true;
+  // Prefer SNTP (Europe/Berlin via configTzTime) — RTC can be stale after OTA.
   time_t t = time(nullptr);
-  return localtime_r(&t, now) != nullptr;
+  if (t > 1700000000) {
+    localtime_r(&t, now);
+    return true;
+  }
+  if (rtcRead(now)) return true;
+  return false;
 }
 
 static void initTimeSource() {
@@ -333,7 +406,7 @@ static void initTimeSource() {
   prefs.begin("clock", false);
   uint32_t savedId = prefs.getUInt("buildid", 0);
   bool newFlash = (savedId != (uint32_t)RTC_BUILD_ID);
-  if (!rtcValid || newFlash) {
+  if (!rtcValid) {
     struct tm bt = {};
     bt.tm_year = RTC_BUILD_Y - 1900;
     bt.tm_mon  = RTC_BUILD_MO - 1;
@@ -343,23 +416,25 @@ static void initTimeSource() {
     bt.tm_sec  = RTC_BUILD_S;
     bt.tm_wday = RTC_BUILD_DOW;
     rtcWrite(&bt);
-    prefs.putUInt("buildid", (uint32_t)RTC_BUILD_ID);
-    Serial.printf("RTC set from build time: %04d-%02d-%02d %02d:%02d:%02d (reason: %s)\n",
-                  RTC_BUILD_Y, RTC_BUILD_MO, RTC_BUILD_D, RTC_BUILD_H, RTC_BUILD_MI, RTC_BUILD_S,
-                  !rtcValid ? "RTC invalid" : "new flash");
+    Serial.printf("RTC set from build time: %04d-%02d-%02d %02d:%02d:%02d (RTC invalid)\n",
+                  RTC_BUILD_Y, RTC_BUILD_MO, RTC_BUILD_D, RTC_BUILD_H, RTC_BUILD_MI, RTC_BUILD_S);
+  } else if (newFlash) {
+    Serial.printf("New firmware (build id %u): RTC kept %04d-%02d-%02d %02d:%02d:%02d, await NTP\n",
+                  (unsigned)RTC_BUILD_ID,
+                  rtcNow.tm_year + 1900, rtcNow.tm_mon + 1, rtcNow.tm_mday,
+                  rtcNow.tm_hour, rtcNow.tm_min, rtcNow.tm_sec);
   } else {
     Serial.printf("RTC running: %04d-%02d-%02d %02d:%02d:%02d\n",
                   rtcNow.tm_year + 1900, rtcNow.tm_mon + 1, rtcNow.tm_mday,
                   rtcNow.tm_hour, rtcNow.tm_min, rtcNow.tm_sec);
   }
+  prefs.putUInt("buildid", (uint32_t)RTC_BUILD_ID);
   prefs.end();
 }
 
 // Non-blocking WiFi/NTP handler. Returns true on fresh NTP sync.
 static bool wifiNtpTick() {
-  static bool     sntpStarted = false;
-  static bool     ntpSynced   = false;
-  static uint32_t lastTry     = 0;
+  static uint32_t lastTry = 0;
 
   if (!g_featureWifi || strlen(currentWifiSsid()) == 0) return false;
 
@@ -383,22 +458,27 @@ static bool wifiNtpTick() {
     startWebServer();
     g_webStarted = true;
   }
-  if (!sntpStarted) {
-    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov", "de.pool.ntp.org");
-    sntpStarted = true;
-    Serial.println("NTP: SNTP gestartet");
+  if (!g_sntpStarted) {
+    applyTimezone();
+    g_sntpStarted = true;
+    Serial.printf("NTP: SNTP gestartet (TZ %s)\n", timezoneLabel(g_timezoneIdx));
   }
-  if (!ntpSynced) {
-    time_t t = time(nullptr);
-    if (t > 1700000000) {
-      struct tm now;
-      localtime_r(&t, &now);
+  time_t t = time(nullptr);
+  if (t > 1700000000) {
+    struct tm now;
+    localtime_r(&t, &now);
+    const bool firstSync = !g_ntpSynced;
+    const bool resyncDue = (millis() - g_lastRtcSyncMs) > 3600000UL;
+    if (firstSync || resyncDue || g_ntpResyncRequested) {
       rtcWrite(&now);
-      ntpSynced = true;
-      Serial.printf("NTP: synchronisiert -> RTC gestellt: %04d-%02d-%02d %02d:%02d:%02d\n",
+      g_lastRtcSyncMs = millis();
+      g_ntpSynced = true;
+      g_ntpResyncRequested = false;
+      Serial.printf("NTP: %s -> RTC gestellt: %04d-%02d-%02d %02d:%02d:%02d\n",
+                    firstSync ? "synchronisiert" : "RTC resync",
                     now.tm_year + 1900, now.tm_mon + 1, now.tm_mday,
                     now.tm_hour, now.tm_min, now.tm_sec);
-      return true;
+      return firstSync;
     }
   }
   return false;
@@ -427,6 +507,7 @@ static void clearBleLiveValues() {
 static void bleWaitScanStopped(NimBLEScan* s, uint32_t timeoutMs) {
   const uint32_t until = millis() + timeoutMs;
   while (s->isScanning() && millis() < until) {
+    if (g_webStarted) webServer.handleClient();
     delay(10);
     yield();
   }
@@ -477,12 +558,15 @@ static void saveBleMacHub(const char* mac) {
   p.end();
 }
 
-static const char* bleTargetDisplay() {
+static const char* bleSavedMacForMode() {
   if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
-    if (g_bleHubMac[0] != '\0') return g_bleHubMac;
-    return SPARTAN_NAME;
+    return g_bleHubMac[0] != '\0' ? g_bleHubMac : DEFAULT_HUB_MAC;
   }
-  return g_bleTargetMac;
+  return g_bleTargetMac[0] != '\0' ? g_bleTargetMac : DEFAULT_123_MAC;
+}
+
+static const char* bleTargetDisplay() {
+  return bleSavedMacForMode();
 }
 
 static void cycleBleConnMode() {
@@ -626,12 +710,12 @@ static bool bleScanMatchesTarget(const NimBLEAdvertisedDevice* dev, String& addr
   addr.toLowerCase();
   name = dev->getName().c_str();
   if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
-    if (g_bleHubMac[0] != '\0' && macEquals(addr, g_bleHubMac)) return true;
+    if (macEquals(addr, bleSavedMacForMode())) return true;
     return name == SPARTAN_NAME ||
            addr == SPARTAN_MAC ||
            dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC));
   }
-  return macEquals(addr, g_bleTargetMac);
+  return macEquals(addr, bleSavedMacForMode());
 }
 
 class SpartanScanCB : public NimBLEScanCallbacks {
@@ -670,29 +754,31 @@ static void bleStartScan() {
   auto* s = NimBLEDevice::getScan();
   s->setScanCallbacks(&spartanScanCB);
   s->setMaxResults(0xFF);
-  s->setActiveScan(g_bleConnMode == BLE_MODE_DIRECT_123);
-  s->setInterval(160);
-  s->setWindow(30);
-  s->start(g_bleConnMode == BLE_MODE_DIRECT_123 ? 10000 : 3000, false, true);
-  Serial.printf("BLE: Scan nach %s...\n", bleConnModeLabel());
+  s->setActiveScan(true);
+  s->setInterval(100);
+  s->setWindow(99);
+  s->start(BLE_DISCOVERY_SCAN_MS, false, true);
+  Serial.printf("BLE: Scan nach %s @ %s...\n", bleConnModeLabel(), bleSavedMacForMode());
 }
 
-static void bleStartDiscoveryScan() {
-  if (!g_featureBle || g_bleDiscoveryScan) return;
+static bool bleStartDiscoveryScan() {
+  if (!g_featureBle || g_bleDiscoveryScan) return false;
   bleDoConnect = false;
-  g_bleConn = false;
   g_bleScanCount = 0;
   auto* s = NimBLEDevice::getScan();
   if (bleClient && bleClient->isConnected()) {
+    g_bleConn = false;
     bleClient->disconnect();
     uint32_t until = millis() + 1000;
     while (bleClient->isConnected() && millis() < until) {
+      if (g_webStarted) webServer.handleClient();
       delay(10);
       yield();
     }
   }
   s->stop();
   bleWaitScanStopped(s, 500);
+  s->clearResults();
   s->setScanCallbacks(&spartanScanCB, true);
   s->setActiveScan(true);
   s->setInterval(100);
@@ -702,9 +788,10 @@ static void bleStartDiscoveryScan() {
   if (!s->start(BLE_DISCOVERY_SCAN_MS, false, true)) {
     g_bleDiscoveryScan = false;
     Serial.println("BLE: Discovery-Scan Start FAIL");
-    return;
+    return false;
   }
   Serial.printf("BLE: Discovery-Scan %ums...\n", BLE_DISCOVERY_SCAN_MS);
+  return true;
 }
 
 static void bleConnect() {
@@ -717,8 +804,8 @@ static void bleConnect() {
     bleClient->setConnectionParams(16, 32, 0, 400);
   }
   if (!bleClient->connect(bleTarget, true, false, false)) {
-    Serial.println("BLE: Connect fehlgeschlagen");
-    bleNextScanAt = millis() + 15000;
+    Serial.printf("BLE: Connect fehlgeschlagen (%s)\n", bleSavedMacForMode());
+    bleNextScanAt = millis() + 3000;
     return;
   }
   if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
@@ -1393,11 +1480,15 @@ static void loadSettings() {
   strncpy(g_bleTargetMac, mac123.c_str(), sizeof(g_bleTargetMac) - 1);
   g_bleTargetMac[sizeof(g_bleTargetMac) - 1] = 0;
   String macHub = p.getString("ble_mac_hub", "");
+  if (macHub.length() == 0) macHub = DEFAULT_HUB_MAC;
   strncpy(g_bleHubMac, macHub.c_str(), sizeof(g_bleHubMac) - 1);
   g_bleHubMac[sizeof(g_bleHubMac) - 1] = 0;
   qmi8658SetTrim(p.getFloat("imu_off_p", 0.0f), p.getFloat("imu_off_r", 0.0f),
                  p.getBool("imu_trim", false));
+  g_timezoneIdx = p.getUChar("tz_idx", TIMEZONE_DEFAULT);
+  if (g_timezoneIdx >= TIMEZONE_COUNT) g_timezoneIdx = TIMEZONE_DEFAULT;
   p.end();
+  applyTimezone();
   if (g_dialScalePct  < DIAL_SCALE_MIN) g_dialScalePct  = DIAL_SCALE_MIN;
   if (g_dialScalePct  > DIAL_SCALE_MAX) g_dialScalePct  = DIAL_SCALE_MAX;
   if (g_dialCenterOffsetX < -20) g_dialCenterOffsetX = -20;
@@ -1419,6 +1510,21 @@ static void saveDialScale(int pct) {
   Preferences p;
   p.begin("clock", false);
   p.putInt("scale", pct);
+  p.end();
+}
+
+static void saveDialOffset(int offX, int offY) {
+  if (offX < -20) offX = -20;
+  if (offX >  20) offX =  20;
+  if (offY < -20) offY = -20;
+  if (offY >  20) offY =  20;
+  g_dialCenterOffsetX = offX;
+  g_dialCenterOffsetY = offY;
+  invalidateDialCache();
+  Preferences p;
+  p.begin("clock", false);
+  p.putInt("dial_off_x", offX);
+  p.putInt("dial_off_y", offY);
   p.end();
 }
 
@@ -1759,7 +1865,8 @@ static void handleWebRoot() {
     ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.metric{background:#0c0c0c;border:1px solid #262626;border-radius:14px;padding:14px;text-align:left}"
     ".metric b{display:block;font-size:1.7rem;color:#fff}.metric span{color:var(--muted);font-size:.9rem}.ok{color:var(--ok)}.warn{color:var(--warn)}"
     "button{background:var(--gold);border:0;border-radius:10px;padding:11px 15px;margin:5px 4px;color:#171200;font-weight:700;cursor:pointer}a{color:#9bd1ff;text-decoration:none}"
-    "input[type=range]{width:100%}.row{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}.pill{border:1px solid #333;border-radius:999px;padding:6px 10px;color:#ccc}"
+    "input[type=range]{width:100%}select{width:100%;max-width:100%;padding:11px 12px;background:#0d0d0d;border:1px solid #333;border-radius:10px;color:#eee;font-size:1rem}"
+    ".row{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}.pill{border:1px solid #333;border-radius:999px;padding:6px 10px;color:#ccc}"
     ".preview-shell{text-align:center;margin:8px auto 16px}.preview-bezel{width:min(78vw,300px);aspect-ratio:1;margin:0 auto;padding:12px;border-radius:50%;background:linear-gradient(145deg,#3a3a3a,#151515);box-shadow:0 16px 36px #0009,inset 0 2px 8px #ffffff14;display:flex;align-items:center;justify-content:center}.preview-content{width:100%;height:100%;transform:scale(calc(var(--scale,100)/100));transform-origin:center}.preview-svg{width:100%;height:auto;display:block;border-radius:50%}.preview-meta{margin-top:10px;color:var(--muted);font-size:.95rem;letter-spacing:.04em}.preview-shell--sm .preview-bezel{width:min(42vw,160px);padding:8px}"
     "table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #292929;text-align:left}.file{width:100%;padding:12px;background:#0d0d0d;border:1px solid #333;border-radius:10px;color:#eee}"
     ".ota-progress{margin-top:12px}.ota-track{height:10px;background:#222;border-radius:999px;overflow:hidden;border:1px solid #333}.ota-bar{height:100%;width:0;background:linear-gradient(90deg,#b8921f,var(--gold));transition:width .25s}</style></head><body><main>");
@@ -1808,7 +1915,11 @@ static void handleWebRoot() {
   html += String(g_dialScalePct);
   html += F("' oninput=\"scaleVal.innerText=this.value\"></form><div class='row'><span><a href='/set?scale_delta=-5'><button>-5%</button></a><a href='/set?scale_delta=-1'><button>-1%</button></a><a href='/set?scale_delta=1'><button>+1%</button></a><a href='/set?scale_delta=5'><button>+5%</button></a></span></div></div><div class='card'><h3>Rotation</h3><div class='row'><b>");
   html += String(g_rotationDeg);
-  html += F("&deg;</b><span><a href='/set?rot_delta=-5'><button>-5&deg;</button></a><a href='/set?rot_delta=-1'><button>-1&deg;</button></a><a href='/set?rot_delta=1'><button>+1&deg;</button></a><a href='/set?rot_delta=5'><button>+5&deg;</button></a></span></div><div class='row'><span><a href='/set?rot=0'><button>0&deg;</button></a><a href='/set?rot=90'><button>90&deg;</button></a><a href='/set?rot=180'><button>180&deg;</button></a><a href='/set?rot=270'><button>270&deg;</button></a></span></div></div></section>");
+  html += F("&deg;</b><span><a href='/set?rot_delta=-5'><button>-5&deg;</button></a><a href='/set?rot_delta=-1'><button>-1&deg;</button></a><a href='/set?rot_delta=1'><button>+1&deg;</button></a><a href='/set?rot_delta=5'><button>+5&deg;</button></a></span></div><div class='row'><span><a href='/set?rot=0'><button>0&deg;</button></a><a href='/set?rot=90'><button>90&deg;</button></a><a href='/set?rot=180'><button>180&deg;</button></a><a href='/set?rot=270'><button>270&deg;</button></a></span></div></div><div class='card'><h3>Zifferblatt-Position</h3><p class='sub'>Nur Bitmap, Zeiger bleiben in der Mitte.</p><div class='row'><b>X ");
+  html += String(g_dialCenterOffsetX);
+  html += F(" &middot; Y ");
+  html += String(g_dialCenterOffsetY);
+  html += F("</b></div><div class='row'><span><a href='/set?dial_x_delta=-1'><button>X -1</button></a><a href='/set?dial_x_delta=1'><button>X +1</button></a></span></div><div class='row'><span><a href='/set?dial_y_delta=-1'><button>Y -1</button></a><a href='/set?dial_y_delta=1'><button>Y +1</button></a><a href='/set?dial_reset=1'><button>Zentrum</button></a></span></div></div></section>");
 
   html += F("<section class='page' id='p3'><div class='card'><h2>Live</h2><pre id='liveBox'>Lade /api/status ...</pre></div></section>");
 
@@ -1820,15 +1931,48 @@ static void handleWebRoot() {
   html += F("> BLE Daten aktiv</label></p><p><label><input type='checkbox' name='buzzer' value='1' ");
   html += g_featureBuzzer ? F("checked") : F("");
   html += F("> Buzzer aktiv</label></p><button type='submit'>Speichern</button></form></div>"
+            "<div class='card'><h2>Zeitzone</h2><p class='sub'>Uhrzeit per NTP (WLAN). Aktuell: <b id='tzLabel'>");
+  html += String(timezoneLabel(g_timezoneIdx));
+  html += F("</b> &middot; ");
+  snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
+  html += String(timeStr);
+  html += F("</p><form action='/tz' method='get'><select name='idx'>");
+  for (uint8_t i = 0; i < TIMEZONE_COUNT; i++) {
+    html += F("<option value='");
+    html += String(i);
+    html += "'";
+    if (i == g_timezoneIdx) html += F(" selected");
+    html += '>';
+    html += String(TIMEZONES[i].label);
+    html += F("</option>");
+  }
+  html += F("</select><p><button type='submit'>Speichern &amp; NTP sync</button></p></form></div>"
             "<div class='card'><h2>BLE Quelle</h2><div class='row'><span>Aktiv: <b id='bleModeLabel'>");
   html += String(bleConnModeLabel());
   html += F("</b></span><span><a href='/ble/mode?m=hub'><button");
   if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) html += F(" style='background:#54d273'");
   html += F(">Spartan Hub</button></a><a href='/ble/mode?m=direct'><button");
   if (g_bleConnMode == BLE_MODE_DIRECT_123) html += F(" style='background:#54d273'");
-  html += F(">123 direkt</button></a></span></div><p class='sub'>Ziel-MAC: <span id='bleMacLabel'>");
+  html += F(">123 direkt</button></a></span></div>"
+            "<p class='sub'>Gleiche MAC fuer Hub und 123 moeglich (z.B. BM6). "
+            "<b>Hub</b> = Spartan3-Hub-Protokoll (Motor/Lambda auf Hub-Seite). "
+            "<b>123 direkt</b> = NUS/123TUNE+ (Motor-Seite). Modus waehlen, nicht nur MAC.</p>"
+            "<form action='/ble/mac' method='get'><p>Hub-MAC: <input name='hub_mac' value='");
+  html += String(g_bleHubMac[0] ? g_bleHubMac : DEFAULT_HUB_MAC);
+  html += F("' style='width:11em;background:#111;border:1px solid #333;color:#eee;padding:6px;border-radius:8px'> "
+            "123-MAC: <input name='direct_mac' value='");
+  html += String(g_bleTargetMac);
+  html += F("' style='width:11em;background:#111;border:1px solid #333;color:#eee;padding:6px;border-radius:8px'> "
+            "<button type='submit'>MAC speichern</button></p></form>"
+            "<p class='sub'>Aktiv: <span id='bleModeLabel2'>");
+  html += String(bleConnModeLabel());
+  html += F("</span> &middot; Ziel <span id='bleMacLabel'>");
   html += String(bleTargetDisplay());
-  html += F("</span></p><button onclick='scanBle()'>&#128269; BLE Scan</button><table><thead><tr><th>Name</th><th>MAC</th><th>RSSI</th><th>Typ</th><th></th></tr></thead><tbody id='bleScanRows'><tr><td colspan='5'>Noch kein Scan</td></tr></tbody></table></div>"
+  html += F("</span> (Hub: <span id='bleHubMacLabel'>");
+  html += String(g_bleHubMac[0] ? g_bleHubMac : DEFAULT_HUB_MAC);
+  html += F("</span>, 123: <span id='bleDirectMacLabel'>");
+  html += String(g_bleTargetMac);
+  html += F("</span>)</p><button onclick='scanBle()'>&#128269; BLE Scan (5s)</button><table><thead><tr><th>Name</th><th>MAC</th><th>RSSI</th><th>Typ</th><th></th></tr></thead><tbody id='bleScanRows'><tr><td colspan='5'>Noch kein Scan</td></tr></tbody></table></div>"
             "<div class='card'><h2>OTA Firmware</h2><p class='sub'>Kaputte Updates rollen automatisch zur vorherigen Firmware zurueck. PC-Backup: backups/esp32s3_vdo_backup_2026-06-10.bin (esptool).</p>"
             "<form id='otaForm' method='POST' action='/update' enctype='multipart/form-data'><input class='file' type='file' name='update' accept='.bin,application/octet-stream' required><button type='submit' id='otaBtn'>Firmware hochladen</button>"
             "<div class='ota-progress' id='otaProgress' hidden><div class='ota-track'><div class='ota-bar' id='otaBar'></div></div><p id='otaStatus' class='sub'>Upload laeuft...</p></div></form></div>"
@@ -1869,10 +2013,11 @@ static void handleWebRoot() {
             "if(d.page!==lastPreviewPage){lastPreviewPage=d.page;refreshPreview().then(()=>syncPreviewValues(d));}"
             "else syncPreviewValues(d);}"
             "async function scanWifi(){const rows=document.getElementById('scanRows');rows.innerHTML='<tr><td colspan=3>Scan laeuft...</td></tr>';try{const r=await fetch('/scan');const d=await r.json();rows.innerHTML=d.networks.map(n=>`<tr><td>${n.ssid}</td><td>${n.rssi}</td><td>${n.connected?'verbunden':''}</td></tr>`).join('')||'<tr><td colspan=3>Keine Netze</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=3>Scan fehlgeschlagen</td></tr>';}}"
-            "async function scanBle(){const rows=document.getElementById('bleScanRows');rows.innerHTML='<tr><td colspan=5>Scan laeuft...</td></tr>';try{const r=await fetch('/ble/scan');const d=await r.json();if(d.error){rows.innerHTML='<tr><td colspan=5>BLE aus – Setup: BLE aktivieren</td></tr>';return;}"
+            "async function scanBle(){const rows=document.getElementById('bleScanRows');rows.innerHTML='<tr><td colspan=5>Scan laeuft...</td></tr>';try{const r=await fetch('/ble/scan');if(!r.ok){rows.innerHTML='<tr><td colspan=5>Scan fehlgeschlagen (HTTP '+r.status+')</td></tr>';return;}const d=await r.json();if(d.error==='ble_off'){rows.innerHTML='<tr><td colspan=5>BLE aus – Setup: BLE aktivieren</td></tr>';return;}if(d.error==='scan_failed'){rows.innerHTML='<tr><td colspan=5>BLE-Scan konnte nicht gestartet werden</td></tr>';return;}"
             "const typ=n=>[n.spartan?'Hub':'',n.nus?'NUS':''].filter(Boolean).join(',')||'–';"
-            "rows.innerHTML=d.devices.map(n=>`<tr><td>${n.name}</td><td>${n.mac}</td><td>${n.rssi}</td><td>${typ(n)}</td><td><a href='/ble/select?mac=${encodeURIComponent(n.mac)}'><button>Waehlen</button></a></td></tr>`).join('')||'<tr><td colspan=5>Keine Geraete</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=5>Scan fehlgeschlagen</td></tr>';}}"
-            "function syncBleSetup(d){const m=document.getElementById('bleModeLabel');if(m)m.textContent=d.ble_mode_label||'?';const mac=document.getElementById('bleMacLabel');if(mac)mac.textContent=d.ble_target_mac||'---';}"
+            "const list=Array.isArray(d.devices)?d.devices:[];"
+            "rows.innerHTML=list.map(n=>`<tr><td>${n.name}</td><td>${n.mac}</td><td>${n.rssi}</td><td>${typ(n)}</td><td><a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=hub'><button>Hub</button></a> <a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=direct'><button>123</button></a></td></tr>`).join('')||'<tr><td colspan=5>Keine Geraete</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=5>Scan fehlgeschlagen</td></tr>';}}"
+            "function syncBleSetup(d){const m=document.getElementById('bleModeLabel');if(m)m.textContent=d.ble_mode_label||'?';const m2=document.getElementById('bleModeLabel2');if(m2)m2.textContent=d.ble_mode_label||'?';const mac=document.getElementById('bleMacLabel');if(mac)mac.textContent=d.ble_target_mac||'---';const hub=document.getElementById('bleHubMacLabel');if(hub)hub.textContent=d.ble_mac_hub||'---';const dir=document.getElementById('bleDirectMacLabel');if(dir)dir.textContent=d.ble_mac_123||'---';const tz=document.getElementById('tzLabel');if(tz&&d.tz_label)tz.textContent=d.tz_label;}"
             "async function live(){try{const r=await fetch('/api/status');const d=await r.json();document.getElementById('liveBox').textContent=JSON.stringify(d,null,2);syncDashboard(d);}catch(e){document.getElementById('liveBox').textContent='Live-Status nicht erreichbar';}}"
             "const otaForm=document.getElementById('otaForm');"
             "function otaShow(pct,msg){const bar=document.getElementById('otaBar');const st=document.getElementById('otaStatus');const box=document.getElementById('otaProgress');if(box)box.hidden=false;if(bar)bar.style.width=Math.max(0,Math.min(100,pct))+'%';if(st)st.textContent=msg||'Upload laeuft...';}"
@@ -1890,19 +2035,7 @@ static void handleWebRoot() {
   webServer.send(200, "text/html", html);
 }
 
-static void handleWebBleScan() {
-  if (webOtaRejectBusy()) return;
-  if (!g_featureBle) {
-    webServer.send(409, "application/json", F("{\"devices\":[],\"error\":\"ble_off\"}"));
-    return;
-  }
-  bleStartDiscoveryScan();
-  uint32_t waitUntil = millis() + BLE_DISCOVERY_SCAN_MS + 1500;
-  while (g_bleDiscoveryScan && millis() < waitUntil) {
-    webServer.handleClient();
-    delay(10);
-    yield();
-  }
+static String bleBuildScanJson() {
   String json = F("{\"devices\":[");
   for (uint8_t i = 0; i < g_bleScanCount; i++) {
     if (i > 0) json += ',';
@@ -1920,6 +2053,42 @@ static void handleWebBleScan() {
     json += '}';
   }
   json += F("]}");
+  return json;
+}
+
+static void handleWebBleScan() {
+  if (webOtaRejectBusy()) return;
+  if (!g_featureBle) {
+    webServer.send(409, "application/json", F("{\"devices\":[],\"error\":\"ble_off\"}"));
+    return;
+  }
+
+  const bool wifiSleepWasOn = (WiFi.getSleep() != WIFI_PS_NONE);
+  WiFi.setSleep(WIFI_PS_NONE);
+  webServer.client().setNoDelay(true);
+  webServer.client().setTimeout(30000);
+
+  bleDoConnect = false;
+  auto* scanDev = NimBLEDevice::getScan();
+  scanDev->stop();
+  bleWaitScanStopped(scanDev, 500);
+  if (bleClient && bleClient->isConnected()) bleClient->disconnect();
+  bleAbortDiscoveryScan();
+  const bool started = bleStartDiscoveryScan();
+  const uint32_t waitUntil = millis() + BLE_DISCOVERY_SCAN_MS + 2000;
+  while (started && millis() < waitUntil) {
+    webServer.handleClient();
+    if (!g_bleDiscoveryScan && !scanDev->isScanning()) break;
+    delay(10);
+    yield();
+  }
+  if (g_bleDiscoveryScan || scanDev->isScanning()) bleAbortDiscoveryScan();
+  bleNextScanAt = millis() + 3000;
+  if (wifiSleepWasOn) WiFi.setSleep(true);
+
+  String json = started ? bleBuildScanJson() :
+                        F("{\"devices\":[],\"error\":\"scan_failed\"}");
+  webServer.sendHeader("Connection", "close");
   webServer.send(200, "application/json", json);
 }
 
@@ -1947,7 +2116,48 @@ static void handleWebBleSelect() {
   else saveBleMac123(mac.c_str());
   saveBleConnMode(mode);
   disconnectBleForModeChange();
+  bleNextScanAt = millis();
   Serial.printf("Web: BLE Ziel -> %s (%s)\n", bleTargetDisplay(), bleConnModeLabel());
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+static bool bleMacLooksValid(const String& mac) {
+  if (mac.length() < 17) return false;
+  for (size_t i = 0; i < mac.length(); i++) {
+    const char c = mac[i];
+    if (c == ':') continue;
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+  }
+  return true;
+}
+
+static void handleWebBleMac() {
+  if (webOtaRejectBusy()) return;
+  bool changed = false;
+  if (webServer.hasArg("hub_mac")) {
+    String mac = webServer.arg("hub_mac");
+    mac.trim();
+    mac.toLowerCase();
+    if (bleMacLooksValid(mac)) {
+      saveBleMacHub(mac.c_str());
+      changed = true;
+    }
+  }
+  if (webServer.hasArg("direct_mac")) {
+    String mac = webServer.arg("direct_mac");
+    mac.trim();
+    mac.toLowerCase();
+    if (bleMacLooksValid(mac)) {
+      saveBleMac123(mac.c_str());
+      changed = true;
+    }
+  }
+  if (changed) {
+    disconnectBleForModeChange();
+    bleNextScanAt = millis();
+    Serial.printf("Web: BLE MAC hub=%s direct=%s\n", g_bleHubMac, g_bleTargetMac);
+  }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -1962,6 +2172,7 @@ static void handleWebBleMode() {
   if (next != g_bleConnMode) {
     saveBleConnMode(next);
     disconnectBleForModeChange();
+    bleNextScanAt = millis();
     Serial.printf("Web: BLE Quelle -> %s\n", bleConnModeLabel());
   }
   webServer.sendHeader("Location", "/");
@@ -2003,7 +2214,11 @@ static void handleWebStatus() {
   json += String(now.tm_min);
   json += F(",\"sec\":");
   json += String(now.tm_sec);
-  json += F(",\"ip\":\"");
+  json += F(",\"tz_idx\":");
+  json += String(g_timezoneIdx);
+  json += F(",\"tz_label\":\"");
+  json += jsonEscape(String(timezoneLabel(g_timezoneIdx)));
+  json += F("\",\"ip\":\"");
   json += jsonEscape(String(g_ipStr));
   json += F("\",\"rpm\":");
   json += String(g_rpm, 0);
@@ -2045,6 +2260,10 @@ static void handleWebStatus() {
   json += String(g_dialScalePct);
   json += F(",\"rotation\":");
   json += String(g_rotationDeg);
+  json += F(",\"dial_off_x\":");
+  json += String(g_dialCenterOffsetX);
+  json += F(",\"dial_off_y\":");
+  json += String(g_dialCenterOffsetY);
   json += F(",\"imu_present\":");
   json += g_imuPresent ? F("true") : F("false");
   json += F(",\"imu_pitch\":");
@@ -2109,6 +2328,21 @@ static void handleWebSet() {
     g_redrawPage = true;
     Serial.printf("Web: Rotation = %d deg\n", g_rotationDeg);
   }
+  if (webServer.hasArg("dial_x_delta")) {
+    saveDialOffset(g_dialCenterOffsetX + webServer.arg("dial_x_delta").toInt(), g_dialCenterOffsetY);
+    g_redrawPage = true;
+    Serial.printf("Web: Zifferblatt-Offset X=%d Y=%d\n", g_dialCenterOffsetX, g_dialCenterOffsetY);
+  }
+  if (webServer.hasArg("dial_y_delta")) {
+    saveDialOffset(g_dialCenterOffsetX, g_dialCenterOffsetY + webServer.arg("dial_y_delta").toInt());
+    g_redrawPage = true;
+    Serial.printf("Web: Zifferblatt-Offset X=%d Y=%d\n", g_dialCenterOffsetX, g_dialCenterOffsetY);
+  }
+  if (webServer.hasArg("dial_reset")) {
+    saveDialOffset(DIAL_CENTER_OFF_X_DEFAULT, DIAL_CENTER_OFF_Y_DEFAULT);
+    g_redrawPage = true;
+    Serial.printf("Web: Zifferblatt-Offset reset X=%d Y=%d\n", g_dialCenterOffsetX, g_dialCenterOffsetY);
+  }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -2121,6 +2355,25 @@ static void handleWebFeatures() {
   Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s\n",
                 g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off",
                 g_featureBuzzer ? "on" : "off");
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+static void handleWebTimezone() {
+  if (webOtaRejectBusy()) return;
+  if (webServer.hasArg("idx")) {
+    int idx = webServer.arg("idx").toInt();
+    if (idx < 0) idx = 0;
+    if (idx >= (int)TIMEZONE_COUNT) idx = TIMEZONE_COUNT - 1;
+    if ((uint8_t)idx != g_timezoneIdx) {
+      saveTimezone((uint8_t)idx);
+    } else {
+      applyTimezone();
+      requestNtpResync();
+      Serial.printf("Web: TZ resync %s\n", timezoneLabel(g_timezoneIdx));
+    }
+    g_redrawPage = true;
+  }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -2158,11 +2411,13 @@ static void startWebServer() {
   webServer.on("/",        handleWebRoot);
   webServer.on("/set",     handleWebSet);
   webServer.on("/features",handleWebFeatures);
+  webServer.on("/tz",      handleWebTimezone);
   webServer.on("/page",    handleWebPage);
   webServer.on("/wifi",    handleWebWifi);
   webServer.on("/scan",    HTTP_GET, handleWebScan);
   webServer.on("/ble/scan", HTTP_GET, handleWebBleScan);
   webServer.on("/ble/select", HTTP_GET, handleWebBleSelect);
+  webServer.on("/ble/mac", HTTP_GET, handleWebBleMac);
   webServer.on("/ble/mode", HTTP_GET, handleWebBleMode);
   webServer.on("/api/status", HTTP_GET, handleWebStatus);
   webServer.on("/api/ota/progress", HTTP_GET, handleWebOtaProgress);
