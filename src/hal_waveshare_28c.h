@@ -390,7 +390,10 @@ void hal_pause_for_ota(bool pause) {
 void hal_fill(uint16_t color) {
   uint16_t *fb = hal_fb();
   if (!fb) return;
-  for (int i = 0; i < 480 * 480; i++) fb[i] = color;
+  const uint32_t pair = (uint32_t)color | ((uint32_t)color << 16);
+  uint32_t *w = (uint32_t *)fb;
+  const int n = (480 * 480) / 2;
+  for (int i = 0; i < n; i++) w[i] = pair;
 }
 
 bool hal_ok() {

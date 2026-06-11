@@ -57,6 +57,27 @@
 Muss vor LCD-Init initialisiert werden: alle drei auf HIGH, dann
 Reset-Sequenz (LOW→HIGH) fuer Display und Touch.
 
+## Freie GPIOs (nicht vom 2.8C-Display/Touch belegt)
+
+| GPIO | ADC | Empfehlung |
+|---|---|---|
+| **4** | ADC1_CH3 | **Tacho-Dimmer ADC** (WiFi-kompatibel, siehe `FUTURE.md`) |
+| 0 | — | Strapping/Boot — nur mit Vorsicht |
+| 19, 20 | — | USB-CDC (nativ, COM-Port) |
+| 22–37 | teils ADC2 | Digital OK; ADC2 kollidiert mit WiFi |
+| 42–44 | ADC1_CH0–CH2 | Alternative ADC-Pins (Header prüfen) |
+
+**Belegt (26 Pins):** 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 38, 39, 40, 41, 45, 46, 47, 48
+
+### PCA9554-Expander — ungenutzte Bits
+
+Config `0x78`: Pins 3–6 sind **Input** (über I2C lesbar, kein ESP-GPIO nötig):
+
+| Expander-Pin | Nutzung (optional) |
+|---|---|
+| 3–6 | Taster, Status-LED, Digital-In |
+| 7 | Buzzer (bereits im Code) |
+
 ## Quelle
 
 ESPHome Community-Config Waveshare ESP32-S3-Touch-LCD-2.8C

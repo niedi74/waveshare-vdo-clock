@@ -21,7 +21,9 @@ binär auf GPIO 6 — ggf. auf **PWM/LEDC** umstellen für echtes Dimmen).
 
 ### Offene Fragen
 
-- **GPIO-Pin:** Welcher freie ADC-fähige GPIO? (GPIO 6 ist bereits LCD-Backlight)
+- **GPIO-Pin:** **GPIO 4** (ADC1_CH3) — einziger freier ADC1-Pin bei WiFi; Hook in
+  `hal_waveshare_28c.h` (`HAL_TACHO_DIMMER_ADC`, `FEATURE_TACHO_DIMMER=0` default).
+  GPIO 6 bleibt LCD-Backlight (später LEDC-PWM für echtes Dimmen).
 - **Spannungsteiler:** Widerstandswerte für erwarteten Spannungsbereich des Dimmers
 - **Kalibrierung:** Mapping ADC-Rohwert → Helligkeitsprozent (min/max am Drehregler)
 - **Verhalten Original-Dimmer:** Rein analoges Widerstandsnetzwerk oder andere Topologie?
