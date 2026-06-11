@@ -1,11 +1,13 @@
 // Waveshare ESP32-S3-Touch-LCD-2.8C - VDO Quartz-Zeit Clock
-// Main app: clock, touch menu, WiFi/NTP, Spartan3-Hub BLE client, WebGUI.
+// Main app: clock, touch menu, WiFi/NTP, Spartan3-Hub data client, WebGUI.
+// Data path priority (future-ready): CAN module > WiFi hub HTTP > BLE hub > direct 123.
 // Display hardware ownership lives in hal_waveshare_28c.h.
 #include <Arduino.h>
 #include <Wire.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
 #include <Update.h>
 #include <NimBLEDevice.h>
 #include "esp_task_wdt.h"
@@ -23,6 +25,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <cstring>
+#include <cstdarg>
 
 #define FEATURE_TOUCH 1
 
@@ -45,6 +48,14 @@
 #define RGB565_BLACK RGB565(0, 0, 0)
 #endif
 
+// Serial debug: DLOG=verbose app logs; BLE_LOG_SERIAL=throttled BLE connection logs (default on).
+#ifndef FEATURE_VERBOSE_SERIAL
+#define FEATURE_VERBOSE_SERIAL 0
+#endif
+#ifndef DEBUG_SERIAL
+#define DEBUG_SERIAL 0
+#endif
+
 // -------- Spartan3-Hub / 123TUNE+ BLE-Client --------
 #define SPARTAN_MAC     "30:30:f9:1d:d0:fd"
 #define SPARTAN_NAME    "Spartan3-Hub"
@@ -59,11 +70,76 @@
 #define BLE_DISCOVERY_SCAN_MS 5000
 #define BLE_OP_SCAN_123_MS    10000  // M5Dial: Scan 10s fuer 123/BM6
 #define BLE_BG_SCAN_INTERVAL_MS 12000
-#define BLE_RECONNECT_123_MS    3000
+#define BLE_RECONNECT_123_MS    1500
+#define BLE_CONNECT_TIMEOUT_MS      3000
+#define BLE_CONNECT_TIMEOUT_HUB_MS  8000
+// M5 Dial 123: conn itvl=40ms lat=0 to=4000ms (NimBLE: 1.25ms / 10ms units)
+#define BLE_123_CONN_ITVL       32     // 40ms
+#define BLE_123_CONN_LATENCY    0
+#define BLE_123_CONN_TIMEOUT    400    // 4000ms
+#define BLE_123_KICK_DELAY_MS   900    // ~1s after NUS subscribe before $+CR
+#define BLE_123_KICK_CR_MS      40     // gap between $ and CR
+#define BLE_123_KICK_IDLE       0
+#define BLE_123_KICK_WAIT       1      // waiting pre-kick delay
+#define BLE_123_KICK_CR         2      // $ sent, waiting for CR
 #define BLE_TICK_MS           300
 #define BLE_SCAN_WEB_WAIT_MS  800
-#define BLELOG(...) Serial.printf(__VA_ARGS__)
-#define BLELOGN(msg) Serial.println(msg)
+#define BLE_STATUS_LOG_MS     8000   // periodischer Offline-Status (Serial + API)
+#define BLE_LIVE_LOG_MS       4000   // rpm/adv wenn LIVE-Daten ankommen
+// Throttled BLE logs on USB serial @115200. Set 0 in platformio.ini to silence serial.
+#ifndef BLE_LOG_SERIAL
+#define BLE_LOG_SERIAL 1
+#endif
+
+enum BleLogKind : uint8_t { BLE_LOG_EVENT = 0, BLE_LOG_STATUS = 1, BLE_LOG_LIVE = 2 };
+
+static char  g_bleState[40]   = "init";
+static char  g_bleLogLine[128] = "---";
+static uint32_t g_bleStatusLogAt = 0;
+static uint32_t g_bleLiveLogAt   = 0;
+
+static void bleLogSetState(const char* state) {
+  strncpy(g_bleState, state, sizeof(g_bleState) - 1);
+  g_bleState[sizeof(g_bleState) - 1] = 0;
+}
+
+static void bleLog(BleLogKind kind, const char* fmt, ...) {
+  char buf[128];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  strncpy(g_bleLogLine, buf, sizeof(g_bleLogLine) - 1);
+  g_bleLogLine[sizeof(g_bleLogLine) - 1] = 0;
+
+  const uint32_t now = millis();
+  bool serial = false;
+  switch (kind) {
+    case BLE_LOG_EVENT:
+      serial = true;
+      break;
+    case BLE_LOG_STATUS:
+      if (now - g_bleStatusLogAt >= BLE_STATUS_LOG_MS) {
+        g_bleStatusLogAt = now;
+        serial = true;
+      }
+      break;
+    case BLE_LOG_LIVE:
+      if (now - g_bleLiveLogAt >= BLE_LIVE_LOG_MS) {
+        g_bleLiveLogAt = now;
+        serial = true;
+      }
+      break;
+  }
+#if DEBUG_SERIAL || BLE_LOG_SERIAL
+  if (serial) Serial.println(buf);
+#endif
+}
+
+#define BLELOG(fmt, ...)   bleLog(BLE_LOG_EVENT, fmt, ##__VA_ARGS__)
+#define BLELOGN(msg)       bleLog(BLE_LOG_EVENT, "%s", msg)
+#define BLELOG_STATUS(...) bleLog(BLE_LOG_STATUS, __VA_ARGS__)
+#define BLELOG_LIVE(...)   bleLog(BLE_LOG_LIVE, __VA_ARGS__)
 
 enum BleConnMode : uint8_t { BLE_MODE_DIRECT_123 = 0, BLE_MODE_SPARTAN_HUB = 1 };
 
@@ -76,9 +152,9 @@ struct BleScanEntry {
 };
 
 static float g_lambda = 0, g_rpm = 0, g_adv = 0, g_map = 0;
-static float g_battVolt = 0, g_speedKmh = 0;
+static float g_battVolt = 0, g_speedKmh = 0, g_auxBattVolt = 0;
 static float g_g123Volt = 0, g_g123Temp = 0, g_g123Coil = 0;
-static bool  g_lambdaValid = false, g_battValid = false;
+static bool  g_lambdaValid = false, g_battValid = false, g_auxBattValid = false;
 static bool  g_speedValid = false, g_g123Valid = false;
 static bool  g_bleConn = false;
 static uint32_t g_bleLastRx = 0, g_bleRxCnt = 0;
@@ -90,9 +166,15 @@ static NimBLEAddress      bleTarget;
 static volatile bool      bleDoConnect = false;
 static uint32_t           bleNextScanAt = 0;
 static uint32_t           g_ble123PingAt = 0;
+static uint32_t           g_ble123KickAt = 0;
+static uint8_t            g_ble123KickStage = BLE_123_KICK_IDLE;
 static BleConnMode        g_bleConnMode = BLE_MODE_SPARTAN_HUB;
 static char               g_bleTargetMac[18] = DEFAULT_123_MAC;  // 123 direkt
+static uint8_t            g_ble123AddrType   = BLE_ADDR_RANDOM;
 static char               g_bleHubMac[18]    = "";               // Hub (leer bis Scan/Connect)
+static bool               g_ble123ScanNext   = false;            // 123: Scan nach Direct-Fail
+static bool               g_bleHubScanNext   = true;             // Hub: Scan vor Direct (Hub advert. selten)
+static uint8_t            g_ble123AddrFlip   = 0;               // Direct: RANDOM/PUBLIC wechseln
 static BleScanEntry       g_bleScanList[BLE_SCAN_MAX];
 static uint8_t            g_bleScanCount = 0;
 static volatile bool      g_bleDiscoveryScan = false;
@@ -100,10 +182,34 @@ static bool               g_bleScanWifiSleepWasOn = false;
 static bool               g_bleOpScanActive = false;
 static volatile bool      g_bleSetupBusy = false;
 static uint8_t            g_blePickIndex = 0;
+static bool               g_bleStackReady = false;
+
+// -------- Spartan Hub data path (WiFi HTTP default; BLE optional fallback) --------
+enum DataPath : uint8_t { DATA_PATH_WIFI_HUB = 0, DATA_PATH_BLE = 1 };
+#define HUB_WIFI_DEFAULT_HOST "192.168.0.87"
+#define HUB_BUS_HOST          "192.168.4.1"
+#define HUB_WIFI_POLL_MS      300
+#define HUB_WIFI_TIMEOUT_MS   1200
+#define DATA_FRESH_MS         3000
+#define WIFI_BUS_FAILOVER_MS  45000
+#define HUB_BUS_FAILOVER_MS   20000
+
+static DataPath  g_dataPath       = DATA_PATH_WIFI_HUB;
+static char      g_hubHost[48]    = HUB_WIFI_DEFAULT_HOST;
+static bool      g_hubWifiOk      = false;
+static uint32_t  g_hubLastOkMs    = 0;
+static uint32_t  g_hubPollCnt     = 0;
+static uint32_t  g_hubErrCnt      = 0;
+static char      g_hubState[32]   = "init";
+static char      g_hubSourceTag[16] = "---";
+static uint32_t  g_liveLastRx     = 0;
+static uint32_t  g_liveRxCnt      = 0;
 
 // ---- GT911 touch state ----
 static uint8_t  gt911Addr = GT911_ADDR_PRIMARY;
 static bool     gt911Found = false;
+static uint8_t  g_touchI2cFailStreak = 0;
+#define TOUCH_I2C_RECOVER_AFTER 40
 static uint16_t g_lastTouchX = 0, g_lastTouchY = 0;
 static uint32_t g_lastTouchMs = 0;
 static uint8_t  g_lastTouchStatus = 0;
@@ -126,19 +232,27 @@ static int       g_dialCenterOffsetX = DIAL_CENTER_OFF_X_DEFAULT;
 static int       g_dialCenterOffsetY = DIAL_CENTER_OFF_Y_DEFAULT;
 static int       g_brightnessPct = 100;
 static int       g_rotationDeg  = 0;
+static const int RPM_SCALE_MIN_VALUE = 4;        // VDO tach: 4 at ~7 o'clock (×100 RPM)
+static const int RPM_SCALE_MAX_VALUE = 80;       // 80 at ~5 o'clock (×100 RPM → 8000)
+static const int RPM_REDLINE_DEFAULT = 4200;
+static const int RPM_REDLINE_MIN     = 2000;
+static const int RPM_REDLINE_MAX     = 5500;
+static int       g_rpmRedline        = RPM_REDLINE_DEFAULT;
+static const uint8_t MOTOR_STYLE_VDO       = 0;
+static const uint8_t MOTOR_STYLE_MERCEDES  = 1;
+static const int     MB_SCALE_MAX_VALUE    = 70;   // Mercedes tach 0–70 (×100 RPM)
+static const float   MB_SCALE_MID_VALUE    = 35.0f;
+static const int     MB_CLOCK_CX           = 240;
+static const int     MB_CLOCK_CY           = 318;
+static const int     MB_CLOCK_R            = 54;
+static uint8_t       g_motorStyle          = MOTOR_STYLE_VDO;
+static const uint8_t PAGE_MAX            = 6;   // 0=UHR .. 6=IMU (5=SETUP)
 static float     g_rotSin       = 0.0f;
 static float     g_rotCos       = 1.0f;
 // Throttled debug logging (115200 baud Serial)
 static uint32_t  g_logTimeLastMs  = 0;
 static uint32_t  g_logDrawLastMs  = 0;
 static int       g_logLastRotDeg  = -1;
-// Verbose Serial in hot paths blocks the main loop (USB-CDC @115200).
-#ifndef FEATURE_VERBOSE_SERIAL
-#define FEATURE_VERBOSE_SERIAL 0
-#endif
-#ifndef DEBUG_SERIAL
-#define DEBUG_SERIAL 0
-#endif
 #if DEBUG_SERIAL
 #define DLOG(...) Serial.printf(__VA_ARGS__)
 #define DLOGN(msg) Serial.println(msg)
@@ -155,6 +269,8 @@ static int       g_logLastRotDeg  = -1;
 static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
+static bool      g_wifiApOnly   = false;   // Standalone AP (VDO-Clock-Setup), kein Home-STA
+static bool      g_apOn         = false;
 static bool      g_webStarted   = false;
 static bool      g_redrawPage   = false;
 static volatile bool g_otaBusy  = false;
@@ -165,9 +281,22 @@ static WebServer webServer(80);
 static void startWebServer();   // forward declaration
 static void bleAbortDiscoveryScan();
 static void reconnectWifiProfile();
+static void applyBusProfile(bool reconnect);
+static void syncHubHostForWifi();
+static void disconnectBleForModeChange();
+static void saveDataPath(DataPath path);
+static void saveHubHost(const char* host);
+static void saveFeatures(bool wifi, bool ble, bool buzzer);
+static void saveWifiProfile(uint8_t idx);
 static void cycleWifiProfile();
+static void enterApOnlyMode();
+static void stopApOnlyMode();
+static void cycleWifiNetworkMode();
+static void cycleSourceMode();
+static void applySourceMode(const char* mode);
 static void updateRotationCache();
 static void logicalToDisplay(int lx, int ly, int *dx, int *dy);
+static bool readTouch(uint16_t *x, uint16_t *y);
 static uint16_t *g_dialCache = nullptr;
 static bool      g_dialRebuilding = false;
 static bool dialCacheMatches(int pct, int rot, int offX, int offY);
@@ -224,6 +353,13 @@ static void webServerPoll(uint8_t n) {
   if (!g_webStarted) return;
   for (uint8_t i = 0; i < n; i++) webServer.handleClient();
 }
+
+#if FEATURE_TOUCH
+static bool readTouch(uint16_t *x, uint16_t *y);
+static void processTouchInput(bool *touchBusyOut);
+static void drawCurrentPage();
+static void gt911Init();
+#endif
 
 static void webOtaBeginUpload(const char* filename) {
   g_otaBusy = true;
@@ -290,6 +426,13 @@ struct WifiProfile {
   const char* pass;
 };
 
+#ifndef HUB_SETUP_WIFI_SSID
+#define HUB_SETUP_WIFI_SSID "Spartan3-Setup"
+#endif
+#ifndef HUB_SETUP_WIFI_PASS
+#define HUB_SETUP_WIFI_PASS "lambda123"
+#endif
+
 static const WifiProfile WIFI_PROFILES[] = {
   { WIFI_SSID, WIFI_PASSWORD },
 #ifdef WIFI_SSID_2
@@ -298,6 +441,7 @@ static const WifiProfile WIFI_PROFILES[] = {
 #ifdef WIFI_SSID_3
   { WIFI_SSID_3, WIFI_PASSWORD_3 },
 #endif
+  { HUB_SETUP_WIFI_SSID, HUB_SETUP_WIFI_PASS },
 };
 
 static uint8_t wifiProfileCount() {
@@ -316,6 +460,48 @@ static const char* currentWifiPassword() {
   if (count == 0) return "";
   if (g_wifiProfile >= count) g_wifiProfile = 0;
   return WIFI_PROFILES[g_wifiProfile].pass;
+}
+
+static uint8_t hubWifiProfileIndex() {
+  const uint8_t count = wifiProfileCount();
+  for (uint8_t i = 0; i < count; i++) {
+    if (strcmp(WIFI_PROFILES[i].ssid, HUB_SETUP_WIFI_SSID) == 0) return i;
+  }
+  return 0xFF;
+}
+
+static bool isBusWifiSsid(const char* ssid) {
+  return ssid && strcmp(ssid, HUB_SETUP_WIFI_SSID) == 0;
+}
+
+static bool isOnBusWifi() {
+  if (isBusWifiSsid(currentWifiSsid())) return true;
+  return WiFi.status() == WL_CONNECTED && WiFi.SSID() == HUB_SETUP_WIFI_SSID;
+}
+
+static void syncHubHostForWifi() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.SSID() != HUB_SETUP_WIFI_SSID) return;
+  if (strcmp(g_hubHost, HUB_BUS_HOST) != 0) saveHubHost(HUB_BUS_HOST);
+  if (g_dataPath != DATA_PATH_WIFI_HUB) saveDataPath(DATA_PATH_WIFI_HUB);
+  if (g_featureBle) saveFeatures(g_featureWifi, false, g_featureBuzzer);
+}
+
+static void applyBusProfile(bool reconnect) {
+  const uint8_t idx = hubWifiProfileIndex();
+  if (idx == 0xFF) {
+    Serial.println("Bus: Spartan3-Setup Profil fehlt");
+    return;
+  }
+  stopApOnlyMode();
+  saveWifiProfile(idx);
+  saveDataPath(DATA_PATH_WIFI_HUB);
+  saveHubHost(HUB_BUS_HOST);
+  if (g_featureBle) disconnectBleForModeChange();
+  saveFeatures(true, false, g_featureBuzzer);
+  Serial.println("Bus: Spartan3-Setup + hub 192.168.4.1 + WiFi (BLE aus)");
+  if (reconnect) reconnectWifiProfile();
+  g_redrawPage = true;
 }
 
 // Build-time fallbacks (inject_time.py provides these)
@@ -522,10 +708,18 @@ static void initTimeSource() {
 // Non-blocking WiFi/NTP handler. Returns true on fresh NTP sync.
 static bool wifiNtpTick() {
   static uint32_t lastTry = 0;
+  static uint32_t failSince = 0;
 
   if (!g_featureWifi || strlen(currentWifiSsid()) == 0) return false;
 
   if (WiFi.status() != WL_CONNECTED) {
+    if (failSince == 0) failSince = millis();
+    else if (!g_wifiApOnly && !isOnBusWifi() && hubWifiProfileIndex() != 0xFF &&
+             millis() - failSince >= WIFI_BUS_FAILOVER_MS) {
+      Serial.println("WiFi: Home timeout -> BUS failover");
+      applyBusProfile(true);
+      failSince = 0;
+    }
     if (millis() - lastTry > 30000) {
       lastTry = millis();
       WiFi.begin(currentWifiSsid(), currentWifiPassword());  // kein disconnect() davor
@@ -534,6 +728,9 @@ static bool wifiNtpTick() {
     if (g_ipStr[0] == '-') strcpy(g_ipStr, "...");
     return false;
   }
+
+  failSince = 0;
+  syncHubHostForWifi();
 
   static char lastIp[20] = "";
   snprintf(g_ipStr, sizeof(g_ipStr), "%s", WiFi.localIP().toString().c_str());
@@ -569,6 +766,197 @@ static bool wifiNtpTick() {
   return false;
 }
 
+// -------- Spartan Hub WiFi client (HTTP /api/status poll) --------
+static const char* dataPathLabel() {
+  return g_dataPath == DATA_PATH_WIFI_HUB ? "WiFi" : "BLE";
+}
+
+static bool dataFresh() {
+  return g_liveLastRx != 0 && (millis() - g_liveLastRx) < DATA_FRESH_MS;
+}
+
+static bool hubLinkOk() {
+  if (g_dataPath == DATA_PATH_WIFI_HUB) {
+    if (!g_featureWifi || WiFi.status() != WL_CONNECTED) return false;
+    if (g_hubWifiOk) return true;
+    // Grace after last OK poll — avoids KEIN HUB flicker between 300 ms polls
+    return g_hubLastOkMs != 0 && (millis() - g_hubLastOkMs) < 5000;
+  }
+  return g_featureBle && g_bleConn;
+}
+
+static void touchLiveRx() {
+  g_liveLastRx = millis();
+  g_liveRxCnt++;
+}
+
+static void clearLiveValues() {
+  g_lambda = g_rpm = g_adv = g_map = 0;
+  g_battVolt = g_speedKmh = g_auxBattVolt = 0;
+  g_g123Volt = g_g123Temp = g_g123Coil = 0;
+  g_lambdaValid = g_battValid = g_auxBattValid = g_speedValid = g_g123Valid = false;
+  g_liveLastRx = 0;
+  g_liveRxCnt = 0;
+  g_bleRxCnt = 0;
+  g_bleLastRx = 0;
+  g_hubWifiOk = false;
+  g_hubLastOkMs = 0;
+  strncpy(g_hubSourceTag, "---", sizeof(g_hubSourceTag));
+  g_hubSourceTag[sizeof(g_hubSourceTag) - 1] = 0;
+}
+
+static int jsonKeyPos(const String& json, const char* key) {
+  const String needle = String("\"") + key + "\":";
+  return json.indexOf(needle);
+}
+
+static bool jsonExtractFloat(const String& json, const char* key, float* out) {
+  const int i = jsonKeyPos(json, key);
+  if (i < 0) return false;
+  int p = i + (int)strlen(key) + 3;
+  while (p < (int)json.length() && (json[p] == ' ' || json[p] == '\t')) p++;
+  *out = json.substring(p).toFloat();
+  return true;
+}
+
+static bool jsonExtractBool(const String& json, const char* key, bool* out) {
+  const int i = jsonKeyPos(json, key);
+  if (i < 0) return false;
+  int p = i + (int)strlen(key) + 3;
+  while (p < (int)json.length() && json[p] == ' ') p++;
+  if (json.startsWith("true", p)) { *out = true; return true; }
+  if (json.startsWith("false", p)) { *out = false; return true; }
+  return false;
+}
+
+static bool jsonExtractString(const String& json, const char* key, char* out, size_t outLen) {
+  const int i = jsonKeyPos(json, key);
+  if (i < 0) return false;
+  int q1 = json.indexOf('"', i + (int)strlen(key) + 3);
+  if (q1 < 0) return false;
+  int q2 = json.indexOf('"', q1 + 1);
+  if (q2 < 0) return false;
+  String s = json.substring(q1 + 1, q2);
+  strncpy(out, s.c_str(), outLen - 1);
+  out[outLen - 1] = 0;
+  return true;
+}
+
+static bool parseHubStatusJson(const String& json) {
+  bool valid = false;
+  const bool hasValid = jsonExtractBool(json, "valid", &valid);
+
+  float lambda = 0, rpm = 0, adv = 0, map = 0;
+  jsonExtractFloat(json, "lambda", &lambda);
+  jsonExtractFloat(json, "rpm", &rpm);
+  jsonExtractFloat(json, "advance", &adv);
+  jsonExtractFloat(json, "map", &map);
+
+  g_lambda = lambda;
+  g_lambdaValid = lambda > 0.001f && (!hasValid || valid);
+  g_rpm = rpm;
+  g_adv = adv;
+  g_map = map;
+
+  float bm6v = 0, auxv = 0, volt = 0, speed = 0;
+  if (jsonExtractFloat(json, "bm6_voltage", &bm6v) && bm6v > 0.5f) {
+    g_battVolt = bm6v;
+    g_battValid = true;
+  } else if (jsonExtractFloat(json, "volt", &volt) && volt > 0.5f) {
+    g_battVolt = volt;
+    g_battValid = true;
+  } else {
+    g_battValid = false;
+  }
+  if (jsonExtractFloat(json, "bm6_aux_voltage", &auxv) && auxv > 0.5f) {
+    g_auxBattVolt = auxv;
+    g_auxBattValid = true;
+  } else {
+    g_auxBattValid = false;
+  }
+  if (jsonExtractFloat(json, "speed_kmh", &speed) && speed >= 0.0f) {
+    g_speedKmh = speed;
+    g_speedValid = true;
+  } else {
+    g_speedValid = false;
+  }
+  jsonExtractString(json, "source", g_hubSourceTag, sizeof(g_hubSourceTag));
+  touchLiveRx();
+  return true;
+}
+
+static bool pollHubAtHost(const char* host, uint32_t now, bool persistHost) {
+  HTTPClient http;
+  const String url = String("http://") + host + "/api/status";
+  http.setTimeout(HUB_WIFI_TIMEOUT_MS);
+  if (!http.begin(url)) return false;
+  http.addHeader("X-Device", "vdo-clock-28");
+  const int code = http.GET();
+  bool ok = false;
+  if (code == HTTP_CODE_OK) {
+    const String body = http.getString();
+    if (body.length() > 20 && parseHubStatusJson(body)) {
+      if (persistHost && strcmp(g_hubHost, host) != 0) saveHubHost(host);
+      g_hubWifiOk = true;
+      g_hubLastOkMs = now;
+      strncpy(g_hubState, "ok", sizeof(g_hubState));
+      g_hubState[sizeof(g_hubState) - 1] = 0;
+      ok = true;
+    }
+  }
+  http.end();
+  return ok;
+}
+
+static void hubWifiPollTick() {
+  if (g_dataPath != DATA_PATH_WIFI_HUB || !g_featureWifi) return;
+  static uint32_t nextPollMs = 0;
+  static uint32_t hubFailSince = 0;
+  const uint32_t now = millis();
+  if (now < nextPollMs) return;
+  nextPollMs = now + HUB_WIFI_POLL_MS;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    g_hubWifiOk = false;
+    strncpy(g_hubState, "no_wifi", sizeof(g_hubState));
+    g_hubState[sizeof(g_hubState) - 1] = 0;
+    return;
+  }
+  if (g_hubHost[0] == '\0') {
+    g_hubWifiOk = false;
+    strncpy(g_hubState, "no_host", sizeof(g_hubState));
+    g_hubState[sizeof(g_hubState) - 1] = 0;
+    return;
+  }
+
+  g_hubPollCnt++;
+  if (pollHubAtHost(g_hubHost, now, false)) {
+    hubFailSince = 0;
+    return;
+  }
+
+  g_hubWifiOk = false;
+  g_hubErrCnt++;
+  strncpy(g_hubState, "poll_fail", sizeof(g_hubState));
+  g_hubState[sizeof(g_hubState) - 1] = 0;
+
+  if (strcmp(g_hubHost, HUB_BUS_HOST) != 0 && pollHubAtHost(HUB_BUS_HOST, now, true)) {
+    hubFailSince = 0;
+    return;
+  }
+
+  if (!isOnBusWifi() && hubWifiProfileIndex() != 0xFF) {
+    if (hubFailSince == 0) hubFailSince = now;
+    else if (now - hubFailSince >= HUB_BUS_FAILOVER_MS) {
+      Serial.println("Hub: poll timeout -> BUS failover");
+      applyBusProfile(true);
+      hubFailSince = 0;
+    }
+  } else {
+    hubFailSince = 0;
+  }
+}
+
 // -------- BLE Spartan3-Hub / 123TUNE+ client --------
 static const char* bleConnModeLabel() {
   return g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "HUB" : "123 dir";
@@ -581,20 +969,16 @@ static bool macEquals(const String& a, const char* b) {
 }
 
 static void clearBleLiveValues() {
-  g_lambda = g_rpm = g_adv = g_map = 0;
-  g_battVolt = g_speedKmh = 0;
-  g_g123Volt = g_g123Temp = g_g123Coil = 0;
-  g_lambdaValid = g_battValid = g_speedValid = g_g123Valid = false;
-  g_bleRxCnt = 0;
-  g_bleLastRx = 0;
+  clearLiveValues();
 }
+
+static void bleIoYield();  // GT911 poll during BLE blocking waits
 
 static void bleWaitScanStopped(NimBLEScan* s, uint32_t timeoutMs) {
   const uint32_t until = millis() + timeoutMs;
   while (s->isScanning() && millis() < until) {
-    if (g_webStarted) webServer.handleClient();
+    bleIoYield();
     delay(10);
-    yield();
   }
 }
 
@@ -620,11 +1004,25 @@ static void bleOpScanBegin() {
 
 static void bleAbortDiscoveryScan() {
   if (!g_bleDiscoveryScan) return;
-  auto* s = NimBLEDevice::getScan();
-  s->stop();
-  bleWaitScanStopped(s, 500);
+  if (g_bleStackReady) {
+    auto* s = NimBLEDevice::getScan();
+    s->stop();
+    bleWaitScanStopped(s, 500);
+  }
   g_bleDiscoveryScan = false;
   bleDiscoveryScanEnded();
+}
+
+// Touch hat Vorrang: laufenden BLE-Scan abbrechen (Radio/CPU entlasten).
+static void blePauseForTouch() {
+  auto* s = NimBLEDevice::getScan();
+  if (!s || !s->isScanning()) return;
+  s->stop();
+  bleWaitScanStopped(s, 150);
+  bleWifiSleepRestore();
+  if (!g_bleConn && !bleDoConnect) {
+    bleNextScanAt = millis() + 4000;
+  }
 }
 
 static void disconnectBleForModeChange() {
@@ -633,10 +1031,17 @@ static void disconnectBleForModeChange() {
   g_bleHubName = "---";
   g_nusRx = nullptr;
   g_ble123PingAt = 0;
+  g_ble123KickAt = 0;
+  g_ble123KickStage = BLE_123_KICK_IDLE;
+  g_ble123ScanNext = false;
+  g_ble123AddrFlip = 0;
+  g_bleHubScanNext = true;
   clearBleLiveValues();
   bleAbortDiscoveryScan();
-  NimBLEDevice::getScan()->stop();
-  if (bleClient && bleClient->isConnected()) bleClient->disconnect();
+  if (g_bleStackReady) {
+    NimBLEDevice::getScan()->stop();
+    if (bleClient && bleClient->isConnected()) bleClient->disconnect();
+  }
   bleNextScanAt = millis() + 2000;
 }
 
@@ -648,12 +1053,14 @@ static void saveBleConnMode(BleConnMode mode) {
   p.end();
 }
 
-static void saveBleMac123(const char* mac) {
+static void saveBleMac123(const char* mac, uint8_t addrType = 0xFF) {
   strncpy(g_bleTargetMac, mac, sizeof(g_bleTargetMac) - 1);
   g_bleTargetMac[sizeof(g_bleTargetMac) - 1] = 0;
+  if (addrType != 0xFF) g_ble123AddrType = addrType;
   Preferences p;
   p.begin("clock", false);
   p.putString("ble_mac_123", g_bleTargetMac);
+  if (addrType != 0xFF) p.putUChar("ble_addr_123", g_ble123AddrType);
   p.end();
 }
 
@@ -686,6 +1093,35 @@ static void cycleBleConnMode() {
   DLOG("BLE: Quelle -> %s\n", bleConnModeLabel());
 }
 
+static void saveDataPath(DataPath path);  // fwd
+static void saveFeatures(bool wifi, bool ble, bool buzzer);  // fwd
+
+static const char* sourceModeLabel() {
+  if (g_dataPath == DATA_PATH_WIFI_HUB) return "HUB WiFi";
+  if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) return "HUB BLE";
+  return "123 dir";
+}
+
+static void cycleSourceMode() {
+  if (g_dataPath == DATA_PATH_WIFI_HUB) {
+    saveDataPath(DATA_PATH_BLE);
+    if (!g_featureBle) {
+      saveFeatures(g_featureWifi, true, g_featureBuzzer);
+    } else if (g_bleConnMode != BLE_MODE_SPARTAN_HUB) {
+      saveBleConnMode(BLE_MODE_SPARTAN_HUB);
+      disconnectBleForModeChange();
+    }
+  } else if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
+    if (!g_featureBle) saveFeatures(g_featureWifi, true, g_featureBuzzer);
+    saveBleConnMode(BLE_MODE_DIRECT_123);
+    disconnectBleForModeChange();
+  } else {
+    saveDataPath(DATA_PATH_WIFI_HUB);
+  }
+  g_redrawPage = true;
+  DLOG("Source -> %s\n", sourceModeLabel());
+}
+
 static int bleHexNib(uint8_t c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -714,6 +1150,11 @@ static void decode123Frame(const uint8_t* d, size_t n) {
   }
   g_bleRxCnt++;
   g_bleLastRx = millis();
+  if (g_dataPath == DATA_PATH_BLE) touchLiveRx();
+  if (g_bleConnMode == BLE_MODE_DIRECT_123) {
+    BLELOG_LIVE("BLE: LIVE rpm=%.0f adv=%.1f map=%.0f rx=%lu",
+                g_rpm, g_adv, g_map, (unsigned long)g_bleRxCnt);
+  }
 }
 
 static void parseSpartanPayload(const String& p) {
@@ -728,15 +1169,21 @@ static void parseSpartanPayload(const String& p) {
   g_adv    = p.substring(posA + 1, posM).toFloat();
 
   int posV   = p.indexOf('V', posM + 1);
+  int posW   = p.indexOf('W', posM + 1);
   int posS   = p.indexOf('S', posM + 1);
   int posI   = p.indexOf('I', posM + 1);
-  int mapEnd = posV > posM ? posV : (posS > posM ? posS : (posI > posM ? posI : p.length()));
+  int mapEnd = posV > posM ? posV : (posW > posM ? posW : (posS > posM ? posS : (posI > posM ? posI : p.length())));
   g_map = p.substring(posM + 1, mapEnd).toFloat();
 
   if (posV > posM) {
-    int vEnd = posS > posV ? posS : (posI > posV ? posI : p.length());
+    int vEnd = posW > posV ? posW : (posS > posV ? posS : (posI > posV ? posI : p.length()));
     float v = p.substring(posV + 1, vEnd).toFloat();
     if (v > 0.5f) { g_battVolt = v; g_battValid = true; }
+  }
+  if (posW > posM) {
+    int wEnd = posS > posW ? posS : (posI > posW ? posI : p.length());
+    float w = p.substring(posW + 1, wEnd).toFloat();
+    if (w > 0.5f) { g_auxBattVolt = w; g_auxBattValid = true; }
   }
   if (posS > posM) {
     int sEnd = posI > posS ? posI : p.length();
@@ -755,6 +1202,7 @@ static void parseSpartanPayload(const String& p) {
   }
   g_bleRxCnt++;
   g_bleLastRx = millis();
+  if (g_dataPath == DATA_PATH_BLE) touchLiveRx();
 }
 
 static void bleNotifyHubCB(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
@@ -771,19 +1219,35 @@ static void bleNotify123CB(NimBLERemoteCharacteristic*, uint8_t* data, size_t le
 class SpartanClientCB : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient*) override {
     bleNextScanAt = 0;
-    BLELOG("BLE: link up (%s)\n", bleConnModeLabel());
+    bleLogSetState("link_up");
+    BLELOG("BLE: link up (%s)", bleConnModeLabel());
     // g_bleConn erst nach NUS/Hub-Subscribe (sonst bricht Setup ab)
-    if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) g_bleConn = true;
+    if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
+      g_bleConn = true;
+      bleLogSetState("connected");
+    }
   }
   void onDisconnect(NimBLEClient*, int reason) override {
     g_bleConn = false;
     g_bleHubName = "---";
     g_nusRx = nullptr;
     g_ble123PingAt = 0;
-    BLELOG("BLE: getrennt (reason=%d)\n", reason);
+    g_ble123KickAt = 0;
+    g_ble123KickStage = BLE_123_KICK_IDLE;
     uint32_t pause = (g_bleConnMode == BLE_MODE_DIRECT_123) ?
                      BLE_RECONNECT_123_MS : BLE_BG_SCAN_INTERVAL_MS;
-    if (g_bleSetupBusy) pause = 2000;
+    // 520/0x208 = Link-Timeout — schnell Direct+Scan abwechseln (M5 bleibt dran)
+    if (g_bleConnMode == BLE_MODE_DIRECT_123 &&
+        (reason == 520 || reason == 0x208 || reason == 0x213)) {
+      pause = 400;
+      g_ble123ScanNext = true;
+    } else if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
+      g_bleHubScanNext = true;
+    }
+    if (g_bleSetupBusy) pause = 800;
+    bleLogSetState("disconnected");
+    BLELOG("BLE: getrennt reason=%d, reconnect in %lums (%s)",
+           reason, (unsigned long)pause, bleConnModeLabel());
     bleNextScanAt = millis() + pause;
   }
   bool onConnParamsUpdateRequest(NimBLEClient*, const ble_gap_upd_params*) override {
@@ -853,11 +1317,14 @@ class SpartanScanCB : public NimBLEScanCallbacks {
     g_bleHubName = name.length() > 0 ? name :
                    (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? SPARTAN_NAME : "123");
     if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) saveBleMacHub(addr.c_str());
-    else saveBleMac123(addr.c_str());
+    else saveBleMac123(addr.c_str(), dev->getAddress().getType());
     bleTarget    = dev->getAddress();
+    g_ble123ScanNext = false;
+    g_ble123AddrFlip = 0;
     bleDoConnect = true;
     NimBLEDevice::getScan()->stop();
-    BLELOG("BLE: %s gefunden (%s / %s)\n",
+    bleLogSetState("found");
+    BLELOG("BLE: %s gefunden %s / %s",
            g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "Hub" : "123",
            addr.c_str(), name.c_str());
   }
@@ -865,14 +1332,22 @@ class SpartanScanCB : public NimBLEScanCallbacks {
     if (g_bleDiscoveryScan) {
       g_bleDiscoveryScan = false;
       bleDiscoveryScanEnded();
-      BLELOG("BLE: Discovery %u Geraete\n", g_bleScanCount);
+      bleLogSetState("discovery_done");
+      BLELOG("BLE: Discovery %u Geraete", g_bleScanCount);
       return;
     }
     bleWifiSleepRestore();
-    BLELOG("BLE: Scan Ende r=%d (%s)\n", results.getCount(), bleConnModeLabel());
+    BLELOG("BLE: Scan Ende r=%d (%s)", results.getCount(), bleConnModeLabel());
     if (!g_bleConn && !bleDoConnect) {
       const uint32_t pause = (g_bleConnMode == BLE_MODE_DIRECT_123) ?
                              BLE_RECONNECT_123_MS : BLE_BG_SCAN_INTERVAL_MS;
+      bleLogSetState("wait_reconnect");
+      if (g_bleConnMode == BLE_MODE_DIRECT_123) {
+        BLELOG("BLE: Scan ohne Treffer @ %s, Direct in %lums",
+               bleSavedMacForMode(), (unsigned long)pause);
+      } else {
+        BLELOG("BLE: Reconnect geplant in %lums", (unsigned long)pause);
+      }
       bleNextScanAt = millis() + pause;
     }
   }
@@ -886,13 +1361,20 @@ static bool bleTryConnectSavedMac() {
   const char* macStr = bleSavedMacForMode();
   if (!macStr[0]) return false;
   if (g_bleConnMode == BLE_MODE_DIRECT_123) {
-    // BM6/123: Adresstyp aus MAC (ef:.. = static random), wie M5Dial aus Scan
-    bleTarget = NimBLEAddress(std::string(macStr), BLE_ADDR_RANDOM);
+    // BM6/123: Typ aus Scan/NVS; bei Fehlschlag RANDOM<->PUBLIC wechseln
+    uint8_t addrType = g_ble123AddrType;
+    if (g_ble123AddrFlip & 1) {
+      addrType = (addrType == BLE_ADDR_RANDOM) ? BLE_ADDR_PUBLIC : BLE_ADDR_RANDOM;
+    }
+    bleTarget = NimBLEAddress(std::string(macStr), addrType);
+    bleLogSetState("connect_attempt");
+    BLELOG("BLE: Direktconnect %s type=%u (%s)", macStr, addrType, bleConnModeLabel());
   } else {
     bleTarget = NimBLEAddress(std::string(macStr), BLE_ADDR_PUBLIC);
+    bleLogSetState("connect_attempt");
+    BLELOG("BLE: Direktconnect %s (%s)", macStr, bleConnModeLabel());
   }
   bleDoConnect = true;
-  BLELOG("BLE: Direktconnect %s (%s)\n", macStr, bleConnModeLabel());
   return true;
 }
 
@@ -909,7 +1391,8 @@ static void bleStartScan() {
   s->setWindow(80);
   const uint32_t scanMs = (g_bleConnMode == BLE_MODE_DIRECT_123) ?
                           BLE_OP_SCAN_123_MS : BLE_DISCOVERY_SCAN_MS;
-  BLELOG("BLE: Scan %lus (%s @ %s)...\n",
+  bleLogSetState("scanning");
+  BLELOG("BLE: Scan %lus (%s @ %s)",
          (unsigned long)(scanMs / 1000), bleConnModeLabel(), bleSavedMacForMode());
   s->start(scanMs, false, true);
 }
@@ -950,29 +1433,65 @@ static bool bleStartDiscoveryScan() {
   return true;
 }
 
+static void ble123KickTick();
 static void ble123PingTick();
+static bool bleLinkUp();
+
+static void bleIoYield() {
+#if FEATURE_TOUCH
+  bool tb = false;
+  processTouchInput(&tb);
+  if (g_redrawPage) {
+    g_redrawPage = false;
+    drawCurrentPage();
+  }
+#endif
+  if (g_webStarted) webServerPoll(1);
+  yield();
+}
 
 static void blePauseMs(uint32_t ms) {
   const uint32_t end = millis() + ms;
   while (millis() < end) {
-    if (g_webStarted) webServerPoll(1);
-    delay(5);
-    yield();
+    bleIoYield();
+    delay(2);
   }
 }
 
-static void ble123KickLive(NimBLERemoteCharacteristic* rx) {
-  if (!rx || !rx->canWrite()) return;
-  const uint8_t dollar[] = {'$'};
-  const uint8_t cr[] = {'\r'};
-  rx->writeValue(dollar, 1, false);
-  blePauseMs(80);
-  rx->writeValue(cr, 1, false);
-  BLELOGN("BLE: 123 kick $ + CR (M5Dial)");
+static void ble123KickTick() {
+  if (g_ble123KickStage == BLE_123_KICK_IDLE) return;
+  if (!g_nusRx || !bleLinkUp()) {
+    g_ble123KickStage = BLE_123_KICK_IDLE;
+    return;
+  }
+  const uint32_t now = millis();
+  if (g_ble123KickStage == BLE_123_KICK_WAIT) {
+    if (now < g_ble123KickAt) return;
+    if (!g_nusRx->canWrite()) {
+      BLELOG("BLE: 123 kick $ skip (no write)");
+      g_ble123KickStage = BLE_123_KICK_IDLE;
+      return;
+    }
+    const uint8_t dollar[] = {'$'};
+    g_nusRx->writeValue(dollar, 1, false);
+    BLELOG("BLE: 123 kick $ nach %lums (M5Dial)", (unsigned long)BLE_123_KICK_DELAY_MS);
+    g_ble123KickAt = now + BLE_123_KICK_CR_MS;
+    g_ble123KickStage = BLE_123_KICK_CR;
+    return;
+  }
+  if (g_ble123KickStage == BLE_123_KICK_CR) {
+    if (now < g_ble123KickAt) return;
+    const uint8_t cr[] = {'\r'};
+    g_nusRx->writeValue(cr, 1, false);
+    BLELOGN("BLE: 123 kick CR (M5Dial)");
+    g_ble123KickStage = BLE_123_KICK_IDLE;
+    g_ble123PingAt = now;
+  }
 }
 
 static void ble123PingTick() {
   if (!g_bleConn || g_bleConnMode != BLE_MODE_DIRECT_123 || !g_nusRx) return;
+  if (g_ble123KickStage != BLE_123_KICK_IDLE) return;
   if (millis() - g_ble123PingAt < 2500) return;
   g_ble123PingAt = millis();
   if (g_nusRx->canWrite()) {
@@ -990,12 +1509,15 @@ static void bleConnectBegin() {
   bleOpScanBegin();
   auto* s = NimBLEDevice::getScan();
   s->stop();
-  bleWaitScanStopped(s, 800);
+  bleWaitScanStopped(s, 300);
 }
 
 static void bleConnectEnd() {
   g_bleSetupBusy = false;
   bleWifiSleepRestore();
+#if FEATURE_TOUCH
+  g_touchI2cFailStreak = 0;
+#endif
 }
 
 static void bleConnect() {
@@ -1007,24 +1529,42 @@ static void bleConnect() {
     bleClient->setClientCallbacks(&spartanClientCB, false);
   }
   if (g_bleConnMode == BLE_MODE_DIRECT_123) {
-    bleClient->setConnectionParams(32, 32, 0, 400);
+    bleClient->setConnectionParams(BLE_123_CONN_ITVL, BLE_123_CONN_ITVL,
+                                   BLE_123_CONN_LATENCY, BLE_123_CONN_TIMEOUT);
   }
+  bleClient->setConnectTimeout(g_bleConnMode == BLE_MODE_SPARTAN_HUB ?
+                               BLE_CONNECT_TIMEOUT_HUB_MS : BLE_CONNECT_TIMEOUT_MS);
+  bleClient->setConnectRetries(1);
   bleConnectBegin();
-  BLELOG("BLE: Connect %s (%s)...\n", bleTarget.toString().c_str(), bleConnModeLabel());
+  bleLogSetState("connecting");
+  BLELOG("BLE: Connect %s type=%u (%s)...",
+         bleTarget.toString().c_str(), bleTarget.getType(), bleConnModeLabel());
 
   bool ok = false;
   for (uint8_t attempt = 0; attempt < 2 && !ok; attempt++) {
     if (attempt > 0) {
-      BLELOG("BLE: Connect retry %u\n", (unsigned)(attempt + 1));
+      BLELOG("BLE: Connect retry %u", (unsigned)(attempt + 1));
       if (bleClient->isConnected()) bleClient->disconnect();
-      blePauseMs(300);
+      blePauseMs(80);
     }
-    if (!bleClient->connect(bleTarget, false, false, false)) continue;
-    blePauseMs(500);
-    if (!bleLinkUp()) continue;
-    bleClient->discoverAttributes();
-    blePauseMs(200);
-    if (!bleLinkUp()) continue;
+    if (!bleClient->connect(bleTarget, false, false, true)) {
+      BLELOG("BLE: connect FAIL err=%d (%s)", bleClient->getLastError(), bleConnModeLabel());
+      continue;
+    }
+    blePauseMs(120);
+    if (!bleLinkUp()) {
+      BLELOG("BLE: link down nach connect err=%d", bleClient->getLastError());
+      continue;
+    }
+    if (!bleClient->discoverAttributes()) {
+      BLELOG("BLE: discover FAIL err=%d", bleClient->getLastError());
+      if (!bleLinkUp()) continue;
+    }
+    blePauseMs(50);
+    if (!bleLinkUp()) {
+      BLELOG("BLE: link down nach discover err=%d", bleClient->getLastError());
+      continue;
+    }
 
     if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
       auto* svc = bleClient->getService(SPARTAN_SVC);
@@ -1032,39 +1572,87 @@ static void bleConnect() {
       auto* status = svc->getCharacteristic(SPARTAN_STATUS);
       if (!status || !bleLinkUp()) continue;
       ok = status->subscribe(true, bleNotifyHubCB, true);
-      BLELOG("BLE: Hub-Subscribe %s\n", ok ? "OK" : "FAIL");
-      if (ok) g_bleConn = true;
+      BLELOG("BLE: Hub-Subscribe %s", ok ? "OK" : "FAIL");
+      if (ok) {
+        g_bleConn = true;
+        bleLogSetState("connected");
+      }
       break;
     }
 
     auto* svc = bleClient->getService(NUS_SVC);
-    if (!svc || !bleLinkUp()) continue;
+    if (!svc || !bleLinkUp()) {
+      BLELOG("BLE: kein NUS-Svc err=%d link=%d", bleClient->getLastError(), bleLinkUp());
+      continue;
+    }
     auto* tx = svc->getCharacteristic(NUS_TX);
-    if (!tx || !bleLinkUp()) continue;
+    if (!tx || !bleLinkUp()) {
+      BLELOG("BLE: kein NUS-TX err=%d", bleClient->getLastError());
+      continue;
+    }
     tx->subscribe(false, nullptr, false);
-    blePauseMs(100);
+    blePauseMs(40);
     ok = tx->subscribe(true, bleNotify123CB, true);
-    BLELOG("BLE: 123-Subscribe %s\n", ok ? "OK" : "FAIL");
+    BLELOG("BLE: 123-Subscribe %s err=%d", ok ? "OK" : "FAIL", bleClient->getLastError());
     if (!ok || !bleLinkUp()) { ok = false; continue; }
     g_nusRx = svc->getCharacteristic(NUS_RX);
-    ble123KickLive(g_nusRx);
-    g_ble123PingAt = millis();
+    g_ble123KickStage = BLE_123_KICK_WAIT;
+    g_ble123KickAt = millis() + BLE_123_KICK_DELAY_MS;
+    BLELOG("BLE: 123 kick geplant in %lums (M5Dial)", (unsigned long)BLE_123_KICK_DELAY_MS);
     g_bleConn = true;
-    BLELOG("BLE: verbunden (%s)\n", bleConnModeLabel());
+    g_ble123ScanNext = false;
+    g_ble123AddrFlip = 0;
+    bleLogSetState("nus_ok");
+    BLELOG("BLE: verbunden (%s)", bleConnModeLabel());
+    bleLogSetState("connected");
     break;
   }
 
   bleConnectEnd();
   if (!ok) {
-    BLELOG("BLE: Connect fehlgeschlagen (%s)\n", bleSavedMacForMode());
+    bleLogSetState("connect_fail");
+    BLELOG("BLE: Connect fehlgeschlagen %s type=%u err=%d",
+           bleSavedMacForMode(), bleTarget.getType(), bleClient ? bleClient->getLastError() : -1);
     if (bleClient && bleClient->isConnected()) bleClient->disconnect();
-    bleNextScanAt = millis() + 5000;
+    const uint32_t pause = (g_bleConnMode == BLE_MODE_DIRECT_123) ?
+                           BLE_RECONNECT_123_MS : 2500;
+    if (g_bleConnMode == BLE_MODE_DIRECT_123) {
+      g_ble123ScanNext = true;
+      g_ble123AddrFlip++;
+    } else {
+      g_bleHubScanNext = true;
+    }
+    BLELOG("BLE: Reconnect geplant in %lums%s", (unsigned long)pause,
+           (g_bleConnMode == BLE_MODE_DIRECT_123 && g_ble123ScanNext) ? " (Scan)" :
+           (g_bleConnMode == BLE_MODE_SPARTAN_HUB && g_bleHubScanNext) ? " (Scan)" : "");
+    bleNextScanAt = millis() + pause;
   }
 }
 
+static const char* blePhaseLabel() {
+  if (g_bleDiscoveryScan) return "discovery";
+  if (g_bleSetupBusy || bleDoConnect) return "connecting";
+  if (g_bleOpScanActive) return "scanning";
+  if (bleNextScanAt != 0 && millis() < bleNextScanAt) return "wait_reconnect";
+  if (g_bleConn) return "connected";
+  return "idle";
+}
+
+static void bleLogPeriodicStatus() {
+  if (!g_featureBle || g_bleConn) return;
+  const uint32_t waitMs = (bleNextScanAt != 0 && millis() < bleNextScanAt) ?
+                          (bleNextScanAt - millis()) : 0;
+  BLELOG_STATUS("BLE: offline mode=%s mac=%s rx=%lu phase=%s wait=%lus",
+                bleConnModeLabel(), bleSavedMacForMode(),
+                (unsigned long)g_bleRxCnt, blePhaseLabel(),
+                (unsigned long)(waitMs / 1000));
+}
+
 static void bleTick() {
+  bleLogPeriodicStatus();
   if (g_bleSetupBusy) return;
   if (g_bleConn && g_bleConnMode == BLE_MODE_DIRECT_123) {
+    ble123KickTick();
     ble123PingTick();
     return;
   }
@@ -1072,13 +1660,25 @@ static void bleTick() {
   if (g_bleConn || g_bleDiscoveryScan) return;
   if (bleNextScanAt == 0 || millis() < bleNextScanAt) return;
   bleNextScanAt = 0;
+  // 123 direkt: Direct und Scan abwechseln (BM6 advertisiert selten)
   if (g_bleConnMode == BLE_MODE_DIRECT_123) {
-    bleStartScan();
+    if (g_ble123ScanNext) {
+      g_ble123ScanNext = false;
+      bleStartScan();
+    } else if (!bleTryConnectSavedMac()) {
+      bleStartScan();
+    }
     return;
   }
-  static uint8_t s_hubDirectTry = 0;
-  if ((++s_hubDirectTry % 3) == 0 && bleTryConnectSavedMac()) return;
-  bleStartScan();
+  // Hub: Scan und Direct abwechseln — Direct allein scheitert wenn Hub nicht advertisiert
+  // (NimBLE stoppt Advertising nach erstem Client, z.B. M5 Dial).
+  if (g_bleHubScanNext) {
+    g_bleHubScanNext = false;
+    bleStartScan();
+  } else if (!bleTryConnectSavedMac()) {
+    g_bleHubScanNext = true;
+    bleStartScan();
+  }
 }
 
 // ---- I2C helpers (GT911) ----
@@ -1134,17 +1734,32 @@ static void gt911Init() {
   Serial.println("GT911: not found on 0x5D/0x14");
 }
 
+static void gt911TouchRecoverIfNeeded() {
+  if (g_touchI2cFailStreak < TOUCH_I2C_RECOVER_AFTER) return;
+  if (g_bleSetupBusy) return;
+  g_touchI2cFailStreak = 0;
+  Serial.println("GT911: I2C recover re-init");
+  gt911Init();
+}
+
 static bool readTouch(uint16_t *x, uint16_t *y) {
-  if (!gt911Found) return false;
+  if (!gt911Found) {
+    if (g_touchI2cFailStreak < 255) g_touchI2cFailStreak++;
+    gt911TouchRecoverIfNeeded();
+    return false;
+  }
   uint8_t status = 0;
   if (!i2cRegRead16(gt911Addr, GT911_READ_XY, &status, 1)) {
     uint8_t other = (gt911Addr == GT911_ADDR_PRIMARY) ? GT911_ADDR_ALT : GT911_ADDR_PRIMARY;
     if (!i2cRegRead16(other, GT911_READ_XY, &status, 1)) {
+      if (g_touchI2cFailStreak < 255) g_touchI2cFailStreak++;
+      gt911TouchRecoverIfNeeded();
       return false;
     }
     gt911Addr  = other;
     gt911Found = true;
   }
+  g_touchI2cFailStreak = 0;
   g_lastTouchStatus = status;
   if ((status & 0x80) == 0) {
     uint8_t clear = 0;
@@ -1161,6 +1776,8 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
   bool ok = i2cRegRead16(gt911Addr, GT911_READ_XY + 1, point, sizeof(point));
   i2cRegWrite16(gt911Addr, GT911_READ_XY, &clear, 1);
   if (!ok) {
+    if (g_touchI2cFailStreak < 255) g_touchI2cFailStreak++;
+    gt911TouchRecoverIfNeeded();
     return false;
   }
   // GT911 ab 0x814F: [TrackID, X-low, X-high, Y-low, Y-high, Size-low, ...]
@@ -1170,6 +1787,23 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
   if (g_rotationDeg == 0) {
     *x = rawX;
     *y = rawY;
+  } else if (g_rotationDeg == 90) {
+    int lx = (int)rawY;
+    int ly = 479 - (int)rawX;
+    if (lx < 0) lx = 0; else if (lx > 479) lx = 479;
+    if (ly < 0) ly = 0; else if (ly > 479) ly = 479;
+    *x = (uint16_t)lx;
+    *y = (uint16_t)ly;
+  } else if (g_rotationDeg == 180) {
+    *x = (uint16_t)(479 - rawX);
+    *y = (uint16_t)(479 - rawY);
+  } else if (g_rotationDeg == 270) {
+    int lx = 479 - (int)rawY;
+    int ly = (int)rawX;
+    if (lx < 0) lx = 0; else if (lx > 479) lx = 479;
+    if (ly < 0) ly = 0; else if (ly > 479) ly = 479;
+    *x = (uint16_t)lx;
+    *y = (uint16_t)ly;
   } else {
     float dx = (float)rawX - ROT_PIVOT;
     float dy = (float)rawY - ROT_PIVOT;
@@ -1205,18 +1839,33 @@ static void setPixelFb(int x, int y, uint16_t color) {
   fb[y * 480 + x] = color;
 }
 
+static void logicalToDisplay(int lx, int ly, int *dx, int *dy);
+
 static void setPixel(int x, int y, uint16_t color) {
   if (g_rotationDeg != 0) {
-    float dx = (float)x - ROT_PIVOT;
-    float dy = (float)y - ROT_PIVOT;
-    x = (int)lroundf(dx * g_rotCos - dy * g_rotSin + ROT_PIVOT);
-    y = (int)lroundf(dx * g_rotSin + dy * g_rotCos + ROT_PIVOT);
+    logicalToDisplay(x, y, &x, &y);
     if ((unsigned)x >= 480 || (unsigned)y >= 480) return;
   }
   setPixelFb(x, y, color);
 }
 
 static void fillRectFast(int x, int y, int w, int h, uint16_t color) {
+  if (g_rotationDeg == 0) {
+    for (int yy = y; yy < y + h; yy++)
+      for (int xx = x; xx < x + w; xx++)
+        setPixelFb(xx, yy, color);
+    return;
+  }
+  if (g_rotationDeg == 90 || g_rotationDeg == 180 || g_rotationDeg == 270) {
+    for (int ly = y; ly < y + h; ly++) {
+      for (int lx = x; lx < x + w; lx++) {
+        int dx, dy;
+        logicalToDisplay(lx, ly, &dx, &dy);
+        setPixelFb(dx, dy, color);
+      }
+    }
+    return;
+  }
   for (int yy = y; yy < y + h; yy++)
     for (int xx = x; xx < x + w; xx++)
       setPixel(xx, yy, color);
@@ -1229,6 +1878,138 @@ static void drawCircleLine(int cx, int cy, int radius, int thickness, uint16_t c
       int dx = x - cx, dy = y - cy, d = dx*dx + dy*dy;
       if (d <= outer && d >= inner) setPixel(x, y, color);
     }
+}
+
+// VDO tach arc: 4 @ ~7 o'clock, 40 @ 12 o'clock, 80 @ ~5 o'clock (270° CW sweep).
+static float rpmDialFrac(float scaleVal) {
+  if (scaleVal <= (float)RPM_SCALE_MIN_VALUE) return 7.0f / 12.0f;
+  if (scaleVal >= (float)RPM_SCALE_MAX_VALUE) return 5.0f / 12.0f;
+  float d;
+  if (scaleVal <= 40.0f)
+    d = (scaleVal - (float)RPM_SCALE_MIN_VALUE) / (40.0f - (float)RPM_SCALE_MIN_VALUE) * (5.0f / 12.0f);
+  else
+    d = 5.0f / 12.0f + (scaleVal - 40.0f) / ((float)RPM_SCALE_MAX_VALUE - 40.0f) * (5.0f / 12.0f);
+  float frac = 7.0f / 12.0f + d;
+  if (frac >= 1.0f) frac -= 1.0f;
+  return frac;
+}
+
+static float rpmScaleAngle(float scaleVal) {
+  return rpmDialFrac(scaleVal) * 2.0f * PI - PI / 2.0f;
+}
+
+static float rpmScaleAtDialFrac(float frac) {
+  float d = frac - 7.0f / 12.0f;
+  if (d < 0.0f) d += 1.0f;
+  const float arcLen = 10.0f / 12.0f;
+  if (d > arcLen + 0.02f) return -1.0f;
+  if (d <= 5.0f / 12.0f)
+    return (float)RPM_SCALE_MIN_VALUE + d / (5.0f / 12.0f) * (40.0f - (float)RPM_SCALE_MIN_VALUE);
+  return 40.0f + (d - 5.0f / 12.0f) / (5.0f / 12.0f) * ((float)RPM_SCALE_MAX_VALUE - 40.0f);
+}
+
+static void drawArcRing(int cx, int cy, int radius, int thickness,
+                        float vStart, float vEnd, uint16_t color) {
+  if (vEnd <= vStart) return;
+  const int outer = radius * radius;
+  const int innerR = radius - thickness;
+  const int inner = innerR > 0 ? innerR * innerR : 0;
+  for (int y = cy - radius; y <= cy + radius; y++) {
+    for (int x = cx - radius; x <= cx + radius; x++) {
+      const int dx = x - cx, dy = y - cy;
+      const int d = dx * dx + dy * dy;
+      if (d > outer || d < inner) continue;
+      float ang = atan2f((float)dy, (float)dx) + PI / 2.0f;
+      if (ang < 0.0f) ang += 2.0f * PI;
+      const float val = rpmScaleAtDialFrac(ang / (2.0f * PI));
+      if (val < 0.0f) continue;
+      if (val >= vStart - 0.05f && val <= vEnd + 0.05f) setPixel(x, y, color);
+    }
+  }
+}
+
+static void drawArcRingLinear(int cx, int cy, int radius, int thickness,
+                              float vStart, float vEnd, float vMax, uint16_t color) {
+  if (vEnd <= vStart || vMax <= 0.0f) return;
+  const int outer = radius * radius;
+  const int innerR = radius - thickness;
+  const int inner = innerR > 0 ? innerR * innerR : 0;
+  for (int y = cy - radius; y <= cy + radius; y++) {
+    for (int x = cx - radius; x <= cx + radius; x++) {
+      const int dx = x - cx, dy = y - cy;
+      const int d = dx * dx + dy * dy;
+      if (d > outer || d < inner) continue;
+      float ang = atan2f((float)dy, (float)dx) + PI / 2.0f;
+      if (ang < 0.0f) ang += 2.0f * PI;
+      const float val = ang * vMax / (2.0f * PI);
+      if (val >= vStart - 0.02f && val <= vEnd + 0.02f) setPixel(x, y, color);
+    }
+  }
+}
+
+static float rpmScaleValue(float rpm) {
+  float v = rpm / 100.0f;
+  if (v < (float)RPM_SCALE_MIN_VALUE) v = (float)RPM_SCALE_MIN_VALUE;
+  if (v > (float)RPM_SCALE_MAX_VALUE) v = (float)RPM_SCALE_MAX_VALUE;
+  return v;
+}
+
+// Mercedes tach: 0 @ ~7 o'clock, 35 @ 12 o'clock, 70 @ ~5 o'clock.
+static float mbDialFrac(float scaleVal) {
+  if (scaleVal <= 0.0f) return 7.0f / 12.0f;
+  if (scaleVal >= (float)MB_SCALE_MAX_VALUE) return 5.0f / 12.0f;
+  float d;
+  if (scaleVal <= MB_SCALE_MID_VALUE)
+    d = scaleVal / MB_SCALE_MID_VALUE * (5.0f / 12.0f);
+  else
+    d = 5.0f / 12.0f
+        + (scaleVal - MB_SCALE_MID_VALUE) / ((float)MB_SCALE_MAX_VALUE - MB_SCALE_MID_VALUE)
+          * (5.0f / 12.0f);
+  float frac = 7.0f / 12.0f + d;
+  if (frac >= 1.0f) frac -= 1.0f;
+  return frac;
+}
+
+static float mbScaleAngle(float scaleVal) {
+  return mbDialFrac(scaleVal) * 2.0f * PI - PI / 2.0f;
+}
+
+static float mbScaleAtDialFrac(float frac) {
+  float d = frac - 7.0f / 12.0f;
+  if (d < 0.0f) d += 1.0f;
+  const float arcLen = 10.0f / 12.0f;
+  if (d > arcLen + 0.02f) return -1.0f;
+  if (d <= 5.0f / 12.0f)
+    return d / (5.0f / 12.0f) * MB_SCALE_MID_VALUE;
+  return MB_SCALE_MID_VALUE
+         + (d - 5.0f / 12.0f) / (5.0f / 12.0f) * ((float)MB_SCALE_MAX_VALUE - MB_SCALE_MID_VALUE);
+}
+
+static void drawMbArcRing(int cx, int cy, int radius, int thickness,
+                          float vStart, float vEnd, uint16_t color) {
+  if (vEnd <= vStart) return;
+  const int outer = radius * radius;
+  const int innerR = radius - thickness;
+  const int inner = innerR > 0 ? innerR * innerR : 0;
+  for (int y = cy - radius; y <= cy + radius; y++) {
+    for (int x = cx - radius; x <= cx + radius; x++) {
+      const int dx = x - cx, dy = y - cy;
+      const int d = dx * dx + dy * dy;
+      if (d > outer || d < inner) continue;
+      float ang = atan2f((float)dy, (float)dx) + PI / 2.0f;
+      if (ang < 0.0f) ang += 2.0f * PI;
+      const float val = mbScaleAtDialFrac(ang / (2.0f * PI));
+      if (val < 0.0f) continue;
+      if (val >= vStart - 0.05f && val <= vEnd + 0.05f) setPixel(x, y, color);
+    }
+  }
+}
+
+static float mbScaleValue(float rpm) {
+  float v = rpm / 100.0f;
+  if (v < 0.0f) v = 0.0f;
+  if (v > (float)MB_SCALE_MAX_VALUE) v = (float)MB_SCALE_MAX_VALUE;
+  return v;
 }
 
 static void fillCircleFast(int cx, int cy, int radius, uint16_t color) {
@@ -1251,6 +2032,15 @@ static void drawLineFast(int x0, int y0, int x1, int y1, uint16_t color, int thi
     if (e2 >= dy) { err += dy; x0 += sx; }
     if (e2 <= dx) { err += dx; y0 += sy; }
   }
+}
+
+static void drawMbTick(int cx, int cy, int rOuter, int rInner, float scaleVal, uint16_t color, int thick) {
+  const float angle = mbScaleAngle(scaleVal);
+  const int x0 = cx + (int)lroundf(cosf(angle) * (float)rInner);
+  const int y0 = cy + (int)lroundf(sinf(angle) * (float)rInner);
+  const int x1 = cx + (int)lroundf(cosf(angle) * (float)rOuter);
+  const int y1 = cy + (int)lroundf(sinf(angle) * (float)rOuter);
+  drawLineFast(x0, y0, x1, y1, color, thick);
 }
 
 static uint16_t faceColorAtFb(int px, int py) {
@@ -1309,6 +2099,19 @@ static void paintHand(float value, float maxValue, int length, int thickness, ui
 
 static void drawHand(float value, float maxValue, int length, int thickness, uint16_t color) {
   paintHand(value, maxValue, length, thickness, color, false);
+}
+
+static void drawHandAt(int cx, int cy, float value, float maxValue, int length, int thickness, uint16_t color) {
+  const float angle = (value / maxValue) * 2.0f * PI - PI / 2.0f;
+  const int x1 = cx + (int)lroundf(cosf(angle) * (float)length);
+  const int y1 = cy + (int)lroundf(sinf(angle) * (float)length);
+  drawLineFast(cx, cy, x1, y1, color, thickness);
+}
+
+static void drawHandAngle(float angle, int length, int thickness, uint16_t color) {
+  const int lx1 = 240 + (int)lroundf(cosf(angle) * (float)length);
+  const int ly1 = 240 + (int)lroundf(sinf(angle) * (float)length);
+  drawLineFast(240, 240, lx1, ly1, color, thickness);
 }
 
 static void restoreHand(float value, float maxValue, int length, int thickness) {
@@ -1396,6 +2199,75 @@ static int textWidthSmall(const char *text, int scale) {
 
 static void drawTextCentered(int cx, int y, const char *text, uint16_t color, int scale) {
   drawTextSmall(cx - textWidthSmall(text, scale) / 2, y, text, color, scale);
+}
+
+static void drawRpmTick(int cx, int cy, int rOuter, int rInner, float scaleVal, uint16_t color) {
+  const float angle = rpmScaleAngle(scaleVal);
+  const int x0 = cx + (int)lroundf(cosf(angle) * (float)rInner);
+  const int y0 = cy + (int)lroundf(sinf(angle) * (float)rInner);
+  const int x1 = cx + (int)lroundf(cosf(angle) * (float)rOuter);
+  const int y1 = cy + (int)lroundf(sinf(angle) * (float)rOuter);
+  drawLineFast(x0, y0, x1, y1, color, 3);
+}
+
+static void drawRpmTickLinear(int cx, int cy, int rOuter, int rInner, float scaleVal,
+                              float vMax, uint16_t color) {
+  const float angle = (scaleVal / vMax) * 2.0f * PI - PI / 2.0f;
+  const int x0 = cx + (int)lroundf(cosf(angle) * (float)rInner);
+  const int y0 = cy + (int)lroundf(sinf(angle) * (float)rInner);
+  const int x1 = cx + (int)lroundf(cosf(angle) * (float)rOuter);
+  const int y1 = cy + (int)lroundf(sinf(angle) * (float)rOuter);
+  drawLineFast(x0, y0, x1, y1, color, 3);
+}
+
+static void drawRpmScaleLabel(int cx, int cy, int radius, float scaleVal, const char* label) {
+  const float angle = rpmScaleAngle(scaleVal);
+  const int lx = cx + (int)lroundf(cosf(angle) * (float)radius) - textWidthSmall(label, 2) / 2;
+  const int ly = cy + (int)lroundf(sinf(angle) * (float)radius) - 7;
+  drawTextSmall(lx, ly, label, RGB565(235, 235, 225), 2);
+}
+
+static void drawRpmScaleLabelLinear(int cx, int cy, int radius, float scaleVal, float vMax,
+                                    const char* label) {
+  const float angle = (scaleVal / vMax) * 2.0f * PI - PI / 2.0f;
+  const int lx = cx + (int)lroundf(cosf(angle) * (float)radius) - textWidthSmall(label, 2) / 2;
+  const int ly = cy + (int)lroundf(sinf(angle) * (float)radius) - 7;
+  drawTextSmall(lx, ly, label, RGB565(235, 235, 225), 2);
+}
+
+static void drawMbScaleLabel(int cx, int cy, int radius, float scaleVal, const char* label) {
+  const float angle = mbScaleAngle(scaleVal);
+  const int lx = cx + (int)lroundf(cosf(angle) * (float)radius) - textWidthSmall(label, 2) / 2;
+  const int ly = cy + (int)lroundf(sinf(angle) * (float)radius) - 7;
+  drawTextSmall(lx, ly, label, RGB565(235, 235, 225), 2);
+}
+
+static void drawMercedesSubClock() {
+  const int cx = MB_CLOCK_CX, cy = MB_CLOCK_CY, r = MB_CLOCK_R;
+  const uint16_t white = RGB565(235, 235, 225);
+  const uint16_t yellow = RGB565(255, 215, 0);
+  for (int h = 0; h < 12; h++) {
+    const float angle = ((float)h / 12.0f) * 2.0f * PI - PI / 2.0f;
+    const int thick = (h % 3 == 0) ? 3 : 2;
+    const int rOut = (h % 3 == 0) ? r - 4 : r - 10;
+    const int x0 = cx + (int)lroundf(cosf(angle) * (float)(r - 18));
+    const int y0 = cy + (int)lroundf(sinf(angle) * (float)(r - 18));
+    const int x1 = cx + (int)lroundf(cosf(angle) * (float)rOut);
+    const int y1 = cy + (int)lroundf(sinf(angle) * (float)rOut);
+    drawLineFast(x0, y0, x1, y1, white, thick);
+  }
+  drawTextCentered(cx, cy - 30, "12", white, 2);
+  drawTextCentered(cx + 30, cy, "3", white, 2);
+  drawTextCentered(cx, cy + 30, "6", white, 2);
+  drawTextCentered(cx - 30, cy, "9", white, 2);
+  struct tm now = {};
+  if (!readClockTime(&now)) return;
+  const float minuteValue = now.tm_min + now.tm_sec / 60.0f;
+  const float hourValue   = (now.tm_hour % 12) + minuteValue / 60.0f;
+  drawHandAt(cx, cy, hourValue,   12.0f, 20, 4, yellow);
+  drawHandAt(cx, cy, minuteValue, 60.0f, 30, 3, yellow);
+  fillCircleFast(cx, cy, 7, RGB565(175, 175, 168));
+  fillCircleFast(cx, cy, 4, RGB565(130, 130, 125));
 }
 
 static void drawGlyphPixelRotated(int x, int y, int lx, int ly, int w, int h, int scale, int rot, uint16_t color) {
@@ -1574,8 +2446,7 @@ static void finishDialCacheRebuildBlocking() {
     if (pct > DIAL_SCALE_MAX) pct = DIAL_SCALE_MAX;
     if (pct == 100 && g_rotationDeg == 0 && g_dialCenterOffsetX == 0 && g_dialCenterOffsetY == 0) break;
     if (dialCacheMatches(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY)) break;
-    if (g_webStarted) webServer.handleClient();
-    yield();
+    bleIoYield();
   }
 }
 
@@ -1618,10 +2489,25 @@ static void copyVdoDialToFrame() {
 }
 
 static void logicalToDisplay(int lx, int ly, int *dx, int *dy) {
-  if (g_rotationDeg == 0) {
-    *dx = lx;
-    *dy = ly;
-    return;
+  switch (g_rotationDeg) {
+    case 0:
+      *dx = lx;
+      *dy = ly;
+      return;
+    case 90:
+      *dx = 479 - ly;
+      *dy = lx;
+      return;
+    case 180:
+      *dx = 479 - lx;
+      *dy = 479 - ly;
+      return;
+    case 270:
+      *dx = ly;
+      *dy = 479 - lx;
+      return;
+    default:
+      break;
   }
   float fx = (float)lx - ROT_PIVOT;
   float fy = (float)ly - ROT_PIVOT;
@@ -1697,47 +2583,87 @@ static void drawVdoClock() {
   presentFrame();
 }
 
-static void drawMenuTile(int x, int y, int w, int h, const char *label, uint16_t accent) {
-  fillRectFast(x, y, w, h, RGB565(18, 18, 18));
-  fillRectFast(x, y, 8, h, accent);
-  drawLineFast(x, y,     x + w, y,     RGB565(70, 70, 70), 2);
-  drawLineFast(x, y + h, x + w, y + h, RGB565(55, 55, 55), 2);
-  drawTextSmall(x + 24, y + 22, label, RGB565(235, 235, 225), 4);
+// 2x3 menu grid on 480 round display: gaps between tiles, inset for round clip.
+#define MENU_ROWS        3
+#define MENU_COLS        2
+#define MENU_COL0_X      84
+#define MENU_COL1_X      252
+#define MENU_COL_W       152
+#define MENU_GRID_Y0     96
+#define MENU_ROW_H       64    // zone per row (tile + vertical gap)
+#define MENU_TILE_H      50
+#define MENU_LABEL_SCALE 2
+#define EDGE_TAP_W       48    // linker/rechter Rand: Seite vor/zurueck
+
+struct MenuEntry { const char *label; uint16_t accent; uint8_t page; };
+
+static const MenuEntry MENU_ENTRIES[MENU_ROWS * MENU_COLS] = {
+  {"UHR",    RGB565(200, 40,  35), 0},
+  {"MOTOR",  RGB565(40,  150, 210), 2},
+  {"LAMBDA", RGB565(60,  185, 90),  3},
+  {"HUB",    RGB565(190, 90,  210), 4},
+  {"IMU",    RGB565(200, 100, 50),  6},
+  {"SETUP",  RGB565(210, 170, 45),  5},
+};
+
+static void menuTileRect(int index, int *x, int *y, int *w, int *h) {
+  const int row = index / MENU_COLS;
+  const int col = index % MENU_COLS;
+  *x = (col == 0) ? MENU_COL0_X : MENU_COL1_X;
+  *y = MENU_GRID_Y0 + row * MENU_ROW_H;
+  *w = MENU_COL_W;
+  *h = MENU_TILE_H;
 }
 
-// Touch zones for menu: 5 equal 60px bands starting at y=108.
-// Zone 0 (UHR)=108..168, Zone 1 (MOTOR)=168..228, Zone 2 (LAMBDA)=228..288,
-// Zone 3 (HUB)=288..348, Zone 4 (SETUP)=348..408.
-// Tiles are drawn 2px inset so the visual tile exactly fills its touch zone.
-#define MENU_ZONE_Y0  100
-#define MENU_ZONE_H    50    // 6 Tiles a 50px
+static int menuIndexFromTap(uint16_t tapX, uint16_t tapY) {
+  if (tapY < MENU_GRID_Y0) return -1;
+  const int row = (int)(tapY - MENU_GRID_Y0) / MENU_ROW_H;
+  if (row >= MENU_ROWS) return -1;
+  int col = -1;
+  if      (tapX >= MENU_COL0_X && tapX < MENU_COL0_X + MENU_COL_W) col = 0;
+  else if (tapX >= MENU_COL1_X && tapX < MENU_COL1_X + MENU_COL_W) col = 1;
+  if (col < 0) return -1;
+  return row * MENU_COLS + col;
+}
+
+static void drawMenuTile(int x, int y, int w, int h, const char *label, uint16_t accent) {
+  fillRectFast(x, y, w, h, RGB565(18, 18, 18));
+  fillRectFast(x, y, 5, h, accent);
+  drawLineFast(x, y,     x + w, y,     RGB565(70, 70, 70), 1);
+  drawLineFast(x, y + h, x + w, y + h, RGB565(55, 55, 55), 1);
+  const int scale = MENU_LABEL_SCALE;
+  const int ty = y + (h - 7 * scale) / 2;
+  drawTextCentered(x + w / 2, ty, label, RGB565(235, 235, 225), scale);
+}
 
 static void drawMenuOverview() {
   if (!ensureFrame()) return;
   g_clockFacePage = currentPage;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(80, 80, 75));
-  drawTextCentered(240, 50, "MENU", RGB565(235, 235, 225), 6);
-  // 6 Tiles, inset 2px from zone boundary so visual == touchable area
-  drawMenuTile(88, MENU_ZONE_Y0 +   0 + 2, 304, MENU_ZONE_H - 4, "UHR",    RGB565(200, 40,  35));
-  drawMenuTile(88, MENU_ZONE_Y0 +  50 + 2, 304, MENU_ZONE_H - 4, "MOTOR",  RGB565(40,  150, 210));
-  webServerPoll(2);
-  drawMenuTile(88, MENU_ZONE_Y0 + 100 + 2, 304, MENU_ZONE_H - 4, "LAMBDA", RGB565(60,  185, 90));
-  drawMenuTile(88, MENU_ZONE_Y0 + 150 + 2, 304, MENU_ZONE_H - 4, "HUB",    RGB565(190, 90,  210));
-  webServerPoll(2);
-  drawMenuTile(88, MENU_ZONE_Y0 + 200 + 2, 304, MENU_ZONE_H - 4, "IMU",    RGB565(200, 100, 50));
-  drawMenuTile(88, MENU_ZONE_Y0 + 250 + 2, 304, MENU_ZONE_H - 4, "SETUP",  RGB565(210, 170, 45));
+  drawTextCentered(240, 52, "MENU", RGB565(235, 235, 225), 3);
+  for (int i = 0; i < MENU_ROWS * MENU_COLS; i++) {
+    int x, y, w, h;
+    menuTileRect(i, &x, &y, &w, &h);
+    drawMenuTile(x, y, w, h, MENU_ENTRIES[i].label, MENU_ENTRIES[i].accent);
+    if (i == 2 || i == 4) webServerPoll(2);
+  }
   char ipLine[32];
   snprintf(ipLine, sizeof(ipLine), "IP %s", g_ipStr);
-  drawTextCentered(240, 424, ipLine, RGB565(150, 200, 150), 2);
+  drawTextCentered(240, 412, ipLine, RGB565(150, 200, 150), 2);
   if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
-    drawTextCentered(240, 446, currentWifiSsid(), RGB565(120, 150, 150), 2);
+    drawTextCentered(240, 434, currentWifiSsid(), RGB565(120, 150, 150), 2);
   }
   presentFrame();
 }
 
-static bool bleFresh() {
-  return g_bleConn && (millis() - g_bleLastRx < 3000);
+static bool bleFresh() { return dataFresh(); }
+
+static const char* liveStatusText() {
+  if (dataFresh()) return "LIVE";
+  if (hubLinkOk()) return "WARTE";
+  if (g_dataPath == DATA_PATH_WIFI_HUB) return "KEIN HUB";
+  return g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "KEIN HUB" : "KEIN 123";
 }
 
 static void drawDataRow(int y, const char* label, const char* value, uint16_t col) {
@@ -1745,44 +2671,114 @@ static void drawDataRow(int y, const char* label, const char* value, uint16_t co
   drawTextSmall(244, y, value, col, 2);
 }
 
+static void drawMotorStatusFooter(int yLambda, int yStatus) {
+  char lbuf[12];
+  uint16_t lcol = RGB565(110, 60, 60);
+  const bool fresh = dataFresh();
+  if (fresh && g_lambdaValid) {
+    snprintf(lbuf, sizeof(lbuf), "L %.2f", g_lambda);
+    if (g_lambda < 0.97f) lcol = RGB565(235, 120, 40);
+    else if (g_lambda > 1.03f) lcol = RGB565(80, 160, 240);
+    else lcol = RGB565(70, 210, 100);
+  } else {
+    strcpy(lbuf, "L ---");
+  }
+  drawTextCentered(240, yLambda, lbuf, lcol, 2);
+  const char* st = liveStatusText();
+  drawTextCentered(240, yStatus, st, fresh ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
+}
+
+static void drawMbMajorTicks(int cx, int cy, int ringR, uint16_t color) {
+  for (int v = 0; v <= MB_SCALE_MAX_VALUE; v += 5) {
+    const int thick = (v % 10 == 0) ? 3 : 2;
+    const int rIn = ringR - ((v % 10 == 0) ? 18 : 12);
+    drawMbTick(cx, cy, ringR + 2, rIn, (float)v, color, thick);
+  }
+}
+
+static void drawMotorPageVdo() {
+  const int ringR = 198, ringT = 14, labelR = ringR - ringT - 28;
+  const uint16_t ringBase  = RGB565(40, 110, 160);
+  const uint16_t redZone   = RGB565(100, 18, 18);
+  const uint16_t needleCol = RGB565(255, 130, 40);
+  drawTextCentered(240, 52, "MOTOR", RGB565(60, 170, 230), 5);
+  drawCircleLine(240, 240, ringR, ringT, ringBase);
+  const float redlineScale = (float)g_rpmRedline / 100.0f;
+  drawArcRing(240, 240, ringR, ringT, redlineScale, (float)RPM_SCALE_MAX_VALUE, redZone);
+  static const int majors[] = {4, 20, 40, 60, 80};
+  for (int i = 0; i < 5; i++)
+    drawRpmTick(240, 240, ringR + 4, ringR - ringT - 8, (float)majors[i], RGB565(235, 235, 225));
+  drawRpmScaleLabel(240, 240, labelR, 4.0f,  "4");
+  drawRpmScaleLabel(240, 240, labelR, 20.0f, "20");
+  drawRpmScaleLabel(240, 240, labelR, 40.0f, "40");
+  drawRpmScaleLabel(240, 240, labelR, 60.0f, "60");
+  drawRpmScaleLabel(240, 240, labelR, 80.0f, "80");
+  const bool fresh = dataFresh();
+  const float rpmVal = fresh ? rpmScaleValue(g_rpm) : (float)RPM_SCALE_MIN_VALUE;
+  drawHandAngle(rpmScaleAngle(rpmVal), 168, 6, needleCol);
+  fillCircleFast(240, 240, 8, RGB565(30, 30, 28));
+  fillCircleFast(240, 240, 4, needleCol);
+  char buf[16];
+  uint16_t cv = fresh ? RGB565(235, 235, 225) : RGB565(110, 60, 60);
+  const char* na = "---";
+  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_rpm); drawTextCentered(240, 268, buf, cv, 3); }
+  else drawTextCentered(240, 268, na, cv, 3);
+  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_adv); drawDataRow(300, "ADV", buf, cv); }
+  else drawDataRow(300, "ADV", na, cv);
+  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_map); drawDataRow(328, "MAP", buf, cv); }
+  else drawDataRow(328, "MAP", na, cv);
+  drawMotorStatusFooter(395, 420);
+}
+
+static void drawMotorPageMercedes() {
+  const int ringR = 212, labelR = ringR - 34;
+  const uint16_t white = RGB565(235, 235, 225);
+  const uint16_t redZone = RGB565(220, 55, 18);
+  const uint16_t yellow = RGB565(255, 215, 0);
+  drawMbMajorTicks(240, 240, ringR, white);
+  static const int labels[] = {5, 10, 20, 30, 40, 50, 60, 70};
+  static const char* labelTxt[] = {"5", "10", "20", "30", "40", "50", "60", "70"};
+  for (int i = 0; i < 8; i++)
+    drawMbScaleLabel(240, 240, labelR, (float)labels[i], labelTxt[i]);
+  drawTextCentered(240, 198, "x100 1/min", white, 2);
+  drawMercedesSubClock();
+  const float redlineScale = (float)g_rpmRedline / 100.0f;
+  if (redlineScale < (float)MB_SCALE_MAX_VALUE)
+    drawMbArcRing(240, 240, labelR + 8, 20, redlineScale, (float)MB_SCALE_MAX_VALUE, redZone);
+  const bool fresh = dataFresh();
+  const float rpmVal = fresh ? mbScaleValue(g_rpm) : 0.0f;
+  drawHandAt(240, 240, rpmVal, (float)MB_SCALE_MAX_VALUE, 188, 3, yellow);
+  fillCircleFast(240, 240, 30, RGB565(175, 175, 168));
+  fillCircleFast(240, 240, 18, RGB565(130, 130, 125));
+  drawMotorStatusFooter(392, 418);
+}
+
+static const char* motorStyleLabel() {
+  return g_motorStyle == MOTOR_STYLE_MERCEDES ? "Mercedes" : "VDO";
+}
+
 static void drawMotorPage() {
   if (!ensureFrame()) return;
   g_clockFacePage = currentPage;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(40, 110, 160));
-  drawTextCentered(240, 52, "MOTOR", RGB565(60, 170, 230), 5);
-  bool fresh = bleFresh();
+  drawTextCentered(240, 58, "MOTOR", RGB565(60, 170, 230), 3);
+  const bool fresh = dataFresh();
   char buf[16];
-  {
-    char lbuf[12];
-    uint16_t lcol = RGB565(110, 60, 60);
-    if (fresh && g_lambdaValid) {
-      snprintf(lbuf, sizeof(lbuf), "L %.2f", g_lambda);
-      if (g_lambda < 0.97f) lcol = RGB565(235, 120, 40);
-      else if (g_lambda > 1.03f) lcol = RGB565(80, 160, 240);
-      else lcol = RGB565(70, 210, 100);
-    } else {
-      strcpy(lbuf, "L ---");
-    }
-    drawTextCentered(240, 82, lbuf, lcol, 2);
-  }
-  uint16_t cv = fresh ? RGB565(235, 235, 225) : RGB565(110, 60, 60);
   const char* na = "---";
-  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_rpm); drawDataRow(112, "RPM", buf, cv); }
-  else drawDataRow(112, "RPM", na, cv);
-  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_adv); drawDataRow(152, "ADV", buf, cv); }
-  else drawDataRow(152, "ADV", na, cv);
-  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_map); drawDataRow(192, "MAP", buf, cv); }
-  else drawDataRow(192, "MAP", na, cv);
-  if (fresh && g_g123Valid) { snprintf(buf, sizeof(buf), "%.1fV", g_g123Volt); drawDataRow(238, "123V", buf, cv); }
-  else drawDataRow(238, "123V", na, cv);
-  if (fresh && g_g123Valid) { snprintf(buf, sizeof(buf), "%dC", (int)g_g123Temp); drawDataRow(278, "123T", buf, cv); }
-  else drawDataRow(278, "123T", na, cv);
-  if (fresh && g_battValid) { snprintf(buf, sizeof(buf), "%.1fV", g_battVolt); drawDataRow(318, "BATT", buf, cv); }
-  else drawDataRow(318, "BATT", na, cv);
-  const char* st = g_bleConn ? (fresh ? "LIVE" : "WARTE") :
-                   (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "KEIN HUB" : "KEIN 123");
-  drawTextCentered(240, 370, st, g_bleConn && fresh ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
+  uint16_t cv = fresh ? RGB565(235, 235, 225) : RGB565(110, 60, 60);
+  if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_rpm);
+  drawTextCentered(240, 148, fresh ? buf : na, cv, 5);
+  drawTextCentered(240, 188, "RPM", RGB565(160, 160, 160), 2);
+  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_adv); drawDataRow(248, "ADV", buf, cv); }
+  else drawDataRow(248, "ADV", na, cv);
+  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_map); drawDataRow(276, "MAP", buf, cv); }
+  else drawDataRow(276, "MAP", na, cv);
+  if (fresh && g_battValid) {
+    snprintf(buf, sizeof(buf), "%.1f V", g_battVolt);
+    drawDataRow(304, "BAT", buf, cv);
+  } else drawDataRow(304, "BAT", na, cv);
+  drawMotorStatusFooter(360, 400);
   presentFrame();
 }
 
@@ -1792,14 +2788,14 @@ static void drawLambdaPage() {
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(45, 150, 70));
   drawTextCentered(240, 58, "LAMBDA", RGB565(70, 200, 100), 5);
-  bool bleOk = bleFresh();
-  bool fresh = bleOk && g_lambdaValid;
+  const bool fresh = dataFresh() && g_lambdaValid;
+  const bool linked = fresh || hubLinkOk();
   char buf[16];
   {
     char mbuf[12];
-    if (bleOk) snprintf(mbuf, sizeof(mbuf), "MAP %d", (int)g_map);
+    if (linked) snprintf(mbuf, sizeof(mbuf), "MAP %d", (int)g_map);
     else strcpy(mbuf, "MAP ---");
-    drawTextCentered(240, 88, mbuf, bleOk ? RGB565(180, 180, 180) : RGB565(110, 60, 60), 2);
+    drawTextCentered(240, 88, mbuf, linked ? RGB565(180, 180, 180) : RGB565(110, 60, 60), 2);
   }
   if (fresh) snprintf(buf, sizeof(buf), "%.2f", g_lambda);
   else strcpy(buf, "----");
@@ -1814,9 +2810,8 @@ static void drawLambdaPage() {
     char sp[16]; snprintf(sp, sizeof(sp), "%d km/h", (int)g_speedKmh);
     drawTextCentered(240, 318, sp, RGB565(180, 180, 180), 3);
   }
-  const char* st = g_bleConn ? (bleFresh() ? "LIVE" : "WARTE") :
-                   (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "KEIN HUB" : "KEIN 123");
-  drawTextCentered(240, 370, st, g_bleConn && bleFresh() ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
+  const char* st = liveStatusText();
+  drawTextCentered(240, 370, st, dataFresh() ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
   presentFrame();
 }
 
@@ -1825,22 +2820,23 @@ static void drawHubPage() {
   g_clockFacePage = currentPage;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(150, 70, 180));
-  drawTextCentered(240, 54, "BLE", RGB565(205, 120, 230), 5);
-  drawTextCentered(240, 84, bleConnModeLabel(), RGB565(150, 150, 150), 2);
+  drawTextCentered(240, 54, "HUB", RGB565(205, 120, 230), 5);
+  drawTextCentered(240, 84, dataPathLabel(), RGB565(150, 150, 150), 2);
   char buf[24];
-  drawDataRow(112, "ZIEL",  bleTargetDisplay(), RGB565(235, 235, 225));
-  drawDataRow(148, "BLE",   g_bleConn ? "OK" : "SCAN",
-              g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  snprintf(buf, sizeof(buf), "%lu", (unsigned long)g_bleRxCnt);
-  drawDataRow(188, "RX",    buf, RGB565(235, 235, 225));
-  snprintf(buf, sizeof(buf), "%lu MS", g_bleLastRx ? (unsigned long)(millis() - g_bleLastRx) : 0UL);
-  drawDataRow(228, "AGE",   buf, RGB565(235, 235, 225));
+  drawDataRow(112, "HOST",  g_hubHost, RGB565(235, 235, 225));
+  drawDataRow(148, "LINK",  hubLinkOk() ? "OK" : "OFF",
+              hubLinkOk() ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(188, "SRC",   g_hubSourceTag, RGB565(235, 235, 225));
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)g_liveRxCnt);
+  drawDataRow(228, "RX",    buf, RGB565(235, 235, 225));
+  snprintf(buf, sizeof(buf), "%lu MS", g_liveLastRx ? (unsigned long)(millis() - g_liveLastRx) : 0UL);
+  drawDataRow(268, "AGE",   buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%.1f V", g_battVolt);
-  drawDataRow(268, "BATT",  g_battValid  ? buf : "---", RGB565(235, 235, 225));
-  snprintf(buf, sizeof(buf), "%.0f KMH", g_speedKmh);
-  drawDataRow(308, "SPEED", g_speedValid ? buf : "---", RGB565(235, 235, 225));
-  drawDataRow(348, "IP",    g_ipStr, RGB565(150, 200, 150));
-  drawTextCentered(240, 370, "TIP MENU", RGB565(180, 180, 170), 2);
+  drawDataRow(308, "BATT",  g_battValid  ? buf : "---", RGB565(235, 235, 225));
+  snprintf(buf, sizeof(buf), "%.1f V", g_auxBattVolt);
+  drawDataRow(348, "AUX",   g_auxBattValid ? buf : "---", RGB565(235, 235, 225));
+  drawDataRow(388, "IP",    g_ipStr, RGB565(150, 200, 150));
+  drawTextCentered(240, 410, liveStatusText(), dataFresh() ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
   presentFrame();
 }
 
@@ -1857,19 +2853,28 @@ static void drawSetupPage() {
   drawDataRow(146, "HELL",  buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d DEG", g_rotationDeg);
   drawDataRow(182, "ROT",   buf, RGB565(235, 235, 225));
-  if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
-    snprintf(buf, sizeof(buf), "%s", currentWifiSsid());
-    drawDataRow(218, "WIFI", buf,
-                WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  } else {
+  char wbuf[20];
+  if (g_wifiApOnly || (g_apOn && WiFi.status() != WL_CONNECTED)) {
+    drawDataRow(218, "WIFI", "AP Setup", RGB565(235, 180, 60));
+  } else if (!g_featureWifi) {
     drawDataRow(218, "WIFI", "AUS", RGB565(220, 130, 50));
+  } else if (WiFi.status() == WL_CONNECTED && strlen(currentWifiSsid()) > 0) {
+    if (isOnBusWifi()) {
+      drawDataRow(218, "WIFI", "BUS OK", RGB565(60, 210, 100));
+    } else {
+      snprintf(wbuf, sizeof(wbuf), "%.16s", currentWifiSsid());
+      drawDataRow(218, "WIFI", wbuf, RGB565(60, 210, 100));
+    }
+  } else {
+    drawDataRow(218, "WIFI", "Home...", RGB565(220, 130, 50));
   }
   drawDataRow(254, "BLE",    g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
               g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   drawDataRow(290, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
               g_featureBuzzer ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
-  drawDataRow(326, "QUELLE", bleConnModeLabel(),
-              g_bleConnMode == BLE_MODE_SPARTAN_HUB ? RGB565(80, 160, 240) : RGB565(235, 150, 60));
+  drawDataRow(326, "QUELLE", sourceModeLabel(),
+              g_dataPath == DATA_PATH_WIFI_HUB ? RGB565(80, 160, 240) :
+              (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? RGB565(120, 200, 120) : RGB565(235, 150, 60)));
   drawDataRow(362, "IMU NULL", g_imuTrimmed ? "SET" : "TAP",
               g_imuTrimmed ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   drawTextCentered(240, 396, "TIP MENU", RGB565(180, 180, 170), 2);
@@ -1921,9 +2926,11 @@ static void drawCurrentPage() {
   else if (currentPage == 4) drawHubPage();
   else if (currentPage == 5) drawSetupPage();
   else if (currentPage == 6) drawImuPage();
+  else { currentPage = 0; drawVdoClock(); }
 }
 
 static void requestPage(uint8_t page) {
+  if (page > PAGE_MAX) page = PAGE_MAX;
   currentPage = page;
   g_redrawPage = true;
 }
@@ -1955,6 +2962,7 @@ static void loadSettings() {
     pw.end();
   }
   g_bleTargetMac[sizeof(g_bleTargetMac) - 1] = 0;
+  g_ble123AddrType = p.getUChar("ble_addr_123", BLE_ADDR_RANDOM);
   String macHub = p.getString("ble_mac_hub", "");
   if (macHub.length() == 0) macHub = DEFAULT_HUB_MAC;
   // Alte Defaults hatten BM6-MAC als Hub — auf Spartan3-Hub umstellen
@@ -1971,6 +2979,22 @@ static void loadSettings() {
                  p.getBool("imu_trim", false));
   g_timezoneIdx = p.getUChar("tz_idx", TIMEZONE_DEFAULT);
   if (g_timezoneIdx >= TIMEZONE_COUNT) g_timezoneIdx = TIMEZONE_DEFAULT;
+  g_rpmRedline = p.getInt("rpm_red", RPM_REDLINE_DEFAULT);
+  g_motorStyle   = p.getUChar("motor_style", MOTOR_STYLE_VDO);
+  if (g_motorStyle > MOTOR_STYLE_MERCEDES) g_motorStyle = MOTOR_STYLE_VDO;
+  g_dataPath = p.getUChar("data_path", DATA_PATH_WIFI_HUB) == DATA_PATH_BLE ?
+               DATA_PATH_BLE : DATA_PATH_WIFI_HUB;
+  g_wifiApOnly = p.getBool("wifi_ap_only", false);
+  String hubHost = p.getString("hub_host", HUB_WIFI_DEFAULT_HOST);
+  hubHost.trim();
+  if (hubHost.length() == 0) hubHost = HUB_WIFI_DEFAULT_HOST;
+  strncpy(g_hubHost, hubHost.c_str(), sizeof(g_hubHost) - 1);
+  g_hubHost[sizeof(g_hubHost) - 1] = 0;
+  if (isBusWifiSsid(currentWifiSsid()) && strcmp(g_hubHost, HUB_BUS_HOST) != 0) {
+    strncpy(g_hubHost, HUB_BUS_HOST, sizeof(g_hubHost) - 1);
+    g_hubHost[sizeof(g_hubHost) - 1] = 0;
+    g_dataPath = DATA_PATH_WIFI_HUB;
+  }
   p.end();
   applyTimezone();
   if (g_dialScalePct  < DIAL_SCALE_MIN) g_dialScalePct  = DIAL_SCALE_MIN;
@@ -1981,6 +3005,8 @@ static void loadSettings() {
   if (g_dialCenterOffsetY >  20) g_dialCenterOffsetY =  20;
   if (g_brightnessPct < 5)   g_brightnessPct = 5;
   if (g_brightnessPct > 100) g_brightnessPct = 100;
+  if (g_rpmRedline < RPM_REDLINE_MIN) g_rpmRedline = RPM_REDLINE_MIN;
+  if (g_rpmRedline > RPM_REDLINE_MAX) g_rpmRedline = RPM_REDLINE_MAX;
   g_rotationDeg %= 360;
   if (g_rotationDeg < 0) g_rotationDeg += 360;
   updateRotationCache();
@@ -2020,6 +3046,55 @@ static void saveBrightness(int pct) {
   p.begin("clock", false);
   p.putInt("bright", pct);
   p.end();
+}
+
+static void saveRpmRedline(int rpm) {
+  if (rpm < RPM_REDLINE_MIN) rpm = RPM_REDLINE_MIN;
+  if (rpm > RPM_REDLINE_MAX) rpm = RPM_REDLINE_MAX;
+  rpm = (rpm / 100) * 100;
+  g_rpmRedline = rpm;
+  Preferences p;
+  p.begin("clock", false);
+  p.putInt("rpm_red", rpm);
+  p.end();
+}
+
+static void saveMotorStyle(uint8_t style) {
+  if (style > MOTOR_STYLE_MERCEDES) style = MOTOR_STYLE_VDO;
+  g_motorStyle = style;
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("motor_style", style);
+  p.end();
+}
+
+static void saveDataPath(DataPath path) {
+  if (path != DATA_PATH_BLE) path = DATA_PATH_WIFI_HUB;
+  if (path == g_dataPath) return;
+  g_dataPath = path;
+  clearLiveValues();
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("data_path", g_dataPath);
+  p.end();
+  DLOG("Hub: Datenweg -> %s\n", dataPathLabel());
+}
+
+static void saveHubHost(const char* host) {
+  if (!host) return;
+  String h = String(host);
+  h.trim();
+  if (h.length() == 0) h = HUB_WIFI_DEFAULT_HOST;
+  if (h.length() >= sizeof(g_hubHost)) h = h.substring(0, sizeof(g_hubHost) - 1);
+  if (h.equals(g_hubHost)) return;
+  strncpy(g_hubHost, h.c_str(), sizeof(g_hubHost) - 1);
+  g_hubHost[sizeof(g_hubHost) - 1] = 0;
+  g_hubWifiOk = false;
+  Preferences p;
+  p.begin("clock", false);
+  p.putString("hub_host", g_hubHost);
+  p.end();
+  DLOG("Hub: Host -> %s\n", g_hubHost);
 }
 
 static void updateRotationCache() {
@@ -2076,9 +3151,18 @@ static void saveFeatures(bool wifi, bool ble, bool buzzer) {
   p.end();
   if (!g_featureBuzzer) hal_buzzer(false);  // sofort aus wenn deaktiviert
   if (!g_featureWifi) {
+    g_wifiApOnly = false;
     WiFi.disconnect();
+    if (g_apOn) {
+      WiFi.softAPdisconnect(true);
+      g_apOn = false;
+    }
     strcpy(g_ipStr, "---");
     g_webStarted = false;
+    Preferences pw;
+    pw.begin("clock", false);
+    pw.putBool("wifi_ap_only", false);
+    pw.end();
     Serial.println("WiFi: AUS");
   } else if (WiFi.status() != WL_CONNECTED && strlen(currentWifiSsid()) > 0) {
     reconnectWifiProfile();
@@ -2225,16 +3309,20 @@ static void webAppendPageMockSvg(String& svg, uint8_t page) {
     const char* items[] = {"UHR", "MOTOR", "LAMBDA", "HUB", "IMU", "SETUP"};
     const char* cols[] = {"#c82823", "#2896d2", "#3cb95a", "#be5ad2", "#c86432", "#d2bc2d"};
     for (int i = 0; i < 6; i++) {
-      char row[128];
-      snprintf(row, sizeof(row),
-               "<rect x='44' y='%d' width='152' height='18' rx='3' fill='#121212' stroke='#333'/>"
-               "<rect x='44' y='%d' width='6' height='18' fill='%s'/>"
-               "<text x='58' y='%d' fill='#ddd' font-family='system-ui,sans-serif' font-size='9'>%s</text>",
-               78 + i * 22, 78 + i * 22, cols[i], 91 + i * 22, items[i]);
-      svg += row;
+      const int row = i / 2;
+      const int col = i % 2;
+      const int tx = 42 + col * 78;
+      const int ty = 72 + row * 34;
+      char rowBuf[160];
+      snprintf(rowBuf, sizeof(rowBuf),
+               "<rect x='%d' y='%d' width='72' height='26' rx='3' fill='#121212' stroke='#333'/>"
+               "<rect x='%d' y='%d' width='4' height='26' fill='%s'/>"
+               "<text x='%d' y='%d' fill='#ddd' font-family='system-ui,sans-serif' font-size='8'>%s</text>",
+               tx, ty, tx, ty, cols[i], tx + 10, ty + 17, items[i]);
+      svg += rowBuf;
     }
   } else if (page == 2) {
-    const bool fresh = bleFresh();
+    const bool fresh = dataFresh();
     char line[32];
     svg += F("<text x='52' y='108' fill='#888' font-size='9' font-family='system-ui,sans-serif'>RPM</text>"
              "<text x='188' y='108' text-anchor='end' fill='#eee' font-size='10' class='pv-rpm' font-family='system-ui,sans-serif'>");
@@ -2254,7 +3342,7 @@ static void webAppendPageMockSvg(String& svg, uint8_t page) {
     else strcpy(line, "---");
     svg += line;
     svg += F("</text><text x='120' y='192' text-anchor='middle' fill='#888' font-size='9' class='pv-motor-st' font-family='system-ui,sans-serif'>");
-    svg += fresh ? (g_bleConn ? F("LIVE") : F("WARTE")) : F("---");
+    svg += fresh ? F("LIVE") : F("---");
     svg += F("</text>");
   } else if (page == 3) {
     char line[24];
@@ -2264,12 +3352,14 @@ static void webAppendPageMockSvg(String& svg, uint8_t page) {
     svg += line;
     svg += F("</text>");
   } else if (page == 4) {
-    svg += F("<text x='120' y='118' text-anchor='middle' fill='#");
-    svg += g_bleConn ? F("54d273") : F("e7a944");
+    svg += F("<text x='120' y='108' text-anchor='middle' fill='#");
+    svg += hubLinkOk() ? F("54d273") : F("e7a944");
     svg += F("' font-size='14' font-family='system-ui,sans-serif' class='pv-hub-st'>");
-    svg += g_bleConn ? F("HUB OK") : F("KEIN HUB");
-    svg += F("</text><text x='120' y='142' text-anchor='middle' fill='#aaa' font-size='10' font-family='system-ui,sans-serif'>RX <tspan class='pv-rx'>");
-    svg += String((unsigned long)g_bleRxCnt);
+    svg += hubLinkOk() ? F("HUB OK") : F("KEIN HUB");
+    svg += F("</text><text x='120' y='128' text-anchor='middle' fill='#aaa' font-size='9' font-family='system-ui,sans-serif'>");
+    svg += dataPathLabel();
+    svg += F("</text><text x='120' y='148' text-anchor='middle' fill='#aaa' font-size='10' font-family='system-ui,sans-serif'>RX <tspan class='pv-rx'>");
+    svg += String((unsigned long)g_liveRxCnt);
     svg += F("</tspan></text>");
   } else if (page == 5) {
     svg += F("<text x='72' y='118' fill='#888' font-size='9' font-family='system-ui,sans-serif'>WLAN</text>"
@@ -2383,10 +3473,13 @@ static void handleWebRoot() {
   html += "<div class='metric'><span>ADV</span><b id='dashAdv'>" + String(g_adv, 1) + "&deg;</b></div>";
   html += "<div class='metric'><span>Lambda</span><b id='dashLambda'>" + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) + "</b></div>";
   html += "<div class='metric'><span>Volt</span><b id='dashVolt'>" + String(g_battValid ? String(g_battVolt, 1) : String("---")) + "</b></div>";
-  html += F("</div></div><div class='card row'><div><b>BLE Hub</b><br><span id='dashBle' class='");
-  html += g_bleConn ? "ok" : "warn";
-  html += "'>" + String(g_featureBle ? (g_bleConn ? "verbunden" : "scan/wartet") : "aus") + "</span></div>";
-  html += "<div class='pill'>RX <span id='dashRx'>" + String((unsigned long)g_bleRxCnt) + "</span></div></div></section>";
+  html += F("</div></div><div class='card row'><div><b>Hub Link</b><br><span id='dashBle' class='");
+  html += hubLinkOk() ? "ok" : "warn";
+  html += "'>" + String(g_dataPath == DATA_PATH_WIFI_HUB ?
+       (g_hubWifiOk ? "WiFi OK" : "WiFi wartet") :
+       (g_featureBle ? (g_bleConn ? "BLE OK" : "BLE scan") : "aus")) + "</span></div>";
+  html += "<div class='pill'>" + String(dataPathLabel()) + " RX <span id='dashRx'>" +
+          String((unsigned long)g_liveRxCnt) + "</span></div></div></section>";
 
   html += F("<section class='page' id='p1'><div class='card'><h2>WLAN</h2><div>Aktiv: <b>");
   html += String(currentWifiSsid());
@@ -2398,7 +3491,18 @@ static void handleWebRoot() {
     if (i == g_wifiProfile) html += F(" style='background:#54d273'");
     html += ">" + String(WIFI_PROFILES[i].ssid) + "</button></a>";
   }
-  html += F("</div><button onclick='scanWifi()'>&#128269; Scan</button><table><thead><tr><th>SSID</th><th>RSSI</th><th>Status</th></tr></thead><tbody id='scanRows'><tr><td colspan='3'>Noch kein Scan</td></tr></tbody></table></div></section>");
+  html += F("</div><button onclick='scanWifi()'>&#128269; Scan</button><table><thead><tr><th>SSID</th><th>RSSI</th><th>Status</th><th></th></tr></thead><tbody id='scanRows'><tr><td colspan='4'>Noch kein Scan</td></tr></tbody></table><p class='sub'>Scan-Zeile antippen oder Profil oben w&auml;hlen. Spartan3-Setup = Hub-AP @ 192.168.4.1</p></div>"
+            "<div class='card'><h3>Bus (unterwegs)</h3><p class='sub'>Ein Tipp: Spartan3-Setup + Hub @ 192.168.4.1 + WiFi-Daten (kein BLE).</p><div class='row'><a href='/wifi?mode=bus'><button");
+  if (isOnBusWifi() && g_dataPath == DATA_PATH_WIFI_HUB && !g_featureBle) html += F(" style='background:#54d273'");
+  html += F(">BUS / Spartan3-Setup</button></a></div></div>"
+            "<div class='card'><h3>Netzwerk-Modus</h3><p class='sub'>Home = Heimrouter/LAN &middot; AP = VDO-Clock-Setup / vdoclock @ 192.168.4.1 &middot; Hub = Spartan3-Setup / lambda123 @ 192.168.4.1</p><div class='row'>");
+  html += F("<a href='/wifi?mode=home'><button");
+  if (g_featureWifi && !g_wifiApOnly) html += F(" style='background:#54d273'");
+  html += F(">Home WiFi</button></a><a href='/wifi?mode=ap'><button");
+  if (g_wifiApOnly) html += F(" style='background:#54d273'");
+  html += F(">AP Setup</button></a><a href='/wifi?mode=off'><button");
+  if (!g_featureWifi && !g_wifiApOnly) html += F(" style='background:#54d273'");
+  html += F(">Aus</button></a></div></div></section>");
 
   html += F("<section class='page' id='p2'><div class='card'><h2>Display</h2><div id='displayPreviewHost'>");
   html += webDisplayPreviewShell(&now);
@@ -2414,7 +3518,22 @@ static void handleWebRoot() {
   html += String(g_dialCenterOffsetX);
   html += F(" &middot; Y ");
   html += String(g_dialCenterOffsetY);
-  html += F("</b></div><div class='row'><span><a href='/set?dial_x_delta=-1'><button>X -1</button></a><a href='/set?dial_x_delta=1'><button>X +1</button></a></span></div><div class='row'><span><a href='/set?dial_y_delta=-1'><button>Y -1</button></a><a href='/set?dial_y_delta=1'><button>Y +1</button></a><a href='/set?dial_reset=1'><button>Zentrum</button></a></span></div></div></section>");
+  html += F("</b></div><div class='row'><span><a href='/set?dial_x_delta=-1'><button>X -1</button></a><a href='/set?dial_x_delta=1'><button>X +1</button></a></span></div><div class='row'><span><a href='/set?dial_y_delta=-1'><button>Y -1</button></a><a href='/set?dial_y_delta=1'><button>Y +1</button></a><a href='/set?dial_reset=1'><button>Zentrum</button></a></span></div></div>"
+            "<div class='card'><h3>Rotbereich (RPM)</h3><p class='sub'>Roter Bereich ab Redline (VDO 4–80 oder Mercedes 0–70, &times;100 RPM).</p>"
+            "<form action='/set' method='get'><div class='row'><label>Redline "
+            "<input type='number' name='rpm_redline' min='2000' max='5500' step='100' value='");
+  html += String(g_rpmRedline);
+  html += F("'></label><button type='submit'>Uebernehmen</button></div></form></div>"
+            "<div class='card'><h3>Motor-Anzeige</h3><p class='sub'>Daten-Seite MOTOR (RPM/ADV/MAP). Stil w&auml;hlbar: VDO-Tacho oder Mercedes mit Uhr.</p>"
+            "<form action='/set' method='get'><select name='motor_style'>"
+            "<option value='0'");
+  if (g_motorStyle == MOTOR_STYLE_VDO) html += F(" selected");
+  html += F(">VDO (Uhr Mitte)</option><option value='1'");
+  if (g_motorStyle == MOTOR_STYLE_MERCEDES) html += F(" selected");
+  html += F(">Mercedes (Uhr unten)</option></select><button type='submit'>Uebernehmen</button></form>"
+            "<p class='sub'>Aktiv: <b>");
+  html += motorStyleLabel();
+  html += F("</b></p></div></section>");
 
   html += F("<section class='page' id='p3'><div class='card'><h2>Live</h2><pre id='liveBox'>Lade /api/status ...</pre></div></section>");
 
@@ -2425,7 +3544,21 @@ static void handleWebRoot() {
   html += g_featureBle ? F("checked") : F("");
   html += F("> BLE Daten aktiv</label></p><p><label><input type='checkbox' name='buzzer' value='1' ");
   html += g_featureBuzzer ? F("checked") : F("");
-  html += F("> Buzzer aktiv</label></p><button type='submit'>Speichern</button></form></div>"
+  html += F("> Buzzer aktiv</label></p><p>Hub IP: <input name='hub_host' value='");
+  html += String(g_hubHost);
+  html += F("' style='width:100%;max-width:220px;padding:8px;background:#0d0d0d;border:1px solid #333;border-radius:8px;color:#eee'></p>"
+            "<p>Datenweg Hub: <select name='data_path'><option value='wifi'");
+  if (g_dataPath == DATA_PATH_WIFI_HUB) html += F(" selected");
+  html += F(">WiFi HTTP (empfohlen)</option><option value='ble'");
+  if (g_dataPath == DATA_PATH_BLE) html += F(" selected");
+  html += F(">BLE (Fallback)</option></select></p><p>Datenquelle (Kurz): "
+            "<a href='/source?m=hub_wifi'><button");
+  if (g_dataPath == DATA_PATH_WIFI_HUB) html += F(" style='background:#54d273'");
+  html += F(">HUB WiFi</button></a><a href='/source?m=hub_ble'><button");
+  if (g_dataPath == DATA_PATH_BLE && g_bleConnMode == BLE_MODE_SPARTAN_HUB) html += F(" style='background:#54d273'");
+  html += F(">HUB BLE</button></a><a href='/source?m=123'><button");
+  if (g_dataPath == DATA_PATH_BLE && g_bleConnMode == BLE_MODE_DIRECT_123) html += F(" style='background:#54d273'");
+  html += F(">123 direkt</button></a></p><button type='submit'>Speichern</button></form></div>"
             "<div class='card'><h2>Zeitzone</h2><p class='sub'>Uhrzeit per NTP (WLAN). Aktuell: <b id='tzLabel'>");
   html += String(timezoneLabel(g_timezoneIdx));
   html += F("</b> &middot; ");
@@ -2487,12 +3620,12 @@ static void handleWebRoot() {
             "const sv=document.getElementById('scaleVal');if(sv)sv.textContent=String(d.scale||100);"
             "document.querySelectorAll('.preview-content').forEach(el=>{el.style.setProperty('--scale',d.scale||100);});}"
             "function syncPreviewValues(d){applyPreviewMeta(d);espH=d.hour||0;espM=d.min||0;espS=d.sec||0;espSync=Date.now();"
-            "if(d.page===0){updateHands();return;}if(d.page===2){const ok=d.ble_connected&&d.ble_enabled;"
+            "if(d.page===0){updateHands();return;}if(d.page===2){const ok=d.data_fresh;"
             "pvSet('.pv-rpm',ok?String(Math.round(d.rpm||0)):'0');pvSet('.pv-adv',ok?String(Math.round(d.adv||0)):'0');"
             "pvSet('.pv-map',ok?String(Math.round(d.map||0)):'0');pvSet('.pv-batt',d.volt_valid?num(d.volt).toFixed(1)+'V':'---');"
-            "pvSet('.pv-motor-st',ok?(d.ble_connected?'LIVE':'WARTE'):'---');}"
+            "pvSet('.pv-motor-st',ok?'LIVE':((d.hub_wifi_ok||d.ble_connected)?'WARTE':'---'));}"
             "if(d.page===3)pvSet('.pv-lambda',d.lambda_valid?num(d.lambda).toFixed(2):'----');"
-            "if(d.page===4){pvSet('.pv-hub-st',d.ble_connected?'HUB OK':'KEIN HUB');pvSet('.pv-rx',String(d.ble_rx||0));}"
+            "if(d.page===4){pvSet('.pv-hub-st',(d.hub_wifi_ok||d.ble_connected)?'HUB OK':'KEIN HUB');pvSet('.pv-rx',String(d.live_rx||0));}"
             "if(d.page===6&&d.imu_present){pvSet('.pv-imu-p','P '+num(d.imu_pitch).toFixed(1));pvSet('.pv-imu-r','R '+num(d.imu_roll).toFixed(1));}}"
             "function syncPreviewContent(html){const m=html.match(/<div class='preview-content'[\\s\\S]*?<\\/div>/);if(!m)return;"
             "const inner=m[0].replace(/--rot:[^;'\"]+;?/g,'');"
@@ -2503,14 +3636,17 @@ static void handleWebRoot() {
             "set('dashRpm',Math.round(num(d.rpm)));set('dashAdv',num(d.adv).toFixed(1)+'°');"
             "set('dashLambda',d.lambda_valid?num(d.lambda).toFixed(2):'---');set('dashVolt',d.volt_valid?num(d.volt).toFixed(1):'---');"
             "const ht=document.getElementById('headerTime');if(ht&&d.hour!=null)ht.textContent=String(d.hour).padStart(2,'0')+':'+String(d.min).padStart(2,'0')+':'+String(d.sec).padStart(2,'0');"
-            "set('dashPage',String(d.page));set('dashPageLabel',pageNames[d.page]||'?');set('dashRx',String(d.ble_rx||0));"
-            "const ble=document.getElementById('dashBle');if(ble){ble.textContent=d.ble_enabled?(d.ble_connected?'verbunden':'scan/wartet'):'aus';"
-            "ble.className=d.ble_enabled&&d.ble_connected?'ok':'warn';}"
+            "set('dashPage',String(d.page));set('dashPageLabel',pageNames[d.page]||'?');set('dashRx',String(d.live_rx||0));"
+            "const ble=document.getElementById('dashBle');if(ble){"
+            "const ok=(d.data_path==='wifi'?d.hub_wifi_ok:(d.ble_enabled&&d.ble_connected));"
+            "ble.textContent=d.data_path==='wifi'?(d.hub_wifi_ok?'WiFi OK':'WiFi wartet'):(d.ble_enabled?(d.ble_connected?'BLE OK':'BLE scan'):'aus');"
+            "ble.className=ok?'ok':'warn';}"
             "syncBleSetup(d);"
             "if(d.page!==lastPreviewPage){lastPreviewPage=d.page;refreshPreview().then(()=>syncPreviewValues(d));}"
             "else syncPreviewValues(d);}"
             "async function fetchWithTimeout(url,ms,opts){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);try{return await fetch(url,{...(opts||{}),signal:c.signal});}finally{clearTimeout(t);}}"
-            "async function scanWifi(){const rows=document.getElementById('scanRows');rows.innerHTML='<tr><td colspan=3>Scan laeuft...</td></tr>';try{const r=await fetchWithTimeout('/scan',12000);const d=await r.json();rows.innerHTML=d.networks.map(n=>`<tr><td>${n.ssid}</td><td>${n.rssi}</td><td>${n.connected?'verbunden':''}</td></tr>`).join('')||'<tr><td colspan=3>Keine Netze</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=3>Scan fehlgeschlagen</td></tr>';}}"
+            "function wifiScanRow(n){if(!n.ssid)return'';const href='/wifi?ssid='+encodeURIComponent(n.ssid);return`<tr class='wifi-scan-row' onclick=\"location.href='${href}'\" style='cursor:pointer'><td>${n.ssid}</td><td>${n.rssi}</td><td>${n.connected?'verbunden':''}</td><td><button type='button' onclick=\"event.stopPropagation();location.href='${href}'\">Verbinden</button></td></tr>`;}"
+            "async function scanWifi(){const rows=document.getElementById('scanRows');rows.innerHTML='<tr><td colspan=4>Scan laeuft...</td></tr>';try{const r=await fetchWithTimeout('/scan',12000);const d=await r.json();rows.innerHTML=(Array.isArray(d.networks)?d.networks.map(wifiScanRow).join(''):'')||'<tr><td colspan=4>Keine Netze</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=4>Scan fehlgeschlagen</td></tr>';}}"
             "function renderBleScanRows(d){const rows=document.getElementById('bleScanRows');const typ=n=>[n.spartan?'Hub':'',n.nus?'NUS':''].filter(Boolean).join(',')||'–';const list=Array.isArray(d.devices)?d.devices:[];const hdr=list.length?`<tr><td colspan=5 class=sub>${list.length} Geraet(e) gefunden</td></tr>`:'';rows.innerHTML=hdr+list.map(n=>`<tr><td>${n.name||'---'}</td><td>${n.mac}</td><td>${n.rssi}</td><td>${typ(n)}</td><td><a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=hub'><button>Hub</button></a> <a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=direct'><button>123</button></a></td></tr>`).join('')||'<tr><td colspan=5>Keine Geraete</td></tr>';}"
             "async function scanBle(){const rows=document.getElementById('bleScanRows');rows.innerHTML='<tr><td colspan=5>Scan startet...</td></tr>';try{const r=await fetchWithTimeout('/ble/scan',15000,{method:'POST'});if(!r.ok){rows.innerHTML='<tr><td colspan=5>Scan fehlgeschlagen (HTTP '+r.status+')</td></tr>';return;}const d=await r.json();if(d.error==='ble_off'){rows.innerHTML='<tr><td colspan=5>BLE aus – Setup: BLE aktivieren</td></tr>';return;}if(!d.started){rows.innerHTML='<tr><td colspan=5>BLE-Scan konnte nicht gestartet werden</td></tr>';return;}rows.innerHTML='<tr><td colspan=5>Scan laeuft (3s)...</td></tr>';const deadline=Date.now()+15000;while(Date.now()<deadline){await new Promise(res=>setTimeout(res,400));const pr=await fetchWithTimeout('/ble/scan/result',12000);if(!pr.ok)continue;const pd=await pr.json();if(pd.error==='ble_off'){rows.innerHTML='<tr><td colspan=5>BLE aus – Setup: BLE aktivieren</td></tr>';return;}if(pd.scanning)continue;renderBleScanRows(pd);return;}rows.innerHTML='<tr><td colspan=5>Timeout – Scan nicht fertig</td></tr>';}catch(e){const msg=(e&&e.name==='AbortError')?'Timeout – ESP antwortet nicht':'Scan fehlgeschlagen';rows.innerHTML='<tr><td colspan=5>'+msg+'</td></tr>';}}"
             "function syncBleSetup(d){const m=document.getElementById('bleModeLabel');if(m)m.textContent=d.ble_mode_label||'?';const m2=document.getElementById('bleModeLabel2');if(m2)m2.textContent=d.ble_mode_label||'?';const mac=document.getElementById('bleMacLabel');if(mac)mac.textContent=d.ble_target_mac||'---';const hub=document.getElementById('bleHubMacLabel');if(hub)hub.textContent=d.ble_mac_hub||'---';const dir=document.getElementById('bleDirectMacLabel');if(dir)dir.textContent=d.ble_mac_123||'---';const tz=document.getElementById('tzLabel');if(tz&&d.tz_label)tz.textContent=d.tz_label;}"
@@ -2726,7 +3862,7 @@ static void handleWebStatus() {
   struct tm now = {};
   readClockTime(&now);
   String json;
-  json.reserve(640);
+  json.reserve(768);
   json += F("{\"time\":");
   json += String((unsigned long)time(nullptr));
   json += F(",\"hour\":");
@@ -2755,8 +3891,40 @@ static void handleWebStatus() {
   jsonAppendFloat(json, g_battVolt, 2);
   json += F(",\"volt_valid\":");
   json += g_battValid ? F("true") : F("false");
+  json += F(",\"aux_volt\":");
+  jsonAppendFloat(json, g_auxBattVolt, 2);
+  json += F(",\"aux_volt_valid\":");
+  json += g_auxBattValid ? F("true") : F("false");
   json += F(",\"ble_enabled\":");
   json += g_featureBle ? F("true") : F("false");
+  json += F(",\"data_path\":\"");
+  json += g_dataPath == DATA_PATH_WIFI_HUB ? F("wifi") : F("ble");
+  json += F("\",\"data_path_label\":\"");
+  json += jsonEscape(String(dataPathLabel()));
+  json += F("\",\"source_mode\":\"");
+  if (g_dataPath == DATA_PATH_WIFI_HUB) json += F("hub_wifi");
+  else if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) json += F("hub_ble");
+  else json += F("direct_123");
+  json += F("\",\"source_mode_label\":\"");
+  json += jsonEscape(String(sourceModeLabel()));
+  json += F("\",\"wifi_network\":\"");
+  if (g_wifiApOnly) json += F("ap");
+  else if (g_featureWifi) json += F("home");
+  else json += F("off");
+  json += F("\",\"wifi_ap_on\":");
+  json += g_apOn ? F("true") : F("false");
+  json += F(",\"hub_host\":\"");
+  json += jsonEscape(String(g_hubHost));
+  json += F("\",\"hub_wifi_ok\":");
+  json += hubLinkOk() ? F("true") : F("false");
+  json += F(",\"hub_state\":\"");
+  json += jsonEscape(String(g_hubState));
+  json += F("\",\"hub_source\":\"");
+  json += jsonEscape(String(g_hubSourceTag));
+  json += F("\",\"data_fresh\":");
+  json += dataFresh() ? F("true") : F("false");
+  json += F(",\"live_rx\":");
+  json += String((unsigned long)g_liveRxCnt);
   json += F(",\"ble_connected\":");
   json += g_bleConn ? F("true") : F("false");
   json += F(",\"ble_rx\":");
@@ -2773,6 +3941,10 @@ static void handleWebStatus() {
   json += jsonEscape(String(g_bleHubMac));
   json += F("\",\"ble_target_name\":\"");
   json += jsonEscape(g_bleHubName);
+  json += F("\",\"ble_state\":\"");
+  json += jsonEscape(String(g_bleState));
+  json += F("\",\"ble_log\":\"");
+  json += jsonEscape(String(g_bleLogLine));
   json += F("\",\"page\":");
   json += String(currentPage);
   json += F(",\"page_label\":\"");
@@ -2785,6 +3957,12 @@ static void handleWebStatus() {
   json += String(g_dialCenterOffsetX);
   json += F(",\"dial_off_y\":");
   json += String(g_dialCenterOffsetY);
+  json += F(",\"rpm_redline\":");
+  json += String(g_rpmRedline);
+  json += F(",\"motor_style\":\"");
+  json += motorStyleLabel();
+  json += F("\",\"motor_style_idx\":");
+  json += String((unsigned)g_motorStyle);
   json += F(",\"imu_present\":");
   json += g_imuPresent ? F("true") : F("false");
   json += F(",\"imu_pitch\":");
@@ -2866,6 +4044,16 @@ static void handleWebSet() {
     g_redrawPage = true;
     DLOG("Web: Zifferblatt-Offset reset X=%d Y=%d\n", g_dialCenterOffsetX, g_dialCenterOffsetY);
   }
+  if (webServer.hasArg("rpm_redline")) {
+    saveRpmRedline(webServer.arg("rpm_redline").toInt());
+    g_redrawPage = true;
+    DLOG("Web: RPM Redline = %d\n", g_rpmRedline);
+  }
+  if (webServer.hasArg("motor_style")) {
+    saveMotorStyle((uint8_t)webServer.arg("motor_style").toInt());
+    g_redrawPage = true;
+    DLOG("Web: Motor style = %s\n", motorStyleLabel());
+  }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -2875,9 +4063,14 @@ static void handleWebFeatures() {
   const bool ble    = webServer.hasArg("ble");
   const bool buzzer = webServer.hasArg("buzzer");
   saveFeatures(wifi, ble, buzzer);
-  DLOG("Web: Funktionen wifi=%s ble=%s buzzer=%s\n",
+  if (webServer.hasArg("hub_host")) saveHubHost(webServer.arg("hub_host").c_str());
+  if (webServer.hasArg("data_path")) {
+    const String m = webServer.arg("data_path");
+    saveDataPath(m == "ble" ? DATA_PATH_BLE : DATA_PATH_WIFI_HUB);
+  }
+  DLOG("Web: Funktionen wifi=%s ble=%s buzzer=%s hub=%s path=%s\n",
                 g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off",
-                g_featureBuzzer ? "on" : "off");
+                g_featureBuzzer ? "on" : "off", g_hubHost, dataPathLabel());
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -2905,7 +4098,7 @@ static void handleWebPage() {
   if (webServer.hasArg("p")) {
     int page = webServer.arg("p").toInt();
     if (page < 0) page = 0;
-    if (page > 6) page = 6;
+    if (page > PAGE_MAX) page = PAGE_MAX;
     currentPage  = static_cast<uint8_t>(page);
     g_redrawPage = true;
     DLOG("Web: page=%u\n", currentPage);
@@ -2917,14 +4110,58 @@ static void handleWebPage() {
 static void reconnectWifiProfile();    // fwd
 static void saveWifiProfile(uint8_t);  // fwd
 
-// WLAN-Profil per Web umschalten: /wifi?prof=N
+// WLAN-Profil per Web umschalten: /wifi?prof=N  oder Modus /wifi?mode=home|ap|off
 static void handleWebWifi() {
+  if (webServer.hasArg("mode")) {
+    const String m = webServer.arg("mode");
+    if (m == "bus") {
+      applyBusProfile(true);
+      DLOG("Web: WiFi -> BUS (Spartan3-Setup)\n");
+    } else if (m == "ap") {
+      enterApOnlyMode();
+      DLOG("Web: WiFi -> AP Setup\n");
+    } else if (m == "off") {
+      stopApOnlyMode();
+      saveFeatures(false, g_featureBle, g_featureBuzzer);
+      DLOG("Web: WiFi -> AUS\n");
+    } else {
+      stopApOnlyMode();
+      saveFeatures(true, g_featureBle, g_featureBuzzer);
+      reconnectWifiProfile();
+      DLOG("Web: WiFi -> Home (%s)\n", currentWifiSsid());
+    }
+  }
   if (webServer.hasArg("prof")) {
     int idx = webServer.arg("prof").toInt();
     if (idx < 0) idx = 0;
     saveWifiProfile((uint8_t)idx);
+    stopApOnlyMode();
+    saveFeatures(true, g_featureBle, g_featureBuzzer);
     reconnectWifiProfile();
     DLOG("Web: WLAN-Profil -> %d (%s)\n", idx, currentWifiSsid());
+  }
+  if (webServer.hasArg("ssid")) {
+    const String ssid = webServer.arg("ssid");
+    const uint8_t count = wifiProfileCount();
+    for (uint8_t i = 0; i < count; i++) {
+      if (ssid == WIFI_PROFILES[i].ssid) {
+        saveWifiProfile(i);
+        stopApOnlyMode();
+        saveFeatures(true, g_featureBle, g_featureBuzzer);
+        reconnectWifiProfile();
+        DLOG("Web: WLAN via Scan -> %u (%s)\n", i, currentWifiSsid());
+        break;
+      }
+    }
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+static void handleWebSource() {
+  if (webServer.hasArg("m")) {
+    applySourceMode(webServer.arg("m").c_str());
+    DLOG("Web: Source -> %s\n", sourceModeLabel());
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -2937,6 +4174,7 @@ static void startWebServer() {
   webServer.on("/tz",      handleWebTimezone);
   webServer.on("/page",    handleWebPage);
   webServer.on("/wifi",    handleWebWifi);
+  webServer.on("/source",  handleWebSource);
   webServer.on("/scan",    HTTP_GET, handleWebScan);
   webServer.on("/ble/scan", HTTP_POST, handleWebBleScanStart);
   webServer.on("/ble/scan", HTTP_GET, handleWebBleScanStart);
@@ -2978,9 +4216,95 @@ static void startWebServer() {
 
 // Fallback-Setup-AP: nur AN wenn keine STA-Verbindung besteht, damit das
 // Display im verbundenen Normalbetrieb stabil bleibt (kein AP-Dauerbeacon).
-static bool     g_apOn = false;
+static void saveWifiApOnly(bool on) {
+  if (on == g_wifiApOnly) return;
+  g_wifiApOnly = on;
+  Preferences p;
+  p.begin("clock", false);
+  p.putBool("wifi_ap_only", g_wifiApOnly);
+  p.end();
+}
+
+static void enterApOnlyMode() {
+  g_featureWifi = true;
+  saveWifiApOnly(true);
+  WiFi.disconnect(true);
+  delay(50);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("VDO-Clock-Setup", "vdoclock");
+  g_apOn = true;
+  snprintf(g_ipStr, sizeof(g_ipStr), "%s", WiFi.softAPIP().toString().c_str());
+  if (!g_webStarted) { startWebServer(); g_webStarted = true; }
+  Serial.printf("WiFi: AP-only -> http://%s (VDO-Clock-Setup / vdoclock)\n", g_ipStr);
+}
+
+static void stopApOnlyMode() {
+  if (!g_wifiApOnly && !g_apOn) return;
+  saveWifiApOnly(false);
+  if (g_apOn) {
+    WiFi.softAPdisconnect(true);
+    g_apOn = false;
+  }
+}
+
+static void cycleWifiNetworkMode() {
+  if (!g_featureWifi && !g_wifiApOnly) {
+    saveWifiApOnly(false);
+    saveFeatures(true, g_featureBle, g_featureBuzzer);
+    reconnectWifiProfile();
+    return;
+  }
+  if (g_wifiApOnly) {
+    stopApOnlyMode();
+    saveFeatures(false, g_featureBle, g_featureBuzzer);
+    g_redrawPage = true;
+    return;
+  }
+  const uint8_t count = wifiProfileCount();
+  if (count > 1 && g_wifiProfile + 1 < count) {
+    saveWifiProfile((uint8_t)(g_wifiProfile + 1));
+    reconnectWifiProfile();
+  } else {
+    enterApOnlyMode();
+  }
+  g_redrawPage = true;
+}
+
+static void applySourceMode(const char* mode) {
+  if (!mode) return;
+  const String m = String(mode);
+  if (m == "hub_wifi" || m == "wifi") {
+    saveDataPath(DATA_PATH_WIFI_HUB);
+  } else if (m == "hub_ble" || m == "hub") {
+    saveDataPath(DATA_PATH_BLE);
+    if (!g_featureBle) saveFeatures(g_featureWifi, true, g_featureBuzzer);
+    if (g_bleConnMode != BLE_MODE_SPARTAN_HUB) {
+      saveBleConnMode(BLE_MODE_SPARTAN_HUB);
+      disconnectBleForModeChange();
+    }
+  } else if (m == "123" || m == "direct") {
+    saveDataPath(DATA_PATH_BLE);
+    if (!g_featureBle) saveFeatures(g_featureWifi, true, g_featureBuzzer);
+    if (g_bleConnMode != BLE_MODE_DIRECT_123) {
+      saveBleConnMode(BLE_MODE_DIRECT_123);
+      disconnectBleForModeChange();
+    }
+  }
+  g_redrawPage = true;
+}
+
 static void manageWifiAp() {
-  if (!g_featureWifi) return;
+  if (g_wifiApOnly) {
+    if (!g_apOn) enterApOnlyMode();
+    return;
+  }
+  if (!g_featureWifi) {
+    if (g_apOn) {
+      WiFi.softAPdisconnect(true);
+      g_apOn = false;
+    }
+    return;
+  }
   const bool conn = (WiFi.status() == WL_CONNECTED);
   if (conn && g_apOn) {
     WiFi.softAPdisconnect(true);
@@ -3025,9 +4349,9 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     g_redrawPage = true;
     DLOG("[ROT] setup tap -> %d deg\n", g_rotationDeg);
   } else if (y >= 200 && y < 236) {
-    cycleWifiProfile();
-    g_redrawPage = true;
-    DLOG("setup tap: wifi profile=%u ssid=%s\n", g_wifiProfile, currentWifiSsid());
+    if (!isOnBusWifi()) applyBusProfile(true);
+    else cycleWifiNetworkMode();
+    DLOG("setup tap: wifi network\n");
   } else if (y >= 236 && y < 272) {
     saveFeatures(g_featureWifi, !g_featureBle, g_featureBuzzer);
     g_redrawPage = true;
@@ -3037,9 +4361,8 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     g_redrawPage = true;
     DLOG("setup tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
   } else if (y >= 308 && y < 344) {
-    cycleBleConnMode();
-    g_redrawPage = true;
-    DLOG("setup tap: ble_source=%s\n", bleConnModeLabel());
+    cycleSourceMode();
+    DLOG("setup tap: source=%s\n", sourceModeLabel());
   } else if (y >= 344 && y < 380) {
     if (calibrateImuZero()) g_redrawPage = true;
     DLOGN("setup tap: imu_null");
@@ -3048,6 +4371,98 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     DLOGN("setup tap: no action");
   }
 }
+
+#if FEATURE_TOUCH
+static void pageNext() {
+  if      (currentPage == 4) requestPage(6);
+  else if (currentPage == 6) requestPage(0);
+  else if (currentPage == 0) requestPage(1);
+  else requestPage(currentPage + 1);
+}
+
+static void pagePrev() {
+  if      (currentPage == 0) requestPage(6);
+  else if (currentPage == 6) requestPage(4);
+  else if (currentPage == 1) requestPage(0);
+  else requestPage(currentPage - 1);
+}
+
+static void handleTouchTap(uint16_t tapX, uint16_t tapY) {
+  if (tapX < EDGE_TAP_W) {
+    pagePrev();
+    return;
+  }
+  if (tapX >= 480 - EDGE_TAP_W) {
+    pageNext();
+    return;
+  }
+  if (currentPage == 0) {
+    requestPage(1);
+  } else if (currentPage == 1) {
+    const int idx = menuIndexFromTap(tapX, tapY);
+    if (idx >= 0) requestPage(MENU_ENTRIES[idx].page);
+    else requestPage(0);
+  } else if (currentPage == 5) {
+    handleSetupLongPress(tapY, 0);
+  } else {
+    pageNext();
+  }
+}
+
+static void processTouchInput(bool *touchBusyOut) {
+  static uint32_t lastTouch = 0;
+  static bool     touchActive = false;
+  static bool     touchLongHandled = false;
+  static uint32_t touchStartMs = 0;
+  static uint32_t touchLastSeenMs = 0;
+  static uint16_t touchStartX = 0, touchStartY = 0;
+  static uint16_t touchLastX = 0, touchLastY = 0;
+  static bool     touchHadPos = false;
+
+  uint16_t x = 0, y = 0;
+  const uint32_t nowMs = millis();
+  const bool touchFrame = readTouch(&x, &y);
+  const bool touchHeld = touchActive && (nowMs - touchLastSeenMs < 200);
+  const bool touchNow = touchFrame || touchHeld;
+  if (touchBusyOut) *touchBusyOut = touchNow || touchActive;
+
+  if (touchNow) {
+    touchSeen = true;
+    if (touchFrame) {
+      touchLastSeenMs = nowMs;
+      touchLastX = x;
+      touchLastY = y;
+      touchHadPos = true;
+    }
+    if (!touchActive) {
+      touchActive = true;
+      touchLongHandled = false;
+      touchHadPos = touchFrame;
+      touchStartMs = nowMs;
+      touchStartX = x;
+      touchStartY = y;
+      touchLastX = x;
+      touchLastY = y;
+      blePauseForTouch();
+    }
+    if (currentPage == 5 && !touchLongHandled && nowMs - touchStartMs >= 600) {
+      touchLongHandled = true;
+      lastTouch = nowMs;
+      handleSetupLongPress(touchLastY, nowMs - touchStartMs);
+    }
+  } else if (touchActive && nowMs - touchLastSeenMs > (currentPage == 5 ? 700UL : TOUCH_RELEASE_MS)) {
+    const uint32_t durMs = touchLastSeenMs - touchStartMs;
+    const uint16_t tapX = touchHadPos ? touchLastX : touchStartX;
+    const uint16_t tapY = touchHadPos ? touchLastY : touchStartY;
+    touchActive = false;
+    touchHadPos = false;
+    if (!touchLongHandled && durMs < 600 && nowMs - lastTouch > TOUCH_COOLDOWN_MS) {
+      lastTouch = nowMs;
+      handleTouchTap(tapX, tapY);
+    }
+  }
+}
+#endif
 
 static void saveWifiProfile(uint8_t idx) {
   uint8_t count = wifiProfileCount();
@@ -3065,8 +4480,8 @@ static void saveWifiProfile(uint8_t idx) {
 static void reconnectWifiProfile() {
   if (strlen(currentWifiSsid()) == 0) return;
   g_featureWifi = true;
+  stopApOnlyMode();
   strcpy(g_ipStr, "...");
-  WiFi.disconnect();
   WiFi.mode(WIFI_STA);
   WiFi.begin(currentWifiSsid(), currentWifiPassword());
   Serial.printf("WiFi: Profil %u -> '%s'\n", g_wifiProfile, currentWifiSsid());
@@ -3099,10 +4514,28 @@ void setup() {
 
   loadSettings();
 
+  if (g_dataPath == DATA_PATH_BLE && g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
+    g_dataPath = DATA_PATH_WIFI_HUB;
+    g_featureBle = false;
+    Preferences pBoot;
+    pBoot.begin("clock", false);
+    pBoot.putUChar("data_path", g_dataPath);
+    pBoot.putBool("feat_ble", false);
+    pBoot.end();
+    Serial.println("Boot: WiFi hub (was BLE hub)");
+  }
+
+  if (strlen(currentWifiSsid()) == 0 && hubWifiProfileIndex() != 0xFF) {
+    applyBusProfile(false);
+  }
+
   // WiFi and BLE MUST init before the RGB panel. WiFi/BLE PHY init temporarily
   // disables the flash cache; if the RGB VSYNC ISR (in flash) fires during that
   // window the CPU faults. With no panel running yet there is no VSYNC ISR.
-  if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
+  if (g_wifiApOnly) {
+    WiFi.persistent(false);
+    enterApOnlyMode();
+  } else if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
     WiFi.persistent(false);  // keine WiFi-Flash-Schreibzugriffe -> kein Cache-Disable
     WiFi.setSleep(true);     // Modem-Sleep: weniger PSRAM-Bus-Konkurrenz
     WiFi.mode(WIFI_STA);
@@ -3110,11 +4543,19 @@ void setup() {
     Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", currentWifiSsid());
   }
 
-  if (g_featureBle) {
+  if (g_featureBle && g_dataPath == DATA_PATH_BLE) {
     NimBLEDevice::init("VDO-Clock");
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-    bleNextScanAt = millis() + 20000;
+    g_bleStackReady = true;
+    const uint32_t bootDelay = (g_bleConnMode == BLE_MODE_DIRECT_123) ? 1500u : 3000u;
+    bleNextScanAt = millis() + bootDelay;
+    bleLogSetState("boot_wait");
+    BLELOG("BLE: init mode=%s mac=%s start in %lums",
+           bleConnModeLabel(), bleSavedMacForMode(), (unsigned long)bootDelay);
     Serial.println("BLE: Client initialisiert");
+  } else if (g_dataPath == DATA_PATH_WIFI_HUB) {
+    Serial.printf("Hub: WiFi poll -> http://%s/api/status every %ums\n",
+                  g_hubHost, (unsigned)HUB_WIFI_POLL_MS);
   }
 
   Serial.println("Display: HAL init...");
@@ -3145,17 +4586,8 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastTouch = 0;
   static uint32_t lastDraw  = 0;
   static String   serialLine;
-  static bool     touchActive = false;
-  static bool     touchLongHandled = false;
-  static uint32_t touchStartMs = 0;
-  static uint32_t touchLastSeenMs = 0;
-  static uint16_t touchStartX = 0, touchStartY = 0;
-  static uint16_t touchLastX = 0, touchLastY = 0;
-  static bool     touchHadPos = false;
-  uint16_t x = 0, y = 0;
   bool touchBusy = false;
 
   if (g_otaBusy) {
@@ -3168,84 +4600,7 @@ void loop() {
   }
 
 #if FEATURE_TOUCH
-  const uint32_t nowMs = millis();
-  const bool touchFrame = readTouch(&x, &y);
-  const bool touchHeld = touchActive && (nowMs - touchLastSeenMs < 200);
-  const bool touchNow = touchFrame || touchHeld;
-  touchBusy = touchNow || touchActive;
-  if (touchNow) {
-    touchSeen = true;
-    if (touchFrame) {
-      // WICHTIG: nur bei echtem Touch-Frame aktualisieren! Sonst haelt der
-      // touchHeld-Zeitfenster-Mechanismus sich selbst am Leben (touchHeld ->
-      // touchNow -> touchLastSeenMs=nowMs -> Fenster nie abgelaufen) und der
-      // Release-Zweig (Tap-Erkennung) feuert NIE.
-      touchLastSeenMs = nowMs;
-      touchLastX = x;
-      touchLastY = y;
-      touchHadPos = true;
-    }
-    if (!touchActive) {
-      touchActive = true;
-      touchLongHandled = false;
-      touchHadPos = touchFrame;
-      touchStartMs = nowMs;
-      touchStartX = x;
-      touchStartY = y;
-      touchLastX = x;
-      touchLastY = y;
-    }
-    if (currentPage == 5 && !touchLongHandled && nowMs - touchStartMs >= 600) {
-      touchLongHandled = true;
-      lastTouch = nowMs;
-      handleSetupLongPress(touchLastY, nowMs - touchStartMs);
-    }
-  } else if (touchActive && nowMs - touchLastSeenMs > (currentPage == 5 ? 700UL : TOUCH_RELEASE_MS)) {
-    const uint32_t durMs = touchLastSeenMs - touchStartMs;
-    const uint16_t tapX = touchHadPos ? touchLastX : touchStartX;
-    const uint16_t tapY = touchHadPos ? touchLastY : touchStartY;
-    touchActive = false;
-    touchHadPos = false;
-    if (!touchLongHandled && durMs < 600 && nowMs - lastTouch > TOUCH_COOLDOWN_MS) {
-      lastTouch = nowMs;
-      if (currentPage == 0) {
-        requestPage(1);
-#if FEATURE_VERBOSE_SERIAL
-        Serial.printf("[TOUCH] tap log=%u,%u page=0 dur=%lums rot=%d\n",
-                      tapX, tapY, (unsigned long)durMs, g_rotationDeg);
-        Serial.println("[TOUCH] hit=clock->menu page=1");
-#endif
-      } else if (currentPage == 1) {
-        // Route by y-position: zones match MENU_ZONE_Y0 / MENU_ZONE_H exactly.
-        const uint16_t z0 = MENU_ZONE_Y0;
-        const uint16_t zh = MENU_ZONE_H;
-        const char *hit = "fallback";
-        if      (tapY >= z0       && tapY < z0 +   zh) { requestPage(0); hit = "UHR"; }
-        else if (tapY >= z0 +  zh && tapY < z0 + 2*zh) { requestPage(2); hit = "MOTOR"; }
-        else if (tapY >= z0 +2*zh && tapY < z0 + 3*zh) { requestPage(3); hit = "LAMBDA"; }
-        else if (tapY >= z0 +3*zh && tapY < z0 + 4*zh) { requestPage(4); hit = "HUB"; }
-        else if (tapY >= z0 +4*zh && tapY < z0 + 5*zh) { requestPage(6); hit = "IMU"; }
-        else if (tapY >= z0 +5*zh && tapY < z0 + 6*zh) { requestPage(5); hit = "SETUP"; }
-        else { requestPage(0); }
-#if FEATURE_VERBOSE_SERIAL
-        Serial.printf("[TOUCH] tap log=%u,%u page=1 dur=%lums rot=%d\n",
-                      tapX, tapY, (unsigned long)durMs, g_rotationDeg);
-        Serial.printf("[TOUCH] hit=menu:%s page=%u y=%u zone=%u..%u\n",
-                      hit, currentPage, tapY, z0, z0 + 6 * zh);
-#endif
-      } else if (currentPage == 5) {
-        handleSetupLongPress(tapY, durMs);
-      } else {
-        const uint8_t prev = currentPage;
-        if      (currentPage == 4) requestPage(6);
-        else if (currentPage == 6) requestPage(0);
-        else requestPage(currentPage + 1);
-#if FEATURE_VERBOSE_SERIAL
-        Serial.printf("[TOUCH] hit=page_next %u->%u\n", prev, currentPage);
-#endif
-      }
-    }
-  }
+  processTouchInput(&touchBusy);
 #else
   (void)touchBusy;
 #endif
@@ -3269,6 +4624,7 @@ void loop() {
         else if (cmd == "buzzer:on")  { saveFeatures(g_featureWifi, g_featureBle, true); }
         else if (cmd == "buzzer:off") { saveFeatures(g_featureWifi, g_featureBle, false); }
         else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
+        else if (cmd == "bus" || cmd == "bus:on") { applyBusProfile(true); g_redrawPage = true; }
         else if (cmd == "wifi:off")  { saveFeatures(false, g_featureBle, g_featureBuzzer); g_redrawPage = true; }
         else if (cmd == "rot:+") { saveRotation(g_rotationDeg + 1); g_redrawPage = true; }
         else if (cmd == "rot:-") { saveRotation(g_rotationDeg - 1); g_redrawPage = true; }
@@ -3314,8 +4670,16 @@ void loop() {
   // WiFi/NTP background tick; redraw clock on fresh sync
   if (!touchBusy && wifiNtpTick() && currentPage == 0) drawVdoClock();
 
-  // BLE: nicht waehrend Touch — blockiert sonst GT911/I2C und Display
-  if (g_featureBle && !touchBusy) {
+  // Hub data via WiFi HTTP (default path; no BLE slot conflict with M5 Dial)
+  if (!touchBusy && !g_otaBusy) hubWifiPollTick();
+
+  // 123 kick state machine: non-blocking, also while touch active
+  if (g_featureBle && g_ble123KickStage != BLE_123_KICK_IDLE) {
+    ble123KickTick();
+  }
+
+  // BLE: only when explicitly selected (fallback); avoids fighting M5 for hub slot
+  if (g_featureBle && g_dataPath == DATA_PATH_BLE && (!touchBusy || bleDoConnect)) {
     static uint32_t bleTickMs = 0;
     if (millis() - bleTickMs >= BLE_TICK_MS) {
       bleTickMs = millis();
@@ -3337,7 +4701,7 @@ void loop() {
     }
   }
   // Data pages: update at 1 Hz
-  if (!touchBusy && currentPage >= 2 && currentPage <= 5 && millis() - lastDraw >= 1000) {
+  if (!touchBusy && currentPage >= 2 && currentPage <= PAGE_MAX && currentPage != 6 && millis() - lastDraw >= 1000) {
     lastDraw = millis();
     drawCurrentPage();
   }
@@ -3348,6 +4712,5 @@ void loop() {
     drawCurrentPage();
   }
 
-  webServerPoll(touchBusy ? 2 : 4);
   delay(touchBusy ? 0 : 1);
 }
