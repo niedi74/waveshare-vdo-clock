@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
+#include "esp_cache.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_rgb.h"
 
@@ -12,6 +13,13 @@
 #define HAL_LCD_SCK 2
 #define HAL_LCD_MOSI 1
 #define HAL_LCD_BL 6
+
+// Optional: Original-Tacho-Helligkeits-Drehregler per ADC (siehe FUTURE.md).
+// GPIO4 = ADC1_CH3 — einziger freier ADC1-Pin bei aktivem WiFi; Touch/Display unberührt.
+#ifndef FEATURE_TACHO_DIMMER
+#define FEATURE_TACHO_DIMMER 0
+#endif
+#define HAL_TACHO_DIMMER_ADC 4
 
 #define HAL_PCA9554_ADDR 0x20
 #define HAL_PCA_OUTPUT 0x01
@@ -45,7 +53,23 @@
 static spi_device_handle_t hal_spi = nullptr;
 static esp_lcd_panel_handle_t hal_panel = nullptr;
 static uint16_t *hal_frame = nullptr;
+static bool hal_frame_owned = false;
 static bool hal_ready = false;
+
+static bool hal_bind_framebuffer() {
+  if (!hal_panel) return false;
+  void *fb0 = nullptr;
+  if (esp_lcd_rgb_panel_get_frame_buffer(hal_panel, 1, &fb0) != ESP_OK || !fb0) {
+    return false;
+  }
+  if (hal_frame && hal_frame_owned) {
+    heap_caps_free(hal_frame);
+  }
+  hal_frame = (uint16_t *)fb0;
+  hal_frame_owned = false;
+  Serial.printf("hal_fb: panel FB0 %p\n", hal_frame);
+  return true;
+}
 
 static uint8_t hal_pca_write_once(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(HAL_PCA9554_ADDR);
@@ -88,6 +112,19 @@ static void hal_buzzer(bool on) {
   // immer den bekannten Betriebs-Zustand schreiben + Buzzer-Bit oben drauf.
   const uint8_t base = HAL_EXIO_LCD_RST | HAL_EXIO_TP_RST | HAL_EXIO_LCD_CS;
   hal_pca_write(HAL_PCA_OUTPUT, on ? (base | HAL_EXIO_BUZZER) : base);
+}
+
+// GT911: INT level waehrend TP_RST-Puls setzt I2C-Adresse (LOW=0x5D, HIGH=0x14).
+void hal_touch_reset(bool intHigh, int touchIntPin) {
+  pinMode(touchIntPin, OUTPUT);
+  digitalWrite(touchIntPin, intHigh ? HIGH : LOW);
+  delay(2);
+  hal_pca_write(HAL_PCA_OUTPUT, HAL_EXIO_LCD_RST | HAL_EXIO_LCD_CS);
+  delay(10);
+  hal_pca_write(HAL_PCA_OUTPUT, HAL_EXIO_LCD_RST | HAL_EXIO_TP_RST | HAL_EXIO_LCD_CS);
+  delay(50);
+  pinMode(touchIntPin, INPUT);
+  delay(10);
 }
 
 static void hal_expander_init() {
@@ -207,10 +244,11 @@ static bool hal_panel_init() {
     esp_lcd_panel_del(hal_panel);
     hal_panel = nullptr;
   }
-  if (hal_frame) {
+  if (hal_frame && hal_frame_owned) {
     heap_caps_free(hal_frame);
-    hal_frame = nullptr;
   }
+  hal_frame = nullptr;
+  hal_frame_owned = false;
 
   esp_lcd_rgb_panel_config_t cfg = {};
   cfg.clk_src = LCD_CLK_SRC_PLL160M;
@@ -260,6 +298,7 @@ static bool hal_panel_init() {
   err = esp_lcd_panel_init(hal_panel);
   Serial.printf("RGB panel init: %s\n", esp_err_to_name(err));
   hal_ready = (err == ESP_OK);
+  if (hal_ready) hal_bind_framebuffer();
   return hal_ready;
 }
 
@@ -268,18 +307,53 @@ void hal_backlight(bool on) {
   digitalWrite(HAL_LCD_BL, on ? HIGH : LOW);
 }
 
+#if FEATURE_TACHO_DIMMER
+static bool hal_dimmerReady = false;
+
+void hal_tacho_dimmer_init() {
+  pinMode(HAL_TACHO_DIMMER_ADC, INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(HAL_TACHO_DIMMER_ADC, ADC_11db);
+  hal_dimmerReady = true;
+  Serial.printf("Dimmer ADC: GPIO%d (ADC1_CH3) bereit\n", HAL_TACHO_DIMMER_ADC);
+}
+
+int hal_tacho_dimmer_read_raw() {
+  if (!hal_dimmerReady) return -1;
+  return analogRead(HAL_TACHO_DIMMER_ADC);
+}
+
+int hal_tacho_dimmer_read_pct() {
+  int raw = hal_tacho_dimmer_read_raw();
+  if (raw < 0) return -1;
+  int pct = map(raw, 0, 4095, 5, 100);
+  if (pct < 5) pct = 5;
+  if (pct > 100) pct = 100;
+  return pct;
+}
+#else
+inline void hal_tacho_dimmer_init() {}
+inline int hal_tacho_dimmer_read_raw() { return -1; }
+inline int hal_tacho_dimmer_read_pct() { return -1; }
+#endif
+
 uint16_t *hal_fb() {
   if (!hal_frame) {
-    hal_frame = (uint16_t *)heap_caps_malloc(480 * 480 * sizeof(uint16_t),
-                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    Serial.printf("hal_fb: %p\n", hal_frame);
+    if (!hal_bind_framebuffer()) {
+      hal_frame = (uint16_t *)heap_caps_malloc(480 * 480 * sizeof(uint16_t),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      hal_frame_owned = (hal_frame != nullptr);
+      Serial.printf("hal_fb: malloc fallback %p\n", hal_frame);
+    }
   }
   return hal_frame;
 }
 
 void hal_present() {
-  if (hal_frame && hal_panel) {
-    esp_lcd_panel_draw_bitmap(hal_panel, 0, 0, 480, 480, hal_frame);
+  if (!hal_frame || !hal_panel) return;
+  esp_lcd_panel_draw_bitmap(hal_panel, 0, 0, 480, 480, hal_frame);
+  if (!hal_frame_owned) {
+    esp_cache_msync(hal_frame, 480 * 480 * sizeof(uint16_t), 0);
   }
 }
 

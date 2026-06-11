@@ -56,7 +56,8 @@
 #define DEFAULT_123_MAC "ef:a8:b2:de:e0:9e"
 #define DEFAULT_HUB_MAC DEFAULT_123_MAC  // gleiches Geraet moeglich (Hub/BM6/123)
 #define BLE_SCAN_MAX    32
-#define BLE_DISCOVERY_SCAN_MS 5000
+#define BLE_DISCOVERY_SCAN_MS 3000
+#define BLE_SCAN_WEB_WAIT_MS  800
 
 enum BleConnMode : uint8_t { BLE_MODE_DIRECT_123 = 0, BLE_MODE_SPARTAN_HUB = 1 };
 
@@ -87,6 +88,7 @@ static char               g_bleHubMac[18]    = "";               // Hub (leer bi
 static BleScanEntry       g_bleScanList[BLE_SCAN_MAX];
 static uint8_t            g_bleScanCount = 0;
 static volatile bool      g_bleDiscoveryScan = false;
+static bool               g_bleScanWifiSleepWasOn = false;
 static uint8_t            g_blePickIndex = 0;
 
 // ---- GT911 touch state ----
@@ -104,6 +106,8 @@ static const int DIAL_SCALE_DEFAULT = 115;  // sweet spot: fills display, chrome
 static const int DIAL_SCALE_MIN     = 30;
 static const int DIAL_SCALE_MAX     = 120;
 static const int DIAL_CENTER        = 240;
+// Rotation pivot must match setPixel/readTouch (not DIAL_CENTER) so dial cache and hands align.
+static constexpr float ROT_PIVOT    = 239.5f;
 static const int DIAL_CENTER_OFF_X_DEFAULT = 4;   // bitmap optical center @115% (hands stay at 240,240)
 static const int DIAL_CENTER_OFF_Y_DEFAULT = -9;
 static const uint16_t DIAL_FACE_BG  = RGB565(52, 47, 45);
@@ -114,6 +118,30 @@ static int       g_brightnessPct = 100;
 static int       g_rotationDeg  = 0;
 static float     g_rotSin       = 0.0f;
 static float     g_rotCos       = 1.0f;
+// Throttled debug logging (115200 baud Serial)
+static uint32_t  g_logTimeLastMs  = 0;
+static uint32_t  g_logDrawLastMs  = 0;
+static int       g_logLastRotDeg  = -1;
+// Verbose Serial in hot paths blocks the main loop (USB-CDC @115200).
+#ifndef FEATURE_VERBOSE_SERIAL
+#define FEATURE_VERBOSE_SERIAL 0
+#endif
+#ifndef DEBUG_SERIAL
+#define DEBUG_SERIAL 0
+#endif
+#if DEBUG_SERIAL
+#define DLOG(...) Serial.printf(__VA_ARGS__)
+#define DLOGN(msg) Serial.println(msg)
+#else
+#define DLOG(...) ((void)0)
+#define DLOGN(msg) ((void)0)
+#endif
+#define LOG_TIME_MS  5000
+#define LOG_DRAW_MS  5000
+#define LOG_TOUCH_MS 500
+#define TOUCH_RELEASE_MS   60   // ms nach letztem Touch-Frame bis Tap (war 180)
+#define TOUCH_COOLDOWN_MS  80   // ms zwischen Taps (war 350)
+#define DIAL_REBUILD_ROWS  48   // inkrementeller Dial-Cache pro Loop-Tick
 static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
@@ -129,6 +157,10 @@ static void bleAbortDiscoveryScan();
 static void reconnectWifiProfile();
 static void cycleWifiProfile();
 static void updateRotationCache();
+static void logicalToDisplay(int lx, int ly, int *dx, int *dy);
+static uint16_t *g_dialCache = nullptr;
+static bool      g_dialRebuilding = false;
+static bool dialCacheMatches(int pct, int rot, int offX, int offY);
 
 static void webOtaAbortUpload();
 
@@ -176,6 +208,11 @@ static bool webOtaRejectBusy() {
   webServer.sendHeader("Connection", "close");
   webServer.send(503, "text/plain", "OTA busy");
   return true;
+}
+
+static void webServerPoll(uint8_t n) {
+  if (!g_webStarted) return;
+  for (uint8_t i = 0; i < n; i++) webServer.handleClient();
 }
 
 static void webOtaBeginUpload(const char* filename) {
@@ -306,6 +343,7 @@ static bool     g_sntpStarted      = false;
 static bool     g_ntpSynced        = false;
 static bool     g_ntpResyncRequested = false;
 static uint32_t g_lastRtcSyncMs    = 0;
+static constexpr uint32_t NTP_RESYNC_INTERVAL_MS = 15UL * 60UL * 1000UL;  // 15 min (ESP default: 1 h)
 
 static uint8_t timezoneCount() { return TIMEZONE_COUNT; }
 
@@ -328,6 +366,9 @@ static void applyTimezone() {
   setenv("TZ", tz, 1);
   tzset();
   configTzTime(tz, "pool.ntp.org", "time.nist.gov", "de.pool.ntp.org");
+  // IMMED: avoid adjtime slow-correction leaving ~1 min visible offset after sync.
+  esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+  esp_sntp_set_sync_interval(NTP_RESYNC_INTERVAL_MS);
 }
 
 static void requestNtpResync() {
@@ -390,25 +431,40 @@ static void rtcWrite(const struct tm *t) {
 static bool readClockTime(struct tm *now) {
   // Single time source for WebGUI and drawVdoClock: SNTP (TZ via configTzTime) first.
   // PCF85063 is fallback only before NTP; never prefer stale RTC when SNTP is valid.
+  const char *src = "none";
   time_t t = time(nullptr);
   if (t > 1700000000) {
     localtime_r(&t, now);
-    return true;
+    src = "SNTP";
+  } else if (rtcRead(now)) {
+    src = "RTC";
+  } else {
+    memset(now, 0, sizeof(*now));
+    return false;
   }
-  if (rtcRead(now)) return true;
-  memset(now, 0, sizeof(*now));
-  return false;
+  const uint32_t logMs = millis();
+#if FEATURE_VERBOSE_SERIAL
+  if (logMs - g_logTimeLastMs >= LOG_TIME_MS) {
+    g_logTimeLastMs = logMs;
+    Serial.printf("[TIME] %02d:%02d:%02d src=%s epoch=%ld rot=%d\n",
+                  now->tm_hour, now->tm_min, now->tm_sec, src, (long)t, g_rotationDeg);
+  }
+#endif
+  return true;
 }
 
-static bool tmSameMinute(const struct tm *a, const struct tm *b) {
-  return a->tm_year == b->tm_year && a->tm_mon == b->tm_mon && a->tm_mday == b->tm_mday
-      && a->tm_hour == b->tm_hour && a->tm_min == b->tm_min
-      && abs(a->tm_sec - b->tm_sec) <= 2;
+static bool tmWithinSeconds(const struct tm *a, const struct tm *b, int maxDelta) {
+  struct tm ac = *a, bc = *b;
+  ac.tm_isdst = bc.tm_isdst = -1;
+  const time_t ta = mktime(&ac);
+  const time_t tb = mktime(&bc);
+  if (ta == (time_t)-1 || tb == (time_t)-1) return false;
+  return labs((long)(ta - tb)) <= maxDelta;
 }
 
-static bool syncRtcFromNtp(const struct tm *ntpLocal) {
+static bool syncRtcFromNtp(const struct tm *ntpLocal, bool force) {
   struct tm rtcNow = {};
-  if (rtcRead(&rtcNow) && tmSameMinute(&rtcNow, ntpLocal)) return false;
+  if (!force && rtcRead(&rtcNow) && tmWithinSeconds(&rtcNow, ntpLocal, 2)) return false;
   rtcWrite(ntpLocal);
   g_lastRtcSyncMs = millis();
   g_ntpSynced = true;
@@ -489,9 +545,12 @@ static bool wifiNtpTick() {
     struct tm now;
     localtime_r(&t, &now);
     const bool wasSynced = g_ntpSynced;
-    const bool resyncDue = (millis() - g_lastRtcSyncMs) > 3600000UL;
+    const bool resyncDue = g_lastRtcSyncMs != 0
+        && (millis() - g_lastRtcSyncMs) > NTP_RESYNC_INTERVAL_MS;
     const bool resyncReq = g_ntpResyncRequested;
-    const bool rtcUpdated = syncRtcFromNtp(&now);
+    if ((resyncDue || resyncReq) && esp_sntp_enabled()) esp_sntp_restart();
+    const bool rtcUpdated = syncRtcFromNtp(&now, resyncDue || resyncReq);
+    if (!g_ntpSynced) g_ntpSynced = true;
     if (rtcUpdated || !wasSynced || resyncDue || resyncReq) {
       if (!wasSynced) Serial.println("NTP: synchronisiert");
       return true;
@@ -529,12 +588,20 @@ static void bleWaitScanStopped(NimBLEScan* s, uint32_t timeoutMs) {
   }
 }
 
+static void bleDiscoveryScanEnded() {
+  if (g_bleScanWifiSleepWasOn) {
+    WiFi.setSleep(true);
+    g_bleScanWifiSleepWasOn = false;
+  }
+}
+
 static void bleAbortDiscoveryScan() {
   if (!g_bleDiscoveryScan) return;
   auto* s = NimBLEDevice::getScan();
   s->stop();
   bleWaitScanStopped(s, 500);
   g_bleDiscoveryScan = false;
+  bleDiscoveryScanEnded();
 }
 
 static void disconnectBleForModeChange() {
@@ -591,7 +658,7 @@ static void cycleBleConnMode() {
   if (next == g_bleConnMode) return;
   saveBleConnMode(next);
   disconnectBleForModeChange();
-  Serial.printf("BLE: Quelle -> %s\n", bleConnModeLabel());
+  DLOG("BLE: Quelle -> %s\n", bleConnModeLabel());
 }
 
 static int bleHexNib(uint8_t c) {
@@ -685,7 +752,7 @@ class SpartanClientCB : public NimBLEClientCallbacks {
     g_bleConn = false;
     g_bleHubName = "---";
     Serial.printf("BLE: getrennt (reason=%d), neuer Scan\n", reason);
-    bleNextScanAt = millis() + 15000;
+    bleNextScanAt = millis() + 6000;
   }
   bool onConnParamsUpdateRequest(NimBLEClient*, const ble_gap_upd_params*) override {
     return true;
@@ -755,10 +822,11 @@ class SpartanScanCB : public NimBLEScanCallbacks {
   void onScanEnd(const NimBLEScanResults&, int) override {
     if (g_bleDiscoveryScan) {
       g_bleDiscoveryScan = false;
+      bleDiscoveryScanEnded();
       Serial.printf("BLE: Discovery %u Geraete\n", g_bleScanCount);
       return;
     }
-    if (!g_bleConn && !bleDoConnect) bleNextScanAt = millis() + 15000;
+    if (!g_bleConn && !bleDoConnect) bleNextScanAt = millis() + 6000;
   }
 };
 
@@ -810,9 +878,12 @@ static bool bleStartDiscoveryScan() {
   s->setInterval(100);
   s->setWindow(99);
   s->setMaxResults(0);
+  g_bleScanWifiSleepWasOn = (WiFi.getSleep() != WIFI_PS_NONE);
+  WiFi.setSleep(WIFI_PS_NONE);
   g_bleDiscoveryScan = true;
   if (!s->start(BLE_DISCOVERY_SCAN_MS, false, true)) {
     g_bleDiscoveryScan = false;
+    bleDiscoveryScanEnded();
     Serial.println("BLE: Discovery-Scan Start FAIL");
     return false;
   }
@@ -836,17 +907,17 @@ static void bleConnect() {
   }
   if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
     auto* svc = bleClient->getService(SPARTAN_SVC);
-    if (!svc) { Serial.println("BLE: kein Hub-Service"); bleNextScanAt = millis() + 15000; return; }
+    if (!svc) { Serial.println("BLE: kein Hub-Service"); bleNextScanAt = millis() + 6000; return; }
     auto* status = svc->getCharacteristic(SPARTAN_STATUS);
-    if (!status) { Serial.println("BLE: kein Hub-Status"); bleNextScanAt = millis() + 15000; return; }
+    if (!status) { Serial.println("BLE: kein Hub-Status"); bleNextScanAt = millis() + 6000; return; }
     bool ok = status->subscribe(true, bleNotifyHubCB, true);
     Serial.printf("BLE: Hub-Subscribe %s\n", ok ? "OK" : "FAIL");
     return;
   }
   auto* svc = bleClient->getService(NUS_SVC);
-  if (!svc) { Serial.println("BLE: kein NUS-Service"); bleNextScanAt = millis() + 15000; return; }
+  if (!svc) { Serial.println("BLE: kein NUS-Service"); bleNextScanAt = millis() + 6000; return; }
   auto* tx = svc->getCharacteristic(NUS_TX);
-  if (!tx) { Serial.println("BLE: kein NUS-TX"); bleNextScanAt = millis() + 15000; return; }
+  if (!tx) { Serial.println("BLE: kein NUS-TX"); bleNextScanAt = millis() + 6000; return; }
   bool ok = tx->subscribe(true, bleNotify123CB, true);
   Serial.printf("BLE: 123-Subscribe %s\n", ok ? "OK" : "FAIL");
 }
@@ -880,13 +951,7 @@ static bool i2cRegWrite16(uint8_t addr, uint16_t reg, const uint8_t *data, uint8
 }
 
 static void gt911ResetAddressMode(bool intHigh) {
-  pinMode(PIN_TOUCH_INT, OUTPUT);
-  digitalWrite(PIN_TOUCH_INT, intHigh ? HIGH : LOW);
-  delay(20);
-  digitalWrite(PIN_TOUCH_INT, intHigh ? HIGH : LOW);
-  delay(5);
-  pinMode(PIN_TOUCH_INT, INPUT);
-  delay(80);
+  hal_touch_reset(intHigh, PIN_TOUCH_INT);
 }
 
 static bool gt911Probe() {
@@ -919,6 +984,7 @@ static void gt911Init() {
 }
 
 static bool readTouch(uint16_t *x, uint16_t *y) {
+  if (!gt911Found) return false;
   uint8_t status = 0;
   if (!i2cRegRead16(gt911Addr, GT911_READ_XY, &status, 1)) {
     uint8_t other = (gt911Addr == GT911_ADDR_PRIMARY) ? GT911_ADDR_ALT : GT911_ADDR_PRIMARY;
@@ -954,10 +1020,10 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
     *x = rawX;
     *y = rawY;
   } else {
-    float dx = (float)rawX - 239.5f;
-    float dy = (float)rawY - 239.5f;
-    int lx = (int)lroundf(dx * g_rotCos + dy * g_rotSin + 239.5f);
-    int ly = (int)lroundf(-dx * g_rotSin + dy * g_rotCos + 239.5f);
+    float dx = (float)rawX - ROT_PIVOT;
+    float dy = (float)rawY - ROT_PIVOT;
+    int lx = (int)lroundf(dx * g_rotCos + dy * g_rotSin + ROT_PIVOT);
+    int ly = (int)lroundf(-dx * g_rotSin + dy * g_rotCos + ROT_PIVOT);
     if (lx < 0) lx = 0; else if (lx > 479) lx = 479;
     if (ly < 0) ly = 0; else if (ly > 479) ly = 479;
     *x = (uint16_t)lx;
@@ -966,6 +1032,14 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
   g_lastTouchX  = *x;
   g_lastTouchY  = *y;
   g_lastTouchMs = millis();
+  static uint32_t s_touchLogMs = 0;
+#if FEATURE_VERBOSE_SERIAL
+  if (g_lastTouchMs - s_touchLogMs >= LOG_TOUCH_MS) {
+    s_touchLogMs = g_lastTouchMs;
+    Serial.printf("[TOUCH] raw=%u,%u log=%u,%u rot=%d pts=%u st=0x%02X\n",
+                  rawX, rawY, *x, *y, g_rotationDeg, (unsigned)points, status);
+  }
+#endif
   return true;
 }
 
@@ -974,17 +1048,21 @@ static bool ensureFrame()         { return hal_fb() != nullptr; }
 static void presentFrame()        { hal_present(); }
 static void fillFrame(uint16_t c) { hal_fill(c); }
 
-static void setPixel(int x, int y, uint16_t color) {
+static void setPixelFb(int x, int y, uint16_t color) {
   uint16_t *fb = hal_fb();
   if (!fb || (unsigned)x >= 480 || (unsigned)y >= 480) return;
+  fb[y * 480 + x] = color;
+}
+
+static void setPixel(int x, int y, uint16_t color) {
   if (g_rotationDeg != 0) {
-    float dx = (float)x - 239.5f;
-    float dy = (float)y - 239.5f;
-    x = (int)lroundf(dx * g_rotCos - dy * g_rotSin + 239.5f);
-    y = (int)lroundf(dx * g_rotSin + dy * g_rotCos + 239.5f);
+    float dx = (float)x - ROT_PIVOT;
+    float dy = (float)y - ROT_PIVOT;
+    x = (int)lroundf(dx * g_rotCos - dy * g_rotSin + ROT_PIVOT);
+    y = (int)lroundf(dx * g_rotSin + dy * g_rotCos + ROT_PIVOT);
     if ((unsigned)x >= 480 || (unsigned)y >= 480) return;
   }
-  fb[y * 480 + x] = color;
+  setPixelFb(x, y, color);
 }
 
 static void fillRectFast(int x, int y, int w, int h, uint16_t color) {
@@ -1024,11 +1102,79 @@ static void drawLineFast(int x0, int y0, int x1, int y1, uint16_t color, int thi
   }
 }
 
-static void drawHand(float value, float maxValue, int length, int thickness, uint16_t color) {
+static uint16_t faceColorAtFb(int px, int py) {
+  if ((unsigned)px >= 480 || (unsigned)py >= 480) return DIAL_FACE_BG;
+  int pct = g_dialScalePct;
+  if (pct < DIAL_SCALE_MIN) pct = DIAL_SCALE_MIN;
+  if (pct > DIAL_SCALE_MAX) pct = DIAL_SCALE_MAX;
+  if (pct == 100 && g_rotationDeg == 0 && g_dialCenterOffsetX == 0 && g_dialCenterOffsetY == 0) {
+    return pgm_read_word(&VDO_DIAL_480_RGB565[py * 480 + px]);
+  }
+  if (g_dialCache && dialCacheMatches(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY)
+      && !g_dialRebuilding) {
+    return g_dialCache[py * 480 + px];
+  }
+  return DIAL_FACE_BG;
+}
+
+static bool clockFaceSourceReady() {
+  int pct = g_dialScalePct;
+  if (pct < DIAL_SCALE_MIN) pct = DIAL_SCALE_MIN;
+  if (pct > DIAL_SCALE_MAX) pct = DIAL_SCALE_MAX;
+  if (pct == 100 && g_rotationDeg == 0 && g_dialCenterOffsetX == 0 && g_dialCenterOffsetY == 0) {
+    return true;
+  }
+  return g_dialCache && dialCacheMatches(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY)
+      && !g_dialRebuilding;
+}
+
+static void paintHand(float value, float maxValue, int length, int thickness, uint16_t color,
+                      bool restoreFromFace) {
   float angle = (value / maxValue) * 2.0f * PI - PI / 2.0f;
-  int x = 240 + (int)lroundf(cosf(angle) * (float)length);
-  int y = 240 + (int)lroundf(sinf(angle) * (float)length);
-  drawLineFast(240, 240, x, y, color, thickness);
+  const int lx1 = 240 + (int)lroundf(cosf(angle) * (float)length);
+  const int ly1 = 240 + (int)lroundf(sinf(angle) * (float)length);
+  const int r = thickness / 2;
+  int x0 = 240, y0 = 240, x1 = lx1, y1 = ly1;
+  int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+  int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy;
+  while (true) {
+    for (int oy = -r; oy <= r; oy++) {
+      for (int ox = -r; ox <= r; ox++) {
+        if (ox * ox + oy * oy > r * r) continue;
+        int lx = x0 + ox, ly = y0 + oy;
+        int px = lx, py = ly;
+        if (g_rotationDeg != 0) logicalToDisplay(lx, ly, &px, &py);
+        const uint16_t c = restoreFromFace ? faceColorAtFb(px, py) : color;
+        setPixelFb(px, py, c);
+      }
+    }
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+
+static void drawHand(float value, float maxValue, int length, int thickness, uint16_t color) {
+  paintHand(value, maxValue, length, thickness, color, false);
+}
+
+static void restoreHand(float value, float maxValue, int length, int thickness) {
+  paintHand(value, maxValue, length, thickness, 0, true);
+}
+
+static void restoreCircleFromFace(int cx, int cy, int radius) {
+  int r2 = radius * radius;
+  for (int y = cy - radius; y <= cy + radius; y++) {
+    for (int x = cx - radius; x <= cx + radius; x++) {
+      int dx = x - cx, dy = y - cy;
+      if (dx * dx + dy * dy > r2) continue;
+      int px = x, py = y;
+      if (g_rotationDeg != 0) logicalToDisplay(x, y, &px, &py);
+      setPixelFb(px, py, faceColorAtFb(px, py));
+    }
+  }
 }
 
 static uint8_t glyphColumn(char c, uint8_t col) {
@@ -1136,11 +1282,15 @@ static void drawDialText(int cx, int cy, const char *text, uint16_t color, int s
 }
 
 // Pre-scaled dial in PSRAM: bilinear rebuild on setting change, fast memcpy each frame.
-static uint16_t *g_dialCache = nullptr;
 static int       g_dialCacheScale = -1;
 static int       g_dialCacheRot   = -1;
 static int       g_dialCacheOffX  = -999;
 static int       g_dialCacheOffY  = -999;
+static int       g_dialRebuildRow = 0;
+static int       g_dialRebuildPct = -1;
+static int       g_dialRebuildRot = -1;
+static int       g_dialRebuildOffX = 0;
+static int       g_dialRebuildOffY = 0;
 
 static inline uint16_t lerpRgb565(uint16_t a, uint16_t b, uint8_t t) {
   int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
@@ -1158,6 +1308,9 @@ static inline uint16_t bilinearRgb565(uint16_t c00, uint16_t c10, uint16_t c01, 
 
 static void invalidateDialCache() {
   g_dialCacheScale = -1;
+  g_dialCacheRot   = -1;
+  g_dialRebuilding = false;
+  g_dialRebuildRow = 0;
 }
 
 static bool dialCacheMatches(int pct, int rot, int offX, int offY) {
@@ -1165,32 +1318,49 @@ static bool dialCacheMatches(int pct, int rot, int offX, int offY) {
       && g_dialCacheOffX == offX && g_dialCacheOffY == offY;
 }
 
-static void rebuildDialCache(int pct, int rot, int offX, int offY) {
+static bool dialCacheAlloc() {
+  if (g_dialCache) return true;
+  g_dialCache = (uint16_t*)ps_malloc(480 * 480 * sizeof(uint16_t));
   if (!g_dialCache) {
-    g_dialCache = (uint16_t*)ps_malloc(480 * 480 * sizeof(uint16_t));
-    if (!g_dialCache) {
-      Serial.println("dial cache: PSRAM alloc failed");
-      return;
-    }
+    Serial.println("dial cache: PSRAM alloc failed");
+    return false;
   }
+  return true;
+}
 
-  const float cx = (float)DIAL_CENTER;
-  const float cy = (float)DIAL_CENTER;
-  const float invScale = 100.0f / (float)pct;
+static void dialCacheBeginRebuild(int pct, int rot, int offX, int offY) {
+  if (!dialCacheAlloc()) return;
+  g_dialRebuildPct = pct;
+  g_dialRebuildRot = rot;
+  g_dialRebuildOffX = offX;
+  g_dialRebuildOffY = offY;
+  g_dialRebuildRow = 0;
+  g_dialRebuilding = true;
+  g_dialCacheScale = -1;
   for (int i = 0; i < 480 * 480; i++) g_dialCache[i] = DIAL_FACE_BG;
+}
 
-  for (int py = 0; py < 480; py++) {
+static void dialCacheRebuildRows(int pct, int rot, int offX, int offY, int rowStart, int rowEnd) {
+  const float pivot = ROT_PIVOT;
+  const float invScale = 100.0f / (float)pct;
+  float rotSin = 0.0f, rotCos = 1.0f;
+  if (rot != 0) {
+    const float rad = (float)rot * PI / 180.0f;
+    rotSin = sinf(rad);
+    rotCos = cosf(rad);
+  }
+  for (int py = rowStart; py < rowEnd; py++) {
     for (int px = 0; px < 480; px++) {
-      float lx = (float)px - cx;
-      float ly = (float)py - cy;
-      float sx = cx + lx * invScale + (float)offX;
-      float sy = cy + ly * invScale + (float)offY;
+      float dx = (float)px - pivot;
+      float dy = (float)py - pivot;
+      float lx = dx;
+      float ly = dy;
       if (rot != 0) {
-        float rx = sx - cx;
-        float ry = sy - cy;
-        sx = rx * g_rotCos - ry * g_rotSin + cx;
-        sy = rx * g_rotSin + ry * g_rotCos + cy;
+        lx = dx * rotCos + dy * rotSin;
+        ly = -dx * rotSin + dy * rotCos;
       }
+      float sx = pivot + lx * invScale + (float)offX;
+      float sy = pivot + ly * invScale + (float)offY;
       if (sx < 0.0f || sy < 0.0f || sx > 479.0f || sy > 479.0f) continue;
 
       int x0 = (int)sx;
@@ -1209,11 +1379,69 @@ static void rebuildDialCache(int pct, int rot, int offX, int offY) {
       g_dialCache[py * 480 + px] = bilinearRgb565(c00, c10, c01, c11, fx, fy);
     }
   }
+}
 
-  g_dialCacheScale = pct;
-  g_dialCacheRot   = rot;
-  g_dialCacheOffX  = offX;
-  g_dialCacheOffY  = offY;
+// Inkrementeller Rebuild: blockiert Touch/Display nicht mehr fuer mehrere Sekunden.
+static void tickDialCacheRebuild() {
+  int pct = g_dialScalePct;
+  if (pct < DIAL_SCALE_MIN) pct = DIAL_SCALE_MIN;
+  if (pct > DIAL_SCALE_MAX) pct = DIAL_SCALE_MAX;
+  if (pct == 100 && g_rotationDeg == 0 && g_dialCenterOffsetX == 0 && g_dialCenterOffsetY == 0) {
+    g_dialRebuilding = false;
+    return;
+  }
+  if (dialCacheMatches(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY)) {
+    g_dialRebuilding = false;
+    return;
+  }
+  if (!g_dialRebuilding
+      || g_dialRebuildPct != pct || g_dialRebuildRot != g_rotationDeg
+      || g_dialRebuildOffX != g_dialCenterOffsetX || g_dialRebuildOffY != g_dialCenterOffsetY) {
+    dialCacheBeginRebuild(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY);
+  }
+  if (!g_dialRebuilding || !g_dialCache) return;
+
+  const int rowEnd = g_dialRebuildRow + DIAL_REBUILD_ROWS;
+  const int clampEnd = rowEnd > 480 ? 480 : rowEnd;
+  dialCacheRebuildRows(g_dialRebuildPct, g_dialRebuildRot, g_dialRebuildOffX, g_dialRebuildOffY,
+                       g_dialRebuildRow, clampEnd);
+  g_dialRebuildRow = clampEnd;
+  if (g_dialRebuildRow >= 480) {
+    g_dialCacheScale = g_dialRebuildPct;
+    g_dialCacheRot   = g_dialRebuildRot;
+    g_dialCacheOffX  = g_dialRebuildOffX;
+    g_dialCacheOffY  = g_dialRebuildOffY;
+    g_dialRebuilding = false;
+  }
+}
+
+static void finishDialCacheRebuildBlocking() {
+  while (true) {
+    tickDialCacheRebuild();
+    int pct = g_dialScalePct;
+    if (pct < DIAL_SCALE_MIN) pct = DIAL_SCALE_MIN;
+    if (pct > DIAL_SCALE_MAX) pct = DIAL_SCALE_MAX;
+    if (pct == 100 && g_rotationDeg == 0 && g_dialCenterOffsetX == 0 && g_dialCenterOffsetY == 0) break;
+    if (dialCacheMatches(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY)) break;
+    if (g_webStarted) webServer.handleClient();
+    yield();
+  }
+}
+
+static bool      g_clockHandsValid = false;
+static float     g_clockLastSecVal = -1.0f;
+static float     g_clockLastMinVal = -1.0f;
+static float     g_clockLastHourVal = -1.0f;
+static uint8_t   g_clockFacePage = 255;
+
+static void invalidateClockHands() {
+  g_clockHandsValid = false;
+  g_clockLastSecVal = g_clockLastMinVal = g_clockLastHourVal = -1.0f;
+}
+
+static void requestDialCacheRebuild() {
+  invalidateDialCache();
+  invalidateClockHands();
 }
 
 static void copyVdoDialToFrame() {
@@ -1227,64 +1455,95 @@ static void copyVdoDialToFrame() {
     return;
   }
 
-  if (!dialCacheMatches(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY)) {
-    rebuildDialCache(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY);
-  }
-  if (g_dialCache) {
+  // Fertiger oder teilweise aufgebauter Cache: memcpy statt teurem NN-Fallback pro Frame.
+  if (g_dialCache && (dialCacheMatches(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY)
+      || g_dialRebuilding)) {
     memcpy(fb, g_dialCache, 480 * 480 * sizeof(uint16_t));
     return;
   }
 
-  // Fallback if PSRAM cache unavailable: nearest-neighbor (legacy path).
-  const float cx = (float)DIAL_CENTER;
-  const float cy = (float)DIAL_CENTER;
-  const float offX = (float)g_dialCenterOffsetX;
-  const float offY = (float)g_dialCenterOffsetY;
-  const float invScale = 100.0f / (float)pct;
+  // Letzter Ausweg ohne Cache (PSRAM fehlgeschlagen): Hintergrund, Zeiger bleiben sichtbar.
   for (int i = 0; i < 480 * 480; i++) fb[i] = DIAL_FACE_BG;
-  for (int py = 0; py < 480; py++) {
-    for (int px = 0; px < 480; px++) {
-      float lx = (float)px - cx;
-      float ly = (float)py - cy;
-      float sx = cx + lx * invScale + offX;
-      float sy = cy + ly * invScale + offY;
-      if (g_rotationDeg != 0) {
-        float rx = sx - cx;
-        float ry = sy - cy;
-        sx = rx * g_rotCos - ry * g_rotSin + cx;
-        sy = rx * g_rotSin + ry * g_rotCos + cy;
-      }
-      int ix = (int)lroundf(sx);
-      int iy = (int)lroundf(sy);
-      if ((unsigned)ix < 480u && (unsigned)iy < 480u) {
-        fb[py * 480 + px] = pgm_read_word(&VDO_DIAL_480_RGB565[iy * 480 + ix]);
-      }
-    }
-  }
 }
+
+static void logicalToDisplay(int lx, int ly, int *dx, int *dy) {
+  if (g_rotationDeg == 0) {
+    *dx = lx;
+    *dy = ly;
+    return;
+  }
+  float fx = (float)lx - ROT_PIVOT;
+  float fy = (float)ly - ROT_PIVOT;
+  *dx = (int)lroundf(fx * g_rotCos - fy * g_rotSin + ROT_PIVOT);
+  *dy = (int)lroundf(fx * g_rotSin + fy * g_rotCos + ROT_PIVOT);
+}
+
+static struct tm g_lastClockDrawTm = {};
+static bool      g_lastClockDrawTmValid = false;
 
 static void drawVdoClock() {
   if (!ensureFrame()) return;
+  if (g_clockFacePage != 0) {
+    invalidateClockHands();
+    g_clockFacePage = 0;
+  }
   struct tm now = {};
   if (!readClockTime(&now)) return;
-  copyVdoDialToFrame();
+  g_lastClockDrawTm = now;
+  g_lastClockDrawTmValid = true;
+
   float seconds     = now.tm_sec;
   float minuteValue = now.tm_min + seconds / 60.0f;
   float hourValue   = (now.tm_hour % 12) + minuteValue / 60.0f;
   float s = g_dialScalePct / 100.0f;
   if (s < 0.30f) s = 0.30f;
   if (s > 1.20f) s = 1.20f;
+#if FEATURE_VERBOSE_SERIAL
+  const uint32_t logMs = millis();
+  if (logMs - g_logDrawLastMs >= LOG_DRAW_MS) {
+    g_logDrawLastMs = logMs;
+    float secAngle = (seconds / 60.0f) * 2.0f * PI - PI / 2.0f;
+    int tipLx = 240 + (int)lroundf(cosf(secAngle) * 188.0f * s);
+    int tipLy = 240 + (int)lroundf(sinf(secAngle) * 188.0f * s);
+    int tipDx = tipLx, tipDy = tipLy;
+    logicalToDisplay(tipLx, tipLy, &tipDx, &tipDy);
+    Serial.printf("[DRAW] clock %02d:%02d:%02d h=%.2f m=%.2f rot=%d scale=%d%% secTip=%d,%d->%d,%d\n",
+                  now.tm_hour, now.tm_min, now.tm_sec, hourValue, minuteValue,
+                  g_rotationDeg, g_dialScalePct, tipLx, tipLy, tipDx, tipDy);
+  }
+#endif
   #define SC(v) ((int)((v) * s + 0.5f))
+
+  const bool incremental = g_clockHandsValid && clockFaceSourceReady();
+  if (!incremental) {
+    copyVdoDialToFrame();
+  } else {
+    restoreHand(g_clockLastHourVal, 12.0f, SC(118), SC(18));
+    restoreHand(g_clockLastHourVal, 12.0f, SC(118), SC(13));
+    restoreHand(g_clockLastMinVal, 60.0f, SC(172), SC(15));
+    restoreHand(g_clockLastMinVal, 60.0f, SC(172), SC(10));
+    restoreHand(g_clockLastSecVal, 60.0f, SC(188), SC(4));
+    restoreCircleFromFace(240, 240, SC(26));
+    webServerPoll(2);
+  }
+
   drawHand(hourValue,   12.0f, SC(118), SC(18), RGB565(24,  24,  22));
   drawHand(hourValue,   12.0f, SC(118), SC(13), RGB565(222, 222, 214));
+  webServerPoll(4);
   drawHand(minuteValue, 60.0f, SC(172), SC(15), RGB565(24,  24,  22));
   drawHand(minuteValue, 60.0f, SC(172), SC(10), RGB565(226, 226, 218));
+  webServerPoll(4);
   drawHand(seconds,     60.0f, SC(188), SC(4),  RGB565(235, 24,  20));
   fillCircleFast(240, 240, SC(26), RGB565(205, 205, 198));
   fillCircleFast(240, 240, SC(15), RGB565(166, 122, 42));
   fillCircleFast(240, 240, SC(9),  RGB565(38,  30,  18));
   fillCircleFast(240, 240, SC(5),  RGB565_BLACK);
   #undef SC
+
+  g_clockLastSecVal = seconds;
+  g_clockLastMinVal = minuteValue;
+  g_clockLastHourVal = hourValue;
+  g_clockHandsValid = clockFaceSourceReady();
   presentFrame();
 }
 
@@ -1305,6 +1564,7 @@ static void drawMenuTile(int x, int y, int w, int h, const char *label, uint16_t
 
 static void drawMenuOverview() {
   if (!ensureFrame()) return;
+  g_clockFacePage = currentPage;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(80, 80, 75));
   drawTextCentered(240, 50, "MENU", RGB565(235, 235, 225), 6);
@@ -1335,6 +1595,7 @@ static void drawDataRow(int y, const char* label, const char* value, uint16_t co
 
 static void drawMotorPage() {
   if (!ensureFrame()) return;
+  g_clockFacePage = currentPage;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(40, 110, 160));
   drawTextCentered(240, 52, "MOTOR", RGB565(60, 170, 230), 5);
@@ -1362,6 +1623,7 @@ static void drawMotorPage() {
 
 static void drawLambdaPage() {
   if (!ensureFrame()) return;
+  g_clockFacePage = currentPage;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(45, 150, 70));
   drawTextCentered(240, 58, "LAMBDA", RGB565(70, 200, 100), 5);
@@ -1388,6 +1650,7 @@ static void drawLambdaPage() {
 
 static void drawHubPage() {
   if (!ensureFrame()) return;
+  g_clockFacePage = currentPage;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(150, 70, 180));
   drawTextCentered(240, 54, "BLE", RGB565(205, 120, 230), 5);
@@ -1411,6 +1674,7 @@ static void drawHubPage() {
 
 static void drawSetupPage() {
   if (!ensureFrame()) return;
+  g_clockFacePage = currentPage;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
   drawTextCentered(240, 54, "SETUP", RGB565(230, 190, 70), 5);
@@ -1442,6 +1706,7 @@ static void drawSetupPage() {
 
 static void drawImuPage() {
   if (!ensureFrame()) return;
+  g_clockFacePage = currentPage;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(200, 100, 50));
   drawTextCentered(240, 52, "IMU", RGB565(220, 130, 60), 5);
@@ -1476,6 +1741,7 @@ static void drawImuPage() {
 }
 
 static void drawCurrentPage() {
+  if (currentPage != 0) g_clockFacePage = currentPage;
   if      (currentPage == 0) drawVdoClock();
   else if (currentPage == 1) drawMenuOverview();
   else if (currentPage == 2) drawMotorPage();
@@ -1532,7 +1798,7 @@ static void saveDialScale(int pct) {
   if (pct < DIAL_SCALE_MIN) pct = DIAL_SCALE_MIN;
   if (pct > DIAL_SCALE_MAX) pct = DIAL_SCALE_MAX;
   g_dialScalePct = pct;
-  invalidateDialCache();
+  requestDialCacheRebuild();
   Preferences p;
   p.begin("clock", false);
   p.putInt("scale", pct);
@@ -1546,7 +1812,7 @@ static void saveDialOffset(int offX, int offY) {
   if (offY >  20) offY =  20;
   g_dialCenterOffsetX = offX;
   g_dialCenterOffsetY = offY;
-  invalidateDialCache();
+  requestDialCacheRebuild();
   Preferences p;
   p.begin("clock", false);
   p.putInt("dial_off_x", offX);
@@ -1570,12 +1836,18 @@ static void updateRotationCache() {
   float rad = (float)g_rotationDeg * PI / 180.0f;
   g_rotSin = sinf(rad);
   g_rotCos = cosf(rad);
+#if DEBUG_SERIAL
+  if (g_rotationDeg != g_logLastRotDeg) {
+    DLOG("[ROT] deg=%d sin=%.4f cos=%.4f\n", g_rotationDeg, g_rotSin, g_rotCos);
+    g_logLastRotDeg = g_rotationDeg;
+  }
+#endif
 }
 
 static void saveRotation(int deg) {
   g_rotationDeg = deg;
   updateRotationCache();
-  invalidateDialCache();
+  requestDialCacheRebuild();
   Preferences p;
   p.begin("clock", false);
   p.putInt("rot_deg", g_rotationDeg);
@@ -1656,6 +1928,11 @@ static String jsonEscape(const String& value) {
     }
   }
   return out;
+}
+
+static void jsonAppendFloat(String& json, float v, int decimals) {
+  if (!isfinite(v)) json += F("0");
+  else json += String(v, decimals);
 }
 
 static const char* webPageLabel(uint8_t page) {
@@ -1877,7 +2154,7 @@ static void handleWebRoot() {
   snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
 
   String html;
-  html.reserve(16384);
+  html.reserve(32768);
   html += F("<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>VDO Cockpit</title><style>"
@@ -1898,9 +2175,9 @@ static void handleWebRoot() {
     ".ota-progress{margin-top:12px}.ota-track{height:10px;background:#222;border-radius:999px;overflow:hidden;border:1px solid #333}.ota-bar{height:100%;width:0;background:linear-gradient(90deg,#b8921f,var(--gold));transition:width .25s}</style></head><body><main>");
   html += F("<h1>VDO Cockpit</h1><div class='sub'>ESP32-S3 WebGUI &middot; IP ");
   html += String(g_ipStr);
-  html += F(" &middot; ");
+  html += F(" &middot; <span id='headerTime'>");
   html += String(timeStr);
-  html += F("</div><input class='tab' id='t0' name='tab' type='radio' checked><input class='tab' id='t1' name='tab' type='radio'><input class='tab' id='t2' name='tab' type='radio'><input class='tab' id='t3' name='tab' type='radio'><input class='tab' id='t4' name='tab' type='radio'>"
+  html += F("</span></div><input class='tab' id='t0' name='tab' type='radio' checked><input class='tab' id='t1' name='tab' type='radio'><input class='tab' id='t2' name='tab' type='radio'><input class='tab' id='t3' name='tab' type='radio'><input class='tab' id='t4' name='tab' type='radio'>"
             "<nav class='tabs'><label for='t0'>Dashboard</label><label for='t1'>WLAN</label><label for='t2'>Display</label><label for='t3'>Live</label><label for='t4'>Setup</label></nav>");
 
   html += F("<section class='page' id='p0'><div class='card row'><div><b>Aktive Display-Seite</b><br><span id='dashPageLabel' style='font-size:1.4rem;color:var(--gold)'>");
@@ -2006,6 +2283,7 @@ static void handleWebRoot() {
 
   html += F("<script>"
             "const pageNames=['UHR','MENU','MOTOR','LAMBDA','HUB','SETUP','IMU'];"
+            "function num(v){const n=Number(v);return Number.isFinite(n)?n:0;}"
             "let lastPreviewPage=-2,espH=0,espM=0,espS=0,espSync=0,liveTimer=null,handTimer=null;"
             "function pvSet(sel,v){document.querySelectorAll(sel).forEach(e=>e.textContent=v);}"
             "function setHand(sel,deg){document.querySelectorAll(sel).forEach(g=>g.setAttribute('transform','rotate('+deg.toFixed(2)+')'));}"
@@ -2019,34 +2297,32 @@ static void handleWebRoot() {
             "function syncPreviewValues(d){applyPreviewMeta(d);espH=d.hour||0;espM=d.min||0;espS=d.sec||0;espSync=Date.now();"
             "if(d.page===0){updateHands();return;}if(d.page===2){const ok=d.ble_connected&&d.ble_enabled;"
             "pvSet('.pv-rpm',ok?String(Math.round(d.rpm||0)):'0');pvSet('.pv-adv',ok?String(Math.round(d.adv||0)):'0');"
-            "pvSet('.pv-map',ok?String(Math.round(d.map||0)):'0');pvSet('.pv-batt',d.volt_valid?(d.volt||0).toFixed(1)+'V':'---');"
+            "pvSet('.pv-map',ok?String(Math.round(d.map||0)):'0');pvSet('.pv-batt',d.volt_valid?num(d.volt).toFixed(1)+'V':'---');"
             "pvSet('.pv-motor-st',ok?(d.ble_connected?'LIVE':'WARTE'):'---');}"
-            "if(d.page===3)pvSet('.pv-lambda',d.lambda_valid?(d.lambda||0).toFixed(2):'----');"
+            "if(d.page===3)pvSet('.pv-lambda',d.lambda_valid?num(d.lambda).toFixed(2):'----');"
             "if(d.page===4){pvSet('.pv-hub-st',d.ble_connected?'HUB OK':'KEIN HUB');pvSet('.pv-rx',String(d.ble_rx||0));}"
-            "if(d.page===6&&d.imu_present){pvSet('.pv-imu-p','P '+(d.imu_pitch||0).toFixed(1));pvSet('.pv-imu-r','R '+(d.imu_roll||0).toFixed(1));}}"
+            "if(d.page===6&&d.imu_present){pvSet('.pv-imu-p','P '+num(d.imu_pitch).toFixed(1));pvSet('.pv-imu-r','R '+num(d.imu_roll).toFixed(1));}}"
             "function syncPreviewContent(html){const m=html.match(/<div class='preview-content'[\\s\\S]*?<\\/div>/);if(!m)return;"
             "const inner=m[0].replace(/--rot:[^;'\"]+;?/g,'');"
             "const dash=document.getElementById('dashPreviewHost');if(dash){const b=dash.querySelector('.preview-bezel');if(b)b.innerHTML=inner;}}"
             "async function refreshPreview(){try{const r=await fetch('/api/preview');let html=await r.text();html=html.replace(/--rot:[^;'\"]+;?/g,'');"
             "const host=document.getElementById('displayPreviewHost');if(host)host.innerHTML=html;syncPreviewContent(html);}catch(e){}}"
             "function syncDashboard(d){if(!d)return;const set=(id,v)=>{const e=document.getElementById(id);if(e)e.textContent=v;};"
-            "set('dashRpm',Math.round(d.rpm||0));set('dashAdv',(d.adv||0).toFixed(1)+'°');"
-            "set('dashLambda',d.lambda_valid?(d.lambda||0).toFixed(2):'---');set('dashVolt',d.volt_valid?(d.volt||0).toFixed(1):'---');"
+            "set('dashRpm',Math.round(num(d.rpm)));set('dashAdv',num(d.adv).toFixed(1)+'°');"
+            "set('dashLambda',d.lambda_valid?num(d.lambda).toFixed(2):'---');set('dashVolt',d.volt_valid?num(d.volt).toFixed(1):'---');"
+            "const ht=document.getElementById('headerTime');if(ht&&d.hour!=null)ht.textContent=String(d.hour).padStart(2,'0')+':'+String(d.min).padStart(2,'0')+':'+String(d.sec).padStart(2,'0');"
             "set('dashPage',String(d.page));set('dashPageLabel',pageNames[d.page]||'?');set('dashRx',String(d.ble_rx||0));"
             "const ble=document.getElementById('dashBle');if(ble){ble.textContent=d.ble_enabled?(d.ble_connected?'verbunden':'scan/wartet'):'aus';"
             "ble.className=d.ble_enabled&&d.ble_connected?'ok':'warn';}"
             "syncBleSetup(d);"
             "if(d.page!==lastPreviewPage){lastPreviewPage=d.page;refreshPreview().then(()=>syncPreviewValues(d));}"
             "else syncPreviewValues(d);}"
-            "async function fetchWithTimeout(url,ms){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);try{return await fetch(url,{signal:c.signal});}finally{clearTimeout(t);}}"
+            "async function fetchWithTimeout(url,ms,opts){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);try{return await fetch(url,{...(opts||{}),signal:c.signal});}finally{clearTimeout(t);}}"
             "async function scanWifi(){const rows=document.getElementById('scanRows');rows.innerHTML='<tr><td colspan=3>Scan laeuft...</td></tr>';try{const r=await fetchWithTimeout('/scan',12000);const d=await r.json();rows.innerHTML=d.networks.map(n=>`<tr><td>${n.ssid}</td><td>${n.rssi}</td><td>${n.connected?'verbunden':''}</td></tr>`).join('')||'<tr><td colspan=3>Keine Netze</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=3>Scan fehlgeschlagen</td></tr>';}}"
-            "async function scanBle(){const rows=document.getElementById('bleScanRows');rows.innerHTML='<tr><td colspan=5>Scan laeuft (bis 8s)...</td></tr>';try{const r=await fetchWithTimeout('/ble/scan',15000);if(!r.ok){rows.innerHTML='<tr><td colspan=5>Scan fehlgeschlagen (HTTP '+r.status+')</td></tr>';return;}const d=await r.json();if(d.error==='ble_off'){rows.innerHTML='<tr><td colspan=5>BLE aus – Setup: BLE aktivieren</td></tr>';return;}if(d.error==='scan_failed'){rows.innerHTML='<tr><td colspan=5>BLE-Scan konnte nicht gestartet werden</td></tr>';return;}"
-            "const typ=n=>[n.spartan?'Hub':'',n.nus?'NUS':''].filter(Boolean).join(',')||'–';"
-            "const list=Array.isArray(d.devices)?d.devices:[];"
-            "const hdr=list.length?`<tr><td colspan=5 class=sub>${list.length} Geraet(e) gefunden</td></tr>`:'';"
-            "rows.innerHTML=hdr+list.map(n=>`<tr><td>${n.name||'---'}</td><td>${n.mac}</td><td>${n.rssi}</td><td>${typ(n)}</td><td><a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=hub'><button>Hub</button></a> <a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=direct'><button>123</button></a></td></tr>`).join('')||'<tr><td colspan=5>Keine Geraete</td></tr>';}catch(e){const msg=(e&&e.name==='AbortError')?'Timeout (>15s) – ESP antwortet nicht':'Scan fehlgeschlagen';rows.innerHTML='<tr><td colspan=5>'+msg+'</td></tr>';}}"
+            "function renderBleScanRows(d){const rows=document.getElementById('bleScanRows');const typ=n=>[n.spartan?'Hub':'',n.nus?'NUS':''].filter(Boolean).join(',')||'–';const list=Array.isArray(d.devices)?d.devices:[];const hdr=list.length?`<tr><td colspan=5 class=sub>${list.length} Geraet(e) gefunden</td></tr>`:'';rows.innerHTML=hdr+list.map(n=>`<tr><td>${n.name||'---'}</td><td>${n.mac}</td><td>${n.rssi}</td><td>${typ(n)}</td><td><a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=hub'><button>Hub</button></a> <a href='/ble/select?mac=${encodeURIComponent(n.mac)}&mode=direct'><button>123</button></a></td></tr>`).join('')||'<tr><td colspan=5>Keine Geraete</td></tr>';}"
+            "async function scanBle(){const rows=document.getElementById('bleScanRows');rows.innerHTML='<tr><td colspan=5>Scan startet...</td></tr>';try{const r=await fetchWithTimeout('/ble/scan',8000,{method:'POST'});if(!r.ok){rows.innerHTML='<tr><td colspan=5>Scan fehlgeschlagen (HTTP '+r.status+')</td></tr>';return;}const d=await r.json();if(d.error==='ble_off'){rows.innerHTML='<tr><td colspan=5>BLE aus – Setup: BLE aktivieren</td></tr>';return;}if(!d.started){rows.innerHTML='<tr><td colspan=5>BLE-Scan konnte nicht gestartet werden</td></tr>';return;}rows.innerHTML='<tr><td colspan=5>Scan laeuft (4s)...</td></tr>';const deadline=Date.now()+12000;while(Date.now()<deadline){await new Promise(res=>setTimeout(res,350));const pr=await fetchWithTimeout('/ble/scan/result',5000);if(!pr.ok)continue;const pd=await pr.json();if(pd.error==='ble_off'){rows.innerHTML='<tr><td colspan=5>BLE aus – Setup: BLE aktivieren</td></tr>';return;}if(pd.scanning)continue;renderBleScanRows(pd);return;}rows.innerHTML='<tr><td colspan=5>Timeout – Scan nicht fertig</td></tr>';}catch(e){const msg=(e&&e.name==='AbortError')?'Timeout – ESP antwortet nicht':'Scan fehlgeschlagen';rows.innerHTML='<tr><td colspan=5>'+msg+'</td></tr>';}}"
             "function syncBleSetup(d){const m=document.getElementById('bleModeLabel');if(m)m.textContent=d.ble_mode_label||'?';const m2=document.getElementById('bleModeLabel2');if(m2)m2.textContent=d.ble_mode_label||'?';const mac=document.getElementById('bleMacLabel');if(mac)mac.textContent=d.ble_target_mac||'---';const hub=document.getElementById('bleHubMacLabel');if(hub)hub.textContent=d.ble_mac_hub||'---';const dir=document.getElementById('bleDirectMacLabel');if(dir)dir.textContent=d.ble_mac_123||'---';const tz=document.getElementById('tzLabel');if(tz&&d.tz_label)tz.textContent=d.tz_label;}"
-            "async function live(){try{const r=await fetch('/api/status');const d=await r.json();document.getElementById('liveBox').textContent=JSON.stringify(d,null,2);syncDashboard(d);}catch(e){document.getElementById('liveBox').textContent='Live-Status nicht erreichbar';}}"
+            "async function live(){const box=document.getElementById('liveBox');try{const r=await fetchWithTimeout('/api/status',8000);if(!r.ok){if(box)box.textContent='HTTP '+r.status+' /api/status';return;}const d=await r.json();if(box)box.textContent=JSON.stringify(d,null,2);try{syncDashboard(d);}catch(e){}}catch(e){if(box)box.textContent='Live-Status nicht erreichbar';}}"
             "const otaForm=document.getElementById('otaForm');"
             "function otaShow(pct,msg){const bar=document.getElementById('otaBar');const st=document.getElementById('otaStatus');const box=document.getElementById('otaProgress');if(box)box.hidden=false;if(bar)bar.style.width=Math.max(0,Math.min(100,pct))+'%';if(st)st.textContent=msg||'Upload laeuft...';}"
             "if(otaForm){otaForm.addEventListener('submit',ev=>{ev.preventDefault();const fd=new FormData(otaForm);const file=fd.get('update');if(!file||!file.size)return;"
@@ -2098,35 +2374,48 @@ static String bleBuildScanJson() {
   return json;
 }
 
-static void handleWebBleScan() {
+static String bleBuildScanResultJson(bool scanning) {
+  if (scanning) {
+    return F("{\"scanning\":true,\"count\":0,\"devices\":[]}");
+  }
+  String json = F("{\"scanning\":false,");
+  json += bleBuildScanJson().substring(1);
+  return json;
+}
+
+static void handleWebBleScanStart() {
   if (webOtaRejectBusy()) return;
   if (!g_featureBle) {
-    webServer.send(409, "application/json", F("{\"devices\":[],\"error\":\"ble_off\"}"));
+    webServer.send(409, "application/json", F("{\"started\":false,\"error\":\"ble_off\"}"));
     return;
   }
-
-  const bool wifiSleepWasOn = (WiFi.getSleep() != WIFI_PS_NONE);
-  WiFi.setSleep(WIFI_PS_NONE);
-  webServer.client().setNoDelay(true);
-  webServer.client().setTimeout(30000);
-
+  auto* scanDev = NimBLEDevice::getScan();
+  if (g_bleDiscoveryScan || scanDev->isScanning()) {
+    webServer.sendHeader("Connection", "close");
+    webServer.send(200, "application/json", F("{\"started\":true,\"scanning\":true}"));
+    return;
+  }
   bleDoConnect = false;
   bleAbortDiscoveryScan();
   const bool started = bleStartDiscoveryScan();
-  auto* scanDev = NimBLEDevice::getScan();
-  const uint32_t waitUntil = millis() + BLE_DISCOVERY_SCAN_MS + 2500;
-  while (started && millis() < waitUntil) {
-    webServer.handleClient();
-    if (!g_bleDiscoveryScan && !scanDev->isScanning()) break;
-    delay(10);
-    yield();
+  bleNextScanAt = millis() + BLE_DISCOVERY_SCAN_MS + 3000;
+  if (!started) {
+    webServer.send(503, "application/json", F("{\"started\":false,\"error\":\"scan_failed\"}"));
+    return;
   }
-  if (g_bleDiscoveryScan || scanDev->isScanning()) bleAbortDiscoveryScan();
-  bleNextScanAt = millis() + 3000;
-  if (wifiSleepWasOn) WiFi.setSleep(true);
+  webServer.sendHeader("Connection", "close");
+  webServer.send(200, "application/json", F("{\"started\":true,\"scanning\":true}"));
+}
 
-  String json = started ? bleBuildScanJson() :
-                        F("{\"devices\":[],\"error\":\"scan_failed\"}");
+static void handleWebBleScanResult() {
+  if (webOtaRejectBusy()) return;
+  if (!g_featureBle) {
+    webServer.send(409, "application/json", F("{\"scanning\":false,\"devices\":[],\"error\":\"ble_off\"}"));
+    return;
+  }
+  auto* scanDev = NimBLEDevice::getScan();
+  const bool scanning = g_bleDiscoveryScan || scanDev->isScanning();
+  const String json = bleBuildScanResultJson(scanning);
   webServer.sendHeader("Connection", "close");
   webServer.send(200, "application/json", json);
 }
@@ -2156,7 +2445,7 @@ static void handleWebBleSelect() {
   saveBleConnMode(mode);
   disconnectBleForModeChange();
   bleNextScanAt = millis();
-  Serial.printf("Web: BLE Ziel -> %s (%s)\n", bleTargetDisplay(), bleConnModeLabel());
+  DLOG("Web: BLE Ziel -> %s (%s)\n", bleTargetDisplay(), bleConnModeLabel());
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -2195,7 +2484,7 @@ static void handleWebBleMac() {
   if (changed) {
     disconnectBleForModeChange();
     bleNextScanAt = millis();
-    Serial.printf("Web: BLE MAC hub=%s direct=%s\n", g_bleHubMac, g_bleTargetMac);
+    DLOG("Web: BLE MAC hub=%s direct=%s\n", g_bleHubMac, g_bleTargetMac);
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -2212,7 +2501,7 @@ static void handleWebBleMode() {
     saveBleConnMode(next);
     disconnectBleForModeChange();
     bleNextScanAt = millis();
-    Serial.printf("Web: BLE Quelle -> %s\n", bleConnModeLabel());
+    DLOG("Web: BLE Quelle -> %s\n", bleConnModeLabel());
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -2241,6 +2530,7 @@ static void handleWebScan() {
 
 static void handleWebStatus() {
   if (webOtaRejectBusy()) return;
+  webServer.client().setNoDelay(true);
   struct tm now = {};
   readClockTime(&now);
   String json;
@@ -2260,17 +2550,17 @@ static void handleWebStatus() {
   json += F("\",\"ip\":\"");
   json += jsonEscape(String(g_ipStr));
   json += F("\",\"rpm\":");
-  json += String(g_rpm, 0);
+  json += String((int)g_rpm);
   json += F(",\"adv\":");
-  json += String(g_adv, 1);
+  jsonAppendFloat(json, g_adv, 1);
   json += F(",\"map\":");
-  json += String(g_map, 0);
+  json += String((int)g_map);
   json += F(",\"lambda\":");
-  json += String(g_lambda, 3);
+  jsonAppendFloat(json, g_lambda, 3);
   json += F(",\"lambda_valid\":");
   json += g_lambdaValid ? F("true") : F("false");
   json += F(",\"volt\":");
-  json += String(g_battVolt, 2);
+  jsonAppendFloat(json, g_battVolt, 2);
   json += F(",\"volt_valid\":");
   json += g_battValid ? F("true") : F("false");
   json += F(",\"ble_enabled\":");
@@ -2282,7 +2572,7 @@ static void handleWebStatus() {
   json += F(",\"ble_mode\":\"");
   json += g_bleConnMode == BLE_MODE_SPARTAN_HUB ? F("hub") : F("direct");
   json += F("\",\"ble_mode_label\":\"");
-  json += bleConnModeLabel();
+  json += jsonEscape(String(bleConnModeLabel()));
   json += F("\",\"ble_target_mac\":\"");
   json += jsonEscape(String(bleTargetDisplay()));
   json += F("\",\"ble_mac_123\":\"");
@@ -2294,7 +2584,7 @@ static void handleWebStatus() {
   json += F("\",\"page\":");
   json += String(currentPage);
   json += F(",\"page_label\":\"");
-  json += webPageLabel(currentPage);
+  json += jsonEscape(String(webPageLabel(currentPage)));
   json += F("\",\"scale\":");
   json += String(g_dialScalePct);
   json += F(",\"rotation\":");
@@ -2306,14 +2596,16 @@ static void handleWebStatus() {
   json += F(",\"imu_present\":");
   json += g_imuPresent ? F("true") : F("false");
   json += F(",\"imu_pitch\":");
-  json += String(g_imuPitch, 1);
+  jsonAppendFloat(json, g_imuPitch, 1);
   json += F(",\"imu_roll\":");
-  json += String(g_imuRoll, 1);
+  jsonAppendFloat(json, g_imuRoll, 1);
   json += F(",\"imu_trimmed\":");
   json += g_imuTrimmed ? F("true") : F("false");
   json += F(",\"ota_boot\":\"");
   json += g_otaBootLabel;
   json += F("\"}");
+  webServer.sendHeader("Connection", "close");
+  webServer.sendHeader("Cache-Control", "no-store");
   webServer.send(200, "application/json", json);
 }
 
@@ -2350,37 +2642,37 @@ static void handleWebSet() {
   if (webServer.hasArg("scale")) {
     saveDialScale(webServer.arg("scale").toInt());
     g_redrawPage = true;
-    Serial.printf("Web: Zifferblatt-Groesse = %d%%\n", g_dialScalePct);
+    DLOG("Web: Zifferblatt-Groesse = %d%%\n", g_dialScalePct);
   }
   if (webServer.hasArg("scale_delta")) {
     saveDialScale(g_dialScalePct + webServer.arg("scale_delta").toInt());
     g_redrawPage = true;
-    Serial.printf("Web: Zifferblatt-Groesse = %d%%\n", g_dialScalePct);
+    DLOG("Web: Zifferblatt-Groesse = %d%%\n", g_dialScalePct);
   }
   if (webServer.hasArg("rot_delta")) {
     saveRotation(g_rotationDeg + webServer.arg("rot_delta").toInt());
     g_redrawPage = true;
-    Serial.printf("Web: Rotation = %d deg\n", g_rotationDeg);
+    DLOG("Web: Rotation = %d deg\n", g_rotationDeg);
   }
   if (webServer.hasArg("rot")) {
     saveRotation(webServer.arg("rot").toInt());
     g_redrawPage = true;
-    Serial.printf("Web: Rotation = %d deg\n", g_rotationDeg);
+    DLOG("Web: Rotation = %d deg\n", g_rotationDeg);
   }
   if (webServer.hasArg("dial_x_delta")) {
     saveDialOffset(g_dialCenterOffsetX + webServer.arg("dial_x_delta").toInt(), g_dialCenterOffsetY);
     g_redrawPage = true;
-    Serial.printf("Web: Zifferblatt-Offset X=%d Y=%d\n", g_dialCenterOffsetX, g_dialCenterOffsetY);
+    DLOG("Web: Zifferblatt-Offset X=%d Y=%d\n", g_dialCenterOffsetX, g_dialCenterOffsetY);
   }
   if (webServer.hasArg("dial_y_delta")) {
     saveDialOffset(g_dialCenterOffsetX, g_dialCenterOffsetY + webServer.arg("dial_y_delta").toInt());
     g_redrawPage = true;
-    Serial.printf("Web: Zifferblatt-Offset X=%d Y=%d\n", g_dialCenterOffsetX, g_dialCenterOffsetY);
+    DLOG("Web: Zifferblatt-Offset X=%d Y=%d\n", g_dialCenterOffsetX, g_dialCenterOffsetY);
   }
   if (webServer.hasArg("dial_reset")) {
     saveDialOffset(DIAL_CENTER_OFF_X_DEFAULT, DIAL_CENTER_OFF_Y_DEFAULT);
     g_redrawPage = true;
-    Serial.printf("Web: Zifferblatt-Offset reset X=%d Y=%d\n", g_dialCenterOffsetX, g_dialCenterOffsetY);
+    DLOG("Web: Zifferblatt-Offset reset X=%d Y=%d\n", g_dialCenterOffsetX, g_dialCenterOffsetY);
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -2391,7 +2683,7 @@ static void handleWebFeatures() {
   const bool ble    = webServer.hasArg("ble");
   const bool buzzer = webServer.hasArg("buzzer");
   saveFeatures(wifi, ble, buzzer);
-  Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s\n",
+  DLOG("Web: Funktionen wifi=%s ble=%s buzzer=%s\n",
                 g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off",
                 g_featureBuzzer ? "on" : "off");
   webServer.sendHeader("Location", "/");
@@ -2409,7 +2701,7 @@ static void handleWebTimezone() {
     } else {
       applyTimezone();
       requestNtpResync();
-      Serial.printf("Web: TZ resync %s\n", timezoneLabel(g_timezoneIdx));
+      DLOG("Web: TZ resync %s\n", timezoneLabel(g_timezoneIdx));
     }
     g_redrawPage = true;
   }
@@ -2424,7 +2716,7 @@ static void handleWebPage() {
     if (page > 6) page = 6;
     currentPage  = static_cast<uint8_t>(page);
     g_redrawPage = true;
-    Serial.printf("Web: page=%u\n", currentPage);
+    DLOG("Web: page=%u\n", currentPage);
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -2440,7 +2732,7 @@ static void handleWebWifi() {
     if (idx < 0) idx = 0;
     saveWifiProfile((uint8_t)idx);
     reconnectWifiProfile();
-    Serial.printf("Web: WLAN-Profil -> %d (%s)\n", idx, currentWifiSsid());
+    DLOG("Web: WLAN-Profil -> %d (%s)\n", idx, currentWifiSsid());
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -2454,7 +2746,9 @@ static void startWebServer() {
   webServer.on("/page",    handleWebPage);
   webServer.on("/wifi",    handleWebWifi);
   webServer.on("/scan",    HTTP_GET, handleWebScan);
-  webServer.on("/ble/scan", HTTP_GET, handleWebBleScan);
+  webServer.on("/ble/scan", HTTP_POST, handleWebBleScanStart);
+  webServer.on("/ble/scan", HTTP_GET, handleWebBleScanStart);
+  webServer.on("/ble/scan/result", HTTP_GET, handleWebBleScanResult);
   webServer.on("/ble/select", HTTP_GET, handleWebBleSelect);
   webServer.on("/ble/mac", HTTP_GET, handleWebBleMac);
   webServer.on("/ble/mode", HTTP_GET, handleWebBleMode);
@@ -2512,13 +2806,15 @@ static void manageWifiAp() {
 }
 
 static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
-  Serial.printf("setup long-press y=%u dur=%lu\n", y, (unsigned long)durMs);
+#if FEATURE_VERBOSE_SERIAL
+  Serial.printf("[TOUCH] setup y=%u dur=%lums rot=%d\n", y, (unsigned long)durMs, g_rotationDeg);
+#endif
 
   // Zonen passend zu drawSetupPage (Zeilen-Mitte = Zonenstart + 18, Hoehe 36)
   if (y >= 380) {                       // unten -> zurueck ins Menue
     currentPage = 1;
     drawMenuOverview();
-    Serial.println("setup tap: menu");
+    DLOGN("setup tap: menu");
     return;
   }
 
@@ -2526,39 +2822,39 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     int next = (g_dialScalePct < 115) ? 115 : (g_dialScalePct < 120 ? 120 : 115);
     saveDialScale(next);
     drawSetupPage();
-    Serial.printf("setup tap: dial=%d%%\n", g_dialScalePct);
+    DLOG("setup tap: dial=%d%%\n", g_dialScalePct);
   } else if (y >= 128 && y < 164) {     // HELL (Zeile 146)
     int next = (g_brightnessPct < 63) ? 75 : (g_brightnessPct < 88 ? 100 : 50);
     saveBrightness(next);
     drawSetupPage();
-    Serial.printf("setup tap: brightness=%d%%\n", g_brightnessPct);
+    DLOG("setup tap: brightness=%d%%\n", g_brightnessPct);
   } else if (y >= 164 && y < 200) {     // ROT (Zeile 182)
     int next = (g_rotationDeg < 90) ? 90 : (g_rotationDeg < 180 ? 180 : (g_rotationDeg < 270 ? 270 : 0));
     saveRotation(next);
     drawSetupPage();
-    Serial.printf("setup tap: rotation=%d deg\n", g_rotationDeg);
+    DLOG("[ROT] setup tap -> %d deg\n", g_rotationDeg);
   } else if (y >= 200 && y < 236) {     // WIFI (Zeile 218)
     cycleWifiProfile();
     drawSetupPage();
-    Serial.printf("setup tap: wifi profile=%u ssid=%s\n", g_wifiProfile, currentWifiSsid());
+    DLOG("setup tap: wifi profile=%u ssid=%s\n", g_wifiProfile, currentWifiSsid());
   } else if (y >= 236 && y < 272) {     // BLE (Zeile 254)
     saveFeatures(g_featureWifi, !g_featureBle, g_featureBuzzer);
     drawSetupPage();
-    Serial.printf("setup tap: ble=%s\n", g_featureBle ? "on" : "off");
+    DLOG("setup tap: ble=%s\n", g_featureBle ? "on" : "off");
   } else if (y >= 272 && y < 308) {     // BUZZER (Zeile 290)
     saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
     drawSetupPage();
-    Serial.printf("setup tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
+    DLOG("setup tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
   } else if (y >= 308 && y < 344) {     // QUELLE (Zeile 326)
     cycleBleConnMode();
     drawSetupPage();
-    Serial.printf("setup tap: ble_source=%s\n", bleConnModeLabel());
+    DLOG("setup tap: ble_source=%s\n", bleConnModeLabel());
   } else if (y >= 344 && y < 380) {     // IMU NULL (Zeile 362)
     if (calibrateImuZero()) drawSetupPage();
-    Serial.println("setup tap: imu_null");
+    DLOGN("setup tap: imu_null");
   } else {
     drawSetupPage();
-    Serial.println("setup tap: no action");
+    DLOGN("setup tap: no action");
   }
 }
 
@@ -2632,6 +2928,9 @@ void setup() {
 
   Serial.println("Display: HAL init...");
   hal_init();
+#if FEATURE_TACHO_DIMMER
+  hal_tacho_dimmer_init();
+#endif
   otaValidatePendingBoot();
   gt911Init();
 
@@ -2646,13 +2945,9 @@ void setup() {
 
   initTimeSource();
   hal_backlight(true);
-  if (g_dialScalePct != 100 || g_rotationDeg != 0 || g_dialCenterOffsetX != 0 || g_dialCenterOffsetY != 0) {
-    int pct = g_dialScalePct;
-    if (pct < DIAL_SCALE_MIN) pct = DIAL_SCALE_MIN;
-    if (pct > DIAL_SCALE_MAX) pct = DIAL_SCALE_MAX;
-    rebuildDialCache(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY);
-    Serial.printf("Dial cache: %s (%d%%, rot=%d)\n", g_dialCache ? "ready" : "fallback", pct, g_rotationDeg);
-  }
+  finishDialCacheRebuildBlocking();
+  Serial.printf("Dial cache: %s (%d%%, rot=%d)\n",
+                g_dialCache ? "ready" : "fallback", g_dialScalePct, g_rotationDeg);
   drawVdoClock();
   otaConfirmBootIfPending();
   Serial.println("VDO clock drawn.");
@@ -2668,6 +2963,7 @@ void loop() {
   static uint32_t touchLastSeenMs = 0;
   static uint16_t touchStartX = 0, touchStartY = 0;
   static uint16_t touchLastX = 0, touchLastY = 0;
+  static bool     touchHadPos = false;
   uint16_t x = 0, y = 0;
 
   if (g_otaBusy) {
@@ -2694,10 +2990,12 @@ void loop() {
       touchLastSeenMs = nowMs;
       touchLastX = x;
       touchLastY = y;
+      touchHadPos = true;
     }
     if (!touchActive) {
       touchActive = true;
       touchLongHandled = false;
+      touchHadPos = touchFrame;
       touchStartMs = nowMs;
       touchStartX = x;
       touchStartY = y;
@@ -2709,40 +3007,51 @@ void loop() {
       lastTouch = nowMs;
       handleSetupLongPress(touchLastY, nowMs - touchStartMs);
     }
-  } else if (touchActive && nowMs - touchLastSeenMs > (currentPage == 5 ? 700UL : 180UL)) {
+  } else if (touchActive && nowMs - touchLastSeenMs > (currentPage == 5 ? 700UL : TOUCH_RELEASE_MS)) {
     const uint32_t durMs = touchLastSeenMs - touchStartMs;
-    const uint16_t tapX = touchLastX ? touchLastX : touchStartX;
-    const uint16_t tapY = touchLastY ? touchLastY : touchStartY;
+    const uint16_t tapX = touchHadPos ? touchLastX : touchStartX;
+    const uint16_t tapY = touchHadPos ? touchLastY : touchStartY;
     touchActive = false;
-    if (!touchLongHandled && durMs < 600 && nowMs - lastTouch > 350) {
+    touchHadPos = false;
+    if (!touchLongHandled && durMs < 600 && nowMs - lastTouch > TOUCH_COOLDOWN_MS) {
       lastTouch = nowMs;
-      Serial.printf("touch x=%u y=%u page=%u dur=%lu\n", tapX, tapY, currentPage, (unsigned long)durMs);
       if (currentPage == 0) {
         currentPage = 1;
         drawMenuOverview();
-        Serial.println("page: menu");
+#if FEATURE_VERBOSE_SERIAL
+        Serial.printf("[TOUCH] tap log=%u,%u page=0 dur=%lums rot=%d\n",
+                      tapX, tapY, (unsigned long)durMs, g_rotationDeg);
+        Serial.println("[TOUCH] hit=clock->menu page=1");
+#endif
       } else if (currentPage == 1) {
         // Route by y-position: zones match MENU_ZONE_Y0 / MENU_ZONE_H exactly.
         const uint16_t z0 = MENU_ZONE_Y0;
         const uint16_t zh = MENU_ZONE_H;
-        if      (tapY >= z0       && tapY < z0 +   zh) { currentPage = 0; drawVdoClock();   Serial.println("page: clock"); }
-        else if (tapY >= z0 +  zh && tapY < z0 + 2*zh) { currentPage = 2; drawMotorPage();  Serial.println("page: motor"); }
-        else if (tapY >= z0 +2*zh && tapY < z0 + 3*zh) { currentPage = 3; drawLambdaPage(); Serial.println("page: lambda"); }
-        else if (tapY >= z0 +3*zh && tapY < z0 + 4*zh) { currentPage = 4; drawHubPage();    Serial.println("page: hub"); }
-        else if (tapY >= z0 +4*zh && tapY < z0 + 5*zh) { currentPage = 6; drawImuPage();    Serial.println("page: imu"); }
-        else if (tapY >= z0 +5*zh && tapY < z0 + 6*zh) { currentPage = 5; drawSetupPage();  Serial.println("page: setup"); }
-        else { currentPage = 0; drawVdoClock(); Serial.println("page: clock fallback"); }
+        const char *hit = "fallback";
+        if      (tapY >= z0       && tapY < z0 +   zh) { currentPage = 0; drawVdoClock();   hit = "UHR"; }
+        else if (tapY >= z0 +  zh && tapY < z0 + 2*zh) { currentPage = 2; drawMotorPage();  hit = "MOTOR"; }
+        else if (tapY >= z0 +2*zh && tapY < z0 + 3*zh) { currentPage = 3; drawLambdaPage(); hit = "LAMBDA"; }
+        else if (tapY >= z0 +3*zh && tapY < z0 + 4*zh) { currentPage = 4; drawHubPage();    hit = "HUB"; }
+        else if (tapY >= z0 +4*zh && tapY < z0 + 5*zh) { currentPage = 6; drawImuPage();    hit = "IMU"; }
+        else if (tapY >= z0 +5*zh && tapY < z0 + 6*zh) { currentPage = 5; drawSetupPage();  hit = "SETUP"; }
+        else { currentPage = 0; drawVdoClock(); }
+#if FEATURE_VERBOSE_SERIAL
+        Serial.printf("[TOUCH] tap log=%u,%u page=1 dur=%lums rot=%d\n",
+                      tapX, tapY, (unsigned long)durMs, g_rotationDeg);
+        Serial.printf("[TOUCH] hit=menu:%s page=%u y=%u zone=%u..%u\n",
+                      hit, currentPage, tapY, z0, z0 + 6 * zh);
+#endif
       } else if (currentPage == 5) {
-        // SETUP: kurzer Tap auf eine Zeile aendert die jeweilige Einstellung
-        // (Zifferblatt/Helligkeit/Rotation/WLAN/BLE/Buzzer). Tap unten = Menue.
         handleSetupLongPress(tapY, durMs);
       } else {
-        // Data pages (Motor/Lambda/Hub/IMU): Tap -> naechste, dann zurueck zur Uhr.
-        if      (currentPage == 4) currentPage = 6;  // Hub -> IMU
-        else if (currentPage == 6) currentPage = 0;  // IMU -> Uhr
-        else currentPage++;                          // Motor->Lambda->Hub
+        const uint8_t prev = currentPage;
+        if      (currentPage == 4) currentPage = 6;
+        else if (currentPage == 6) currentPage = 0;
+        else currentPage++;
         drawCurrentPage();
-        Serial.printf("page: next %u\n", currentPage);
+#if FEATURE_VERBOSE_SERIAL
+        Serial.printf("[TOUCH] hit=page_next %u->%u\n", prev, currentPage);
+#endif
       }
     }
   }
@@ -2778,11 +3087,29 @@ void loop() {
     }
   }
 
+#if FEATURE_TACHO_DIMMER
+  {
+    static uint32_t dimmerLogMs = 0;
+    const uint32_t now = millis();
+    if (now - dimmerLogMs >= 2000) {
+      dimmerLogMs = now;
+      const int raw = hal_tacho_dimmer_read_raw();
+      const int pct = hal_tacho_dimmer_read_pct();
+      Serial.printf("[DIMMER] raw=%d pct=%d\n", raw, pct);
+    }
+  }
+#endif
+
   // Fallback-Setup-AP verwalten (nur AN wenn keine STA-Verbindung)
   manageWifiAp();
 
-  // Web server
-  if (g_webStarted) webServer.handleClient();
+  // Web server (extra polls while BLE discovery scan runs in background)
+  if (g_webStarted) {
+    const uint8_t webPolls = g_bleDiscoveryScan ? 8 : 1;
+    for (uint8_t n = 0; n < webPolls; n++) webServer.handleClient();
+  }
+
+  tickDialCacheRebuild();
 
   // WiFi/NTP background tick; redraw clock on fresh sync
   if (wifiNtpTick() && currentPage == 0) drawVdoClock();
@@ -2796,10 +3123,18 @@ void loop() {
     drawCurrentPage();
   }
 
-  // Clock: update every second (same readClockTime/SNTP path as /api/status)
-  if (currentPage == 0 && millis() - lastDraw >= 1000) {
-    lastDraw = millis();
-    drawVdoClock();
+  // Clock: redraw when wall-clock time changes (hour/min/sec; NTP correction safe)
+  if (currentPage == 0 && millis() - lastDraw >= 250) {
+    struct tm now = {};
+    if (readClockTime(&now)) {
+      if (!g_lastClockDrawTmValid
+          || now.tm_hour != g_lastClockDrawTm.tm_hour
+          || now.tm_min != g_lastClockDrawTm.tm_min
+          || now.tm_sec != g_lastClockDrawTm.tm_sec) {
+        lastDraw = millis();
+        drawVdoClock();
+      }
+    }
   }
   // Data pages: update at 2 Hz
   if (currentPage >= 2 && currentPage <= 5 && millis() - lastDraw >= 500) {
@@ -2813,5 +3148,6 @@ void loop() {
     drawCurrentPage();
   }
 
-  delay(10);
+  webServerPoll(8);
+  delay(1);
 }
