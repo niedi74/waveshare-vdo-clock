@@ -32,6 +32,10 @@ runden Touch-Display im Cockpit. Holt optional Live-Daten vom **Spartan3-Hub**
 2. **Gateway-Modus** (optional): verbindet zu `Spartan3-Hub`, zeigt Live-Daten
    (Lambda, RPM, Speed, Batterie) — gleiches BLE-Payload wie der M5 Dial
 
+## WLAN-Profile
+
+Siehe **[docs/WLAN-MATRIX.md](docs/WLAN-MATRIX.md)** — Kurzübersicht für Home / Phone / Bus auf M5 und 2.8″.
+
 ## Zeit-Synchronisation
 
 Priorität (bis RTC-Batterien auf Hub und Display):
