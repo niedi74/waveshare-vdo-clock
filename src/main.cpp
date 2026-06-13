@@ -188,6 +188,7 @@ static bool               g_bleStackReady = false;
 enum DataPath : uint8_t { DATA_PATH_WIFI_HUB = 0, DATA_PATH_BLE = 1 };
 #define HUB_WIFI_DEFAULT_HOST "192.168.0.87"
 #define HUB_BUS_HOST          "192.168.4.1"
+#define HUB_BUS_CLIENT_IP     "192.168.4.3"   // M5 Dial uses .2 on Spartan3-Setup
 #define HUB_WIFI_POLL_MS      300
 #define HUB_WIFI_TIMEOUT_MS   1200
 #define DATA_FRESH_MS         3000
@@ -498,6 +499,20 @@ static void syncHubHostForWifi() {
   if (isOnBusWifi() && g_featureBle) saveFeatures(g_featureWifi, false, g_featureBuzzer);
 }
 
+static void applyWifiIpConfig() {
+  if (isBusWifiSsid(currentWifiSsid())) {
+    IPAddress ip, gw, mask, dns;
+    ip.fromString(HUB_BUS_CLIENT_IP);
+    gw.fromString(HUB_BUS_HOST);
+    mask.fromString("255.255.255.0");
+    dns.fromString(HUB_BUS_HOST);
+    WiFi.config(ip, gw, mask, dns);
+    Serial.printf("WiFi: Bus static %s (hub %s)\n", HUB_BUS_CLIENT_IP, HUB_BUS_HOST);
+  } else {
+    WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+  }
+}
+
 static void applyBusProfile(bool reconnect) {
   const uint8_t idx = hubWifiProfileIndex();
   if (idx == 0xFF) {
@@ -510,7 +525,8 @@ static void applyBusProfile(bool reconnect) {
   saveHubHost(HUB_BUS_HOST);
   if (g_featureBle) disconnectBleForModeChange();
   saveFeatures(true, false, g_featureBuzzer);
-  Serial.println("Bus: Spartan3-Setup + hub 192.168.4.1 + WiFi (BLE aus)");
+  Serial.printf("Bus: Spartan3-Setup + hub %s + client %s + WiFi (BLE aus)\n",
+                HUB_BUS_HOST, HUB_BUS_CLIENT_IP);
   if (reconnect) reconnectWifiProfile();
   g_redrawPage = true;
 }
@@ -534,7 +550,7 @@ struct TimezoneEntry {
 };
 
 static const TimezoneEntry TIMEZONES[] = {
-  { "Europe/Berlin (CET/CEST)", "CET-1CEST,M3.5.0,M10.5.0/3" },
+  { "Europe/Berlin (CET/CEST)", "CET-1CEST,M3.5.0/2,M10.5.0/3" },
   { "UTC",                      "UTC0" },
   { "Europe/London (GMT/BST)",  "GMT0BST,M3.5.0/1,M10.5.0" },
   { "America/New_York (EST/EDT)","EST5EDT,M3.2.0,M11.1.0" },
@@ -548,9 +564,12 @@ static const uint8_t TIMEZONE_DEFAULT = 0;  // Europe/Berlin
 static uint8_t  g_timezoneIdx      = TIMEZONE_DEFAULT;
 static bool     g_sntpStarted      = false;
 static bool     g_ntpSynced        = false;
+static bool     g_hubTimeSynced    = false;
 static bool     g_ntpResyncRequested = false;
 static uint32_t g_lastRtcSyncMs    = 0;
+static uint32_t g_lastHubEpochSyncMs = 0;
 static constexpr uint32_t NTP_RESYNC_INTERVAL_MS = 15UL * 60UL * 1000UL;  // 15 min (ESP default: 1 h)
+static constexpr uint32_t HUB_TIME_RESYNC_MS    = 60UL * 1000UL;
 static uint8_t timezoneCount() { return TIMEZONE_COUNT; }
 
 static const char* timezoneLabel(uint8_t idx) {
@@ -683,6 +702,7 @@ static bool syncRtcFromNtp(const struct tm *ntpLocal, bool force) {
 }
 
 static const char* clockSourceLabel() {
+  if (g_hubTimeSynced && g_hubWifiOk) return "HUB";
   if (g_ntpSynced) return "SNTP";
   time_t t = time(nullptr);
   if (t > 1700000000) return "SYS";
@@ -734,6 +754,7 @@ static bool wifiNtpTick() {
     if (failSince == 0) failSince = millis();
     if (millis() - lastTry > 30000) {
       lastTry = millis();
+      applyWifiIpConfig();
       WiFi.begin(currentWifiSsid(), currentWifiPassword());  // kein disconnect() davor
       Serial.printf("WiFi: Reconnect-Versuch zu '%s'\n", currentWifiSsid());
     }
@@ -758,6 +779,10 @@ static bool wifiNtpTick() {
     applyTimezone();
     g_sntpStarted = true;
     Serial.printf("NTP: SNTP gestartet (TZ %s)\n", timezoneLabel(g_timezoneIdx));
+  }
+  if (g_hubTimeSynced && g_hubWifiOk &&
+      (millis() - g_hubLastOkMs) < (HUB_TIME_RESYNC_MS + 5000)) {
+    return false;
   }
   time_t t = time(nullptr);
   if (t > 1700000000) {
@@ -866,6 +891,36 @@ static bool jsonExtractString(const String& json, const char* key, char* out, si
   return true;
 }
 
+static bool maybeSyncClockFromHubJson(const String& json) {
+  bool hubNtp = false;
+  if (!jsonExtractBool(json, "ntp_synced", &hubNtp) || !hubNtp) return false;
+  unsigned long epoch = 0;
+  if (!jsonExtractULong(json, "time_epoch", &epoch) || epoch < 1700000000UL) return false;
+
+  const uint32_t nowMs = millis();
+  const time_t cur = time(nullptr);
+  const long drift = (cur > 1700000000) ? labs((long)epoch - (long)cur) : 999;
+  if (g_hubTimeSynced && drift < 2 &&
+      (nowMs - g_lastHubEpochSyncMs) < HUB_TIME_RESYNC_MS) {
+    return true;
+  }
+
+  struct timeval tv = {};
+  tv.tv_sec = (time_t)epoch;
+  settimeofday(&tv, nullptr);
+  struct tm local = {};
+  const time_t epochT = (time_t)epoch;
+  localtime_r(&epochT, &local);
+  syncRtcFromNtp(&local, drift >= 2 || !g_hubTimeSynced);
+  g_hubTimeSynced = true;
+  g_ntpSynced = true;
+  g_lastHubEpochSyncMs = nowMs;
+  Serial.printf("Hub -> clock: epoch %lu (%02d:%02d:%02d TZ %s)\n",
+                epoch, local.tm_hour, local.tm_min, local.tm_sec,
+                timezoneLabel(g_timezoneIdx));
+  return true;
+}
+
 static bool parseHubStatusJson(const String& json) {
   bool valid = false;
   const bool hasValid = jsonExtractBool(json, "valid", &valid);
@@ -905,6 +960,7 @@ static bool parseHubStatusJson(const String& json) {
     g_speedValid = false;
   }
   jsonExtractString(json, "source", g_hubSourceTag, sizeof(g_hubSourceTag));
+  maybeSyncClockFromHubJson(json);
   touchLiveRx();
   return true;
 }
@@ -941,6 +997,7 @@ static void hubWifiPollTick() {
 
   if (WiFi.status() != WL_CONNECTED) {
     g_hubWifiOk = false;
+    g_hubTimeSynced = false;
     strncpy(g_hubState, "no_wifi", sizeof(g_hubState));
     g_hubState[sizeof(g_hubState) - 1] = 0;
     return;
@@ -3500,7 +3557,7 @@ static void handleWebRoot() {
     html += ">" + String(WIFI_PROFILES[i].ssid) + "</button></a>";
   }
   html += F("</div><button onclick='scanWifi()'>&#128269; Scan</button><table><thead><tr><th>SSID</th><th>RSSI</th><th>Status</th><th></th></tr></thead><tbody id='scanRows'><tr><td colspan='4'>Noch kein Scan</td></tr></tbody></table><p class='sub'>Scan-Zeile antippen oder Profil oben w&auml;hlen. Spartan3-Setup = Hub-AP @ 192.168.4.1</p></div>"
-            "<div class='card'><h3>Bus (unterwegs)</h3><p class='sub'>Ein Tipp: Spartan3-Setup + Hub @ 192.168.4.1 + WiFi-Daten (kein BLE).</p><div class='row'><a href='/wifi?mode=bus'><button");
+            "<div class='card'><h3>Bus (unterwegs)</h3><p class='sub'>Ein Tipp: Spartan3-Setup + Hub @ 192.168.4.1 + Display @ 192.168.4.3 (M5 @ .2) + WiFi-Daten (kein BLE).</p><div class='row'><a href='/wifi?mode=bus'><button");
   if (isOnBusWifi() && g_dataPath == DATA_PATH_WIFI_HUB && !g_featureBle) html += F(" style='background:#54d273'");
   html += F(">BUS / Spartan3-Setup</button></a></div></div>"
             "<div class='card'><h3>Netzwerk-Modus</h3><p class='sub'>Home = Heimrouter/LAN &middot; AP = VDO-Clock-Setup / vdoclock @ 192.168.4.1 &middot; Hub = Spartan3-Setup / lambda123 @ 192.168.4.1</p><div class='row'>");
@@ -4493,6 +4550,7 @@ static void reconnectWifiProfile() {
   stopApOnlyMode();
   strcpy(g_ipStr, "...");
   WiFi.mode(WIFI_STA);
+  applyWifiIpConfig();
   WiFi.begin(currentWifiSsid(), currentWifiPassword());
   Serial.printf("WiFi: Profil %u -> '%s'\n", g_wifiProfile, currentWifiSsid());
 }
@@ -4549,6 +4607,7 @@ void setup() {
     WiFi.persistent(false);  // keine WiFi-Flash-Schreibzugriffe -> kein Cache-Disable
     WiFi.setSleep(true);     // Modem-Sleep: weniger PSRAM-Bus-Konkurrenz
     WiFi.mode(WIFI_STA);
+    applyWifiIpConfig();
     WiFi.begin(currentWifiSsid(), currentWifiPassword());
     Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", currentWifiSsid());
   }
