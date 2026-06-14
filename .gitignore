@@ -2,6 +2,17 @@
 .vscode/
 *.bin
 *.elf
+*.log
+*.err
+build*.txt
+build_*.txt
+flash*.txt
+upload*.txt
+*_capture*.txt
+*_com*.txt
+debug_web_*.html
+debug_web_*.png
+_patch_*.py
 
 # Lokale WiFi-Zugangsdaten
 src/wifi_secret.h

@@ -218,6 +218,7 @@ static uint32_t  g_liveRxCnt      = 0;
 
 #if ENABLE_ESP_NOW_CLIENT
 static bool      g_espNowReady    = false;
+static uint8_t   g_espNowActiveChannel = 0;
 static uint32_t  g_espNowRx       = 0;
 static uint16_t  g_espNowSeq      = 0;
 static uint32_t  g_espNowLastRxMs = 0;
@@ -289,6 +290,8 @@ static int       g_logLastRotDeg  = -1;
 static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
+static bool      g_featureEspNow = true;
+static uint8_t   g_espNowChannelPref = 0;  // 0=auto (WiFi), sonst 1..14
 static bool      g_wifiApOnly   = false;   // Standalone AP (VDO-Clock-Setup), kein Home-STA
 static bool      g_apOn         = false;
 static bool      g_webStarted   = false;
@@ -304,12 +307,17 @@ static void reconnectWifiProfile();
 static void applyBusProfile(bool reconnect);
 static void syncHubHostForWifi();
 static void disconnectBleForModeChange();
+static void saveBleConnMode(BleConnMode mode);
 static void saveDataPath(DataPath path);
 static void saveHubHost(const char* host);
 static void saveFeatures(bool wifi, bool ble, bool buzzer);
 static void saveWifiProfile(uint8_t idx);
 static void cycleWifiProfile();
 static void enterApOnlyMode();
+#if ENABLE_ESP_NOW_CLIENT
+static void saveEspNowFeature(bool enabled);
+static const char* espNowChannelLabel();
+#endif
 static void stopApOnlyMode();
 static void cycleWifiNetworkMode();
 static void cycleSourceMode();
@@ -517,8 +525,6 @@ static void syncHubHostForWifi() {
       if (strcmp(g_hubHost, buf) != 0) saveHubHost(buf);
     }
   }
-  if (g_dataPath != DATA_PATH_WIFI_HUB) saveDataPath(DATA_PATH_WIFI_HUB);
-  if (isOnBusWifi() && g_featureBle) saveFeatures(g_featureWifi, false, g_featureBuzzer);
 }
 
 static void applyWifiIpConfig() {
@@ -543,14 +549,20 @@ static void applyBusProfile(bool reconnect) {
   }
   stopApOnlyMode();
   saveWifiProfile(idx);
-  saveDataPath(DATA_PATH_WIFI_HUB);
+  saveDataPath(DATA_PATH_BLE);
   saveHubHost(HUB_BUS_HOST);
-  if (g_featureBle) disconnectBleForModeChange();
-  saveFeatures(true, false, g_featureBuzzer);
-  Serial.printf("Bus: Spartan3-Setup + hub %s + client %s + WiFi (BLE aus)\n",
+  if (g_bleConnMode != BLE_MODE_DIRECT_123) {
+    saveBleConnMode(BLE_MODE_DIRECT_123);
+    disconnectBleForModeChange();
+  }
+  saveFeatures(true, true, g_featureBuzzer);
+#if ENABLE_ESP_NOW_CLIENT
+  saveEspNowFeature(true);
+#endif
+  Serial.printf("Bus: Spartan3-Setup + hub %s + client %s + BLE 123 direkt\n",
                 HUB_BUS_HOST, HUB_BUS_CLIENT_IP);
 #if ENABLE_ESP_NOW_CLIENT
-  Serial.printf("Bus: ESP-NOW recv on channel %d (HTTP poll fallback)\n", ESP_NOW_WIFI_CHANNEL);
+  Serial.printf("Bus: ESP-NOW recv %s (HTTP nur Fallback/Status)\n", espNowChannelLabel());
 #endif
   if (reconnect) reconnectWifiProfile();
   g_redrawPage = true;
@@ -841,7 +853,62 @@ static void touchLiveRx();
 
 #if ENABLE_ESP_NOW_CLIENT
 static bool espNowClientActive() {
-  return isOnBusWifi() && g_dataPath == DATA_PATH_WIFI_HUB && g_featureWifi;
+  return g_featureEspNow;
+}
+
+static uint8_t espNowEffectiveChannel() {
+  if (WiFi.status() == WL_CONNECTED) {
+    const uint8_t ch = WiFi.channel();
+    if (ch > 0 && ch <= 14 && g_espNowChannelPref == 0) return ch;
+  }
+  if (g_espNowChannelPref >= 1 && g_espNowChannelPref <= 14) {
+    return g_espNowChannelPref;
+  }
+  return ESP_NOW_WIFI_CHANNEL;
+}
+
+static void teardownEspNowClient() {
+  if (!g_espNowReady) return;
+  esp_now_deinit();
+  g_espNowReady = false;
+  g_espNowActiveChannel = 0;
+  g_espNowLastRxMs = 0;
+}
+
+static const char* espNowChannelLabel() {
+  static char buf[12];
+  if (!g_featureEspNow) return "AUS";
+  if (g_espNowChannelPref >= 1 && g_espNowChannelPref <= 14) {
+    snprintf(buf, sizeof(buf), "%u", g_espNowChannelPref);
+    return buf;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(buf, sizeof(buf), "A%u", WiFi.channel());
+    return buf;
+  }
+  return "AUTO";
+}
+
+static void cycleEspNowChannelPref() {
+  if (g_espNowChannelPref == 0) g_espNowChannelPref = 6;
+  else if (g_espNowChannelPref == 6) g_espNowChannelPref = 11;
+  else g_espNowChannelPref = 0;
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("espnow_ch", g_espNowChannelPref);
+  p.end();
+  teardownEspNowClient();
+  Serial.printf("ESP-NOW: Kanal -> %s\n", espNowChannelLabel());
+}
+
+static void saveEspNowFeature(bool enabled) {
+  g_featureEspNow = enabled;
+  Preferences p;
+  p.begin("clock", false);
+  p.putBool("feat_espnow", enabled);
+  p.end();
+  if (!enabled) teardownEspNowClient();
+  else Serial.println("ESP-NOW: AN");
 }
 
 static bool espNowDataFresh() {
@@ -854,12 +921,12 @@ static void applyEspNowFrame(const SpartanCockpitFrame& frame) {
   if (lambdaValid && frame.lambda_x1000 > 0) {
     g_lambda = frame.lambda_x1000 / 1000.0f;
     g_lambdaValid = true;
-  } else {
-    g_lambdaValid = false;
   }
-  g_rpm = frame.rpm;
-  g_adv = frame.advance_x10 / 10.0f;
-  g_map = frame.map;
+  if ((frame.flags & kSpartanFlagTuneFresh) != 0) {
+    g_rpm = frame.rpm;
+    g_adv = frame.advance_x10 / 10.0f;
+    g_map = frame.map;
+  }
   g_espNowLastRxMs = millis();
   strncpy(g_hubSourceTag, "espnow", sizeof(g_hubSourceTag));
   g_hubSourceTag[sizeof(g_hubSourceTag) - 1] = 0;
@@ -893,28 +960,37 @@ static void espNowClientProcessPending() {
 }
 
 static void setupEspNowClient() {
-  if (g_espNowReady || !espNowClientActive()) return;
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (!espNowClientActive()) return;
+  if (WiFi.getMode() == WIFI_OFF) {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+  }
+  const uint8_t channel = espNowEffectiveChannel();
+  if (g_espNowReady && g_espNowActiveChannel == channel) return;
+  if (g_espNowReady) teardownEspNowClient();
 
-  esp_wifi_set_channel(ESP_NOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  if (WiFi.status() != WL_CONNECTED) {
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  }
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW: init failed");
     return;
   }
   esp_now_register_recv_cb(onEspNowRecv);
   g_espNowReady = true;
-  Serial.printf("ESP-NOW: recv ready on channel %d\n", ESP_NOW_WIFI_CHANNEL);
+  g_espNowActiveChannel = channel;
+  Serial.printf("ESP-NOW: recv ready on channel %u\n", channel);
 }
 
 static void espNowClientTick() {
   espNowClientProcessPending();
   if (!espNowClientActive()) {
-    if (g_espNowReady) {
-      esp_now_deinit();
-      g_espNowReady = false;
-      g_espNowLastRxMs = 0;
-    }
+    teardownEspNowClient();
     return;
+  }
+  const uint8_t channel = espNowEffectiveChannel();
+  if (g_espNowReady && g_espNowActiveChannel != channel) {
+    teardownEspNowClient();
   }
   setupEspNowClient();
 }
@@ -3072,14 +3148,24 @@ static void drawSetupPage() {
   }
   drawDataRow(254, "BLE",    g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
               g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawDataRow(290, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
+  {
+    char ebuf[20];
+    if (!g_featureEspNow) snprintf(ebuf, sizeof(ebuf), "AUS");
+    else if (espNowDataFresh()) snprintf(ebuf, sizeof(ebuf), "OK rx%lu", (unsigned long)g_espNowRx);
+    else snprintf(ebuf, sizeof(ebuf), "AN %s", espNowChannelLabel());
+    drawDataRow(290, "ESPNOW", ebuf,
+                g_featureEspNow && espNowDataFresh() ? RGB565(60, 210, 100) :
+                (g_featureEspNow ? RGB565(220, 180, 60) : RGB565(150, 150, 150)));
+  }
+  drawDataRow(326, "ESPN CH", espNowChannelLabel(), RGB565(120, 180, 240));
+  drawDataRow(362, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
               g_featureBuzzer ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
-  drawDataRow(326, "QUELLE", sourceModeLabel(),
+  drawDataRow(398, "QUELLE", sourceModeLabel(),
               g_dataPath == DATA_PATH_WIFI_HUB ? RGB565(80, 160, 240) :
               (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? RGB565(120, 200, 120) : RGB565(235, 150, 60)));
-  drawDataRow(362, "IMU NULL", g_imuTrimmed ? "SET" : "TAP",
+  drawDataRow(434, "IMU NULL", g_imuTrimmed ? "SET" : "TAP",
               g_imuTrimmed ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawTextCentered(240, 396, "TIP MENU", RGB565(180, 180, 170), 2);
+  drawTextCentered(240, 468, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
 
@@ -3151,6 +3237,8 @@ static void loadSettings() {
   g_featureWifi   = p.getBool("feat_wifi", strlen(currentWifiSsid()) > 0);
   g_featureBle    = p.getBool("feat_ble",  false);
   g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
+  g_featureEspNow = p.getBool("feat_espnow", true);
+  g_espNowChannelPref = p.getUChar("espnow_ch", 0);
   g_bleConnMode   = p.getUChar("ble_mode", BLE_MODE_SPARTAN_HUB) == BLE_MODE_DIRECT_123 ?
                     BLE_MODE_DIRECT_123 : BLE_MODE_SPARTAN_HUB;
   String mac123 = p.getString("ble_mac_123", "");
@@ -3694,8 +3782,8 @@ static void handleWebRoot() {
     html += ">" + String(WIFI_PROFILES[i].ssid) + "</button></a>";
   }
   html += F("</div><button onclick='scanWifi()'>&#128269; Scan</button><table><thead><tr><th>SSID</th><th>RSSI</th><th>Status</th><th></th></tr></thead><tbody id='scanRows'><tr><td colspan='4'>Noch kein Scan</td></tr></tbody></table><p class='sub'>Scan-Zeile antippen oder Profil oben w&auml;hlen. Spartan3-Setup = Hub-AP @ 192.168.4.1</p></div>"
-            "<div class='card'><h3>Bus (unterwegs)</h3><p class='sub'>Ein Tipp: Spartan3-Setup + Hub @ 192.168.4.1 + Display @ 192.168.4.3 (M5 @ .2) + WiFi-Daten (kein BLE).</p><div class='row'><a href='/wifi?mode=bus'><button");
-  if (isOnBusWifi() && g_dataPath == DATA_PATH_WIFI_HUB && !g_featureBle) html += F(" style='background:#54d273'");
+            "<div class='card'><h3>Bus (unterwegs)</h3><p class='sub'>Fahrtprofil: BLE direkt zum 123, ESP-NOW Lambda vom Hub, HTTP nur Status/Zeit. Display @ 192.168.4.3 (M5 @ .2).</p><div class='row'><a href='/wifi?mode=bus'><button");
+  if (isOnBusWifi() && g_dataPath == DATA_PATH_BLE && g_bleConnMode == BLE_MODE_DIRECT_123 && g_featureEspNow) html += F(" style='background:#54d273'");
   html += F(">BUS / Spartan3-Setup</button></a></div></div>"
             "<div class='card'><h3>Netzwerk-Modus</h3><p class='sub'>Home = Heimrouter/LAN &middot; AP = VDO-Clock-Setup / vdoclock @ 192.168.4.1 &middot; Hub = Spartan3-Setup / lambda123 @ 192.168.4.1</p><div class='row'>");
   html += F("<a href='/wifi?mode=home'><button");
@@ -3746,7 +3834,15 @@ static void handleWebRoot() {
   html += g_featureBle ? F("checked") : F("");
   html += F("> BLE Daten aktiv</label></p><p><label><input type='checkbox' name='buzzer' value='1' ");
   html += g_featureBuzzer ? F("checked") : F("");
-  html += F("> Buzzer aktiv</label></p><p>Hub IP: <input name='hub_host' value='");
+  html += F("> Buzzer aktiv</label></p><p><label><input type='checkbox' name='espnow' value='1' ");
+  html += g_featureEspNow ? F("checked") : F("");
+  html += F("> ESP-NOW Lambda</label></p><p>ESP-NOW Kanal: <select name='espnow_ch'><option value='0'");
+  if (g_espNowChannelPref == 0) html += F(" selected");
+  html += F(">Auto (WiFi)</option><option value='6'");
+  if (g_espNowChannelPref == 6) html += F(" selected");
+  html += F(">6 Bus</option><option value='11'");
+  if (g_espNowChannelPref == 11) html += F(" selected");
+  html += F(">11 Handy</option></select></p><p>Hub IP: <input name='hub_host' value='");
   html += String(g_hubHost);
   html += F("' style='width:100%;max-width:220px;padding:8px;background:#0d0d0d;border:1px solid #333;border-radius:8px;color:#eee'></p>"
             "<p>Datenweg Hub: <select name='data_path'><option value='wifi'");
@@ -4130,14 +4226,30 @@ static void handleWebStatus() {
   json += F(",\"live_rx\":");
   json += String((unsigned long)g_liveRxCnt);
 #if ENABLE_ESP_NOW_CLIENT
+  json += F(",\"esp_now_enabled\":");
+  json += g_featureEspNow ? F("true") : F("false");
   json += F(",\"esp_now_ready\":");
   json += g_espNowReady ? F("true") : F("false");
+  json += F(",\"esp_now_channel\":");
+  json += String((unsigned)(g_espNowReady ? g_espNowActiveChannel : espNowEffectiveChannel()));
+  json += F(",\"esp_now_channel_label\":\"");
+  json += jsonEscape(String(espNowChannelLabel()));
+  json += F("\",\"esp_now_channel_pref\":");
+  json += String((unsigned)g_espNowChannelPref);
   json += F(",\"esp_now_rx\":");
   json += String((unsigned long)g_espNowRx);
   json += F(",\"esp_now_seq\":");
   json += String((unsigned)g_espNowSeq);
   json += F(",\"esp_now_fresh\":");
   json += espNowDataFresh() ? F("true") : F("false");
+  json += F(",\"esp_now_enabled\":");
+  json += g_featureEspNow ? F("true") : F("false");
+  json += F(",\"esp_now_channel\":");
+  json += String(g_espNowReady ? g_espNowActiveChannel : espNowEffectiveChannel());
+  json += F(",\"esp_now_channel_label\":\"");
+  json += jsonEscape(String(espNowChannelLabel()));
+  json += F("\",\"esp_now_channel_pref\":");
+  json += String(g_espNowChannelPref);
 #endif
   json += F(",\"ble_connected\":");
   json += g_bleConn ? F("true") : F("false");
@@ -4277,6 +4389,20 @@ static void handleWebFeatures() {
   const bool ble    = webServer.hasArg("ble");
   const bool buzzer = webServer.hasArg("buzzer");
   saveFeatures(wifi, ble, buzzer);
+#if ENABLE_ESP_NOW_CLIENT
+  saveEspNowFeature(webServer.hasArg("espnow"));
+  if (webServer.hasArg("espnow_ch")) {
+    int ch = webServer.arg("espnow_ch").toInt();
+    if (ch < 0) ch = 0;
+    if (ch > 14) ch = 14;
+    g_espNowChannelPref = (uint8_t)ch;
+    Preferences p;
+    p.begin("clock", false);
+    p.putUChar("espnow_ch", g_espNowChannelPref);
+    p.end();
+    teardownEspNowClient();
+  }
+#endif
   if (webServer.hasArg("hub_host")) saveHubHost(webServer.arg("hub_host").c_str());
   if (webServer.hasArg("data_path")) {
     const String m = webServer.arg("data_path");
@@ -4541,7 +4667,7 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
 #endif
 
   // Zonen passend zu drawSetupPage (Zeilen-Mitte = Zonenstart + 18, Hoehe 36)
-  if (y >= 380) {
+  if (y >= 452) {
     requestPage(1);
     DLOGN("setup tap: menu");
     return;
@@ -4571,13 +4697,21 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     g_redrawPage = true;
     DLOG("setup tap: ble=%s\n", g_featureBle ? "on" : "off");
   } else if (y >= 272 && y < 308) {
+    saveEspNowFeature(!g_featureEspNow);
+    g_redrawPage = true;
+    DLOG("setup tap: espnow=%s\n", g_featureEspNow ? "on" : "off");
+  } else if (y >= 308 && y < 344) {
+    cycleEspNowChannelPref();
+    g_redrawPage = true;
+    DLOG("setup tap: espnow_ch=%s\n", espNowChannelLabel());
+  } else if (y >= 344 && y < 380) {
     saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
     g_redrawPage = true;
     DLOG("setup tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
-  } else if (y >= 308 && y < 344) {
+  } else if (y >= 380 && y < 416) {
     cycleSourceMode();
     DLOG("setup tap: source=%s\n", sourceModeLabel());
-  } else if (y >= 344 && y < 380) {
+  } else if (y >= 416 && y < 452) {
     if (calibrateImuZero()) g_redrawPage = true;
     DLOGN("setup tap: imu_null");
   } else {
@@ -4843,6 +4977,11 @@ void loop() {
         else if (cmd == "ble:off") { saveFeatures(g_featureWifi, false, g_featureBuzzer); }
         else if (cmd == "buzzer:on")  { saveFeatures(g_featureWifi, g_featureBle, true); }
         else if (cmd == "buzzer:off") { saveFeatures(g_featureWifi, g_featureBle, false); }
+#if ENABLE_ESP_NOW_CLIENT
+        else if (cmd == "espnow:on")  { saveEspNowFeature(true); g_redrawPage = true; }
+        else if (cmd == "espnow:off") { saveEspNowFeature(false); g_redrawPage = true; }
+        else if (cmd == "espnow:ch")  { cycleEspNowChannelPref(); g_redrawPage = true; }
+#endif
         else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
         else if (cmd == "bus" || cmd == "bus:on") { applyBusProfile(true); g_redrawPage = true; }
         else if (cmd == "wifi:off")  { saveFeatures(false, g_featureBle, g_featureBuzzer); g_redrawPage = true; }
