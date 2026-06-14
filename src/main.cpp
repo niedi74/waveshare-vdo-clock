@@ -3838,11 +3838,11 @@ static void handleWebRoot() {
   html += g_featureEspNow ? F("checked") : F("");
   html += F("> ESP-NOW Lambda</label></p><p>ESP-NOW Kanal: <select name='espnow_ch'><option value='0'");
   if (g_espNowChannelPref == 0) html += F(" selected");
-  html += F(">Auto (WiFi)</option><option value='6'");
+  html += F(">Automatisch (folgt WLAN)</option><option value='6'");
   if (g_espNowChannelPref == 6) html += F(" selected");
-  html += F(">6 Bus</option><option value='11'");
+  html += F(">Bus (Kanal 6 / Spartan3-Setup)</option><option value='11'");
   if (g_espNowChannelPref == 11) html += F(" selected");
-  html += F(">11 Handy</option></select></p><p>Hub IP: <input name='hub_host' value='");
+  html += F(">Handy-Test (Kanal 11)</option></select></p><p>Hub IP: <input name='hub_host' value='");
   html += String(g_hubHost);
   html += F("' style='width:100%;max-width:220px;padding:8px;background:#0d0d0d;border:1px solid #333;border-radius:8px;color:#eee'></p>"
             "<p>Datenweg Hub: <select name='data_path'><option value='wifi'");
@@ -4242,14 +4242,6 @@ static void handleWebStatus() {
   json += String((unsigned)g_espNowSeq);
   json += F(",\"esp_now_fresh\":");
   json += espNowDataFresh() ? F("true") : F("false");
-  json += F(",\"esp_now_enabled\":");
-  json += g_featureEspNow ? F("true") : F("false");
-  json += F(",\"esp_now_channel\":");
-  json += String(g_espNowReady ? g_espNowActiveChannel : espNowEffectiveChannel());
-  json += F(",\"esp_now_channel_label\":\"");
-  json += jsonEscape(String(espNowChannelLabel()));
-  json += F("\",\"esp_now_channel_pref\":");
-  json += String(g_espNowChannelPref);
 #endif
   json += F(",\"ble_connected\":");
   json += g_bleConn ? F("true") : F("false");
