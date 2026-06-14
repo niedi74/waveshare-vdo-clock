@@ -379,13 +379,17 @@ Bei Handy-Hotspot-Profil: Kanal **11** überall konsistent setzen.
 
 ## Git-Status (2026-06-14)
 
-| Repo | Branch | Letzter Commit | Remote | PR vs main |
-|------|--------|----------------|--------|------------|
-| spartan3v2-can-adapter | `work` | `5fa03ac` Hub WebGUI Fahrt-Features | origin/work synced | PR gegen `main` empfohlen |
-| m5stack-123 | `feature/spartan-live-display` | `dc1a0bc` Fahrt 123 BLE + ESP-NOW | origin synced | Feature-Branch |
-| waveshare-vdo-clock | `cursor/webgui-ota-c56e` | `1a5d614` Bus Fahrtprofil | origin synced | Cursor-Branch |
+| Repo | Branch | HEAD (gepusht) | Wichtige Basis-Commits | Remote |
+|------|--------|----------------|------------------------|--------|
+| spartan3v2-can-adapter | `work` | `08c8026` | `5fa03ac` Hub WebGUI Fahrt-Features (WLAN/LOG/Serial) | [origin/work](https://github.com/niedi74/spartan3v2-can-adapter/tree/work) |
+| m5stack-123 | `feature/spartan-live-display` | `ec200b5` | `dc1a0bc` Fahrt 123 BLE + ESP-NOW | [origin/feature/spartan-live-display](https://github.com/niedi74/m5stack-123/tree/feature/spartan-live-display) |
+| waveshare-vdo-clock | `cursor/webgui-ota-c56e` | `8d18611` | `1a5d614` Bus Fahrtprofil | [origin/cursor/webgui-ota-c56e](https://github.com/niedi74/waveshare-vdo-clock/tree/cursor/webgui-ota-c56e) |
+
+**Lokal uncommitted (Stand Handoff):** Hub `src/main.cpp`, Waveshare `src/main.cpp` — nur committen wenn beabsichtigt.
 
 **Nicht committen:** `.pio/build/**`, `*.log`, `src/wifi_secret.h`, Build-Artefakte.
+
+**PR-Hinweis:** `gh auth login` fehlt in dieser Umgebung — PRs manuell auf GitHub anlegen (`work` → `main` Hub; Feature-Branches M5/Waveshare).
 
 ---
 
