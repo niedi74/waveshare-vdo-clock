@@ -247,7 +247,7 @@ static const int DIAL_CENTER        = 240;
 static constexpr float ROT_PIVOT    = 239.5f;
 static const int DIAL_CENTER_OFF_X_DEFAULT = 4;   // bitmap optical center @115% (hands stay at 240,240)
 static const int DIAL_CENTER_OFF_Y_DEFAULT = -9;
-static const uint16_t DIAL_FACE_BG  = RGB565(52, 47, 45);
+static const uint16_t DIAL_FACE_BG  = RGB565(46, 43, 40);
 static int       g_dialScalePct = DIAL_SCALE_DEFAULT;
 static int       g_dialCenterOffsetX = DIAL_CENTER_OFF_X_DEFAULT;
 static int       g_dialCenterOffsetY = DIAL_CENTER_OFF_Y_DEFAULT;
@@ -2178,13 +2178,13 @@ static void drawCircleLine(int cx, int cy, int radius, int thickness, uint16_t c
 }
 
 // VDO tach arc: 4 @ ~7 o'clock, 40 @ 12 o'clock, 80 @ ~5 o'clock (270° CW sweep).
-static uint16_t vdoFaceColor() { return g_nightMode ? RGB565(24, 34, 31) : DIAL_FACE_BG; }
-static uint16_t vdoMarkColor() { return g_nightMode ? RGB565(178, 224, 194) : RGB565(218, 202, 172); }
-static uint16_t vdoDimMarkColor() { return g_nightMode ? RGB565(72, 112, 88) : RGB565(150, 145, 130); }
-static uint16_t vdoNeedleColor() { return g_nightMode ? RGB565(230, 190, 62) : RGB565(244, 178, 0); }
-static uint16_t vdoWarnColor() { return g_nightMode ? RGB565(142, 76, 38) : RGB565(190, 54, 28); }
-static uint16_t vdoDarkRimColor() { return g_nightMode ? RGB565(10, 17, 14) : RGB565(17, 16, 15); }
-static uint16_t vdoHubColor() { return g_nightMode ? RGB565(30, 38, 34) : RGB565(42, 41, 39); }
+static uint16_t vdoFaceColor() { return g_nightMode ? RGB565(33, 37, 33) : DIAL_FACE_BG; }
+static uint16_t vdoMarkColor() { return g_nightMode ? RGB565(202, 222, 202) : RGB565(226, 211, 181); }
+static uint16_t vdoDimMarkColor() { return g_nightMode ? RGB565(112, 126, 108) : RGB565(154, 143, 124); }
+static uint16_t vdoNeedleColor() { return g_nightMode ? RGB565(232, 185, 55) : RGB565(232, 168, 0); }
+static uint16_t vdoWarnColor() { return g_nightMode ? RGB565(166, 74, 28) : RGB565(184, 66, 26); }
+static uint16_t vdoDarkRimColor() { return g_nightMode ? RGB565(11, 12, 11) : RGB565(16, 15, 14); }
+static uint16_t vdoHubColor() { return g_nightMode ? RGB565(35, 37, 34) : RGB565(40, 38, 35); }
 
 static float degToRad(float deg) {
   return deg * PI / 180.0f;
@@ -2485,6 +2485,27 @@ static void drawHandAngle(float angle, int length, int thickness, uint16_t color
   drawLineFast(240, 240, lx1, ly1, color, thickness);
 }
 
+static void drawVdoNeedle(int cx, int cy, float angle, int length, uint16_t color) {
+  const float ca = cosf(angle);
+  const float sa = sinf(angle);
+  const float px = -sa;
+  const float py = ca;
+  const int tipX = cx + (int)lroundf(ca * (float)length);
+  const int tipY = cy + (int)lroundf(sa * (float)length);
+  const int tailX = cx - (int)lroundf(ca * 22.0f);
+  const int tailY = cy - (int)lroundf(sa * 22.0f);
+  const int baseLx = cx + (int)lroundf(px * 7.0f);
+  const int baseLy = cy + (int)lroundf(py * 7.0f);
+  const int baseRx = cx - (int)lroundf(px * 7.0f);
+  const int baseRy = cy - (int)lroundf(py * 7.0f);
+  drawLineFast(baseLx, baseLy, tipX, tipY, color, 4);
+  drawLineFast(baseRx, baseRy, tipX, tipY, color, 4);
+  drawLineFast(tailX, tailY, cx, cy, color, 4);
+  drawLineFast(cx + (int)lroundf(px * 2.0f), cy + (int)lroundf(py * 2.0f),
+               tipX - (int)lroundf(ca * 22.0f), tipY - (int)lroundf(sa * 22.0f),
+               RGB565(250, 200, 45), 1);
+}
+
 static void restoreHand(float value, float maxValue, int length, int thickness) {
   paintHand(value, maxValue, length, thickness, 0, true);
 }
@@ -2527,6 +2548,7 @@ static uint8_t glyphColumn(char c, uint8_t col) {
     case 'V': { static const uint8_t v[5]={0x1F,0x20,0x40,0x20,0x1F}; g=v; break; }
     case 'W': { static const uint8_t v[5]={0x7F,0x20,0x18,0x20,0x7F}; g=v; break; }
     case 'X': { static const uint8_t v[5]={0x63,0x14,0x08,0x14,0x63}; g=v; break; }
+    case 'x': { static const uint8_t v[5]={0x63,0x14,0x08,0x14,0x63}; g=v; break; }
     case 'Y': { static const uint8_t v[5]={0x07,0x08,0x70,0x08,0x07}; g=v; break; }
     case 'Z': { static const uint8_t v[5]={0x61,0x51,0x49,0x45,0x43}; g=v; break; }
     case '/': { static const uint8_t v[5]={0x20,0x10,0x08,0x04,0x02}; g=v; break; }
@@ -2640,6 +2662,38 @@ static void drawMercedesSubClock() {
   drawHandAt(cx, cy, minuteValue, 60.0f, 30, 3, yellow);
   fillCircleFast(cx, cy, 7, vdoHubColor());
   fillCircleFast(cx, cy, 4, white);
+}
+
+static void drawVdoSubClockAt(int cx, int cy, int r) {
+  const uint16_t cream = vdoMarkColor();
+  const uint16_t dim = vdoDimMarkColor();
+  const uint16_t yellow = vdoNeedleColor();
+  drawCircleLine(cx, cy, r + 8, 2, vdoDarkRimColor());
+  drawCircleLine(cx, cy, r, 1, dim);
+  for (int h = 0; h < 12; h++) {
+    const float angle = ((float)h / 12.0f) * 2.0f * PI - PI / 2.0f;
+    const bool major = (h % 3) == 0;
+    const int rOut = r - 4;
+    const int rIn = r - (major ? 18 : 12);
+    drawLineFast(cx + (int)lroundf(cosf(angle) * (float)rIn),
+                 cy + (int)lroundf(sinf(angle) * (float)rIn),
+                 cx + (int)lroundf(cosf(angle) * (float)rOut),
+                 cy + (int)lroundf(sinf(angle) * (float)rOut),
+                 cream, major ? 3 : 2);
+  }
+  drawTextCentered(cx, cy - 26, "12", cream, 2);
+  drawTextCentered(cx + 26, cy - 2, "3", cream, 2);
+  drawTextCentered(cx, cy + 22, "6", cream, 2);
+  drawTextCentered(cx - 26, cy - 2, "9", cream, 2);
+  struct tm now = {};
+  if (readClockTime(&now)) {
+    const float minuteValue = now.tm_min + now.tm_sec / 60.0f;
+    const float hourValue = (now.tm_hour % 12) + minuteValue / 60.0f;
+    drawHandAt(cx, cy, hourValue, 12.0f, r - 25, 4, yellow);
+    drawHandAt(cx, cy, minuteValue, 60.0f, r - 14, 3, yellow);
+  }
+  fillCircleFast(cx, cy, 7, vdoHubColor());
+  fillCircleFast(cx, cy, 3, cream);
 }
 
 static void drawGlyphPixelRotated(int x, int y, int lx, int ly, int w, int h, int scale, int rot, uint16_t color) {
@@ -3204,34 +3258,37 @@ static void drawCombiInstrument() {
   const uint16_t redZone = vdoWarnColor();
   fillCircleFast(240, 240, 216, vdoFaceColor());
   drawCircleLine(240, 240, 222, 8, vdoDarkRimColor());
-  drawCircleLine(240, 240, 211, 1, g_nightMode ? RGB565(46, 66, 52) : RGB565(70, 67, 60));
+  drawCircleLine(240, 240, 211, 1, g_nightMode ? RGB565(60, 64, 58) : RGB565(73, 68, 60));
 
-  const int mainCx = 240, mainCy = 216;
+  const int mainCx = 240, mainCy = 214;
   const float mainMin = 50.0f, mainMax = 150.0f;
   const float mainA0 = 205.0f, mainA1 = 335.0f;
-  drawGaugeArcRing(mainCx, mainCy, 176, 2, mainA0, mainA1, dim);
-  drawGaugeArcRing(mainCx, mainCy, 174, 12,
+  drawGaugeArcRing(mainCx, mainCy, 184, 2, mainA0, mainA1, dim);
+  drawGaugeArcRing(mainCx, mainCy, 181, 17,
                    205.0f + (120.0f - mainMin) / (mainMax - mainMin) * (mainA1 - mainA0),
                    mainA1, redZone);
   for (int t = 50; t <= 150; t += 10) {
     const bool major = (t % 25) == 0 || t == 50 || t == 150;
-    drawGaugeTick(mainCx, mainCy, 178, major ? 148 : 158,
+    drawGaugeTick(mainCx, mainCy, 187, major ? 151 : 164,
                   (float)t, mainMin, mainMax, mainA0, mainA1, cream, major ? 4 : 2);
   }
   const int mainLabels[] = {50, 100, 150};
   for (size_t i = 0; i < sizeof(mainLabels) / sizeof(mainLabels[0]); i++) {
     char lab[8];
     snprintf(lab, sizeof(lab), "%d", mainLabels[i]);
-    drawGaugeLabel(mainCx, mainCy, 126, (float)mainLabels[i], mainMin, mainMax,
-                   mainA0, mainA1, lab, cream, 2);
+    const float angle = gaugeValueAngle((float)mainLabels[i], mainMin, mainMax, mainA0, mainA1);
+    const int scale = mainLabels[i] == 100 ? 2 : 3;
+    const int lx = mainCx + (int)lroundf(cosf(angle) * 132.0f) - textWidthSmall(lab, scale) / 2;
+    const int ly = mainCy + (int)lroundf(sinf(angle) * 132.0f) - (7 * scale) / 2;
+    drawTextSmall(lx, ly, lab, cream, scale);
   }
-  drawTextCentered(240, 88, "VDO", cream, 2);
-  drawTextCentered(240, 120, "OEL-TEMP.", cream, 2);
-  drawTextCentered(240, 144, "C", dim, 2);
+  drawTextCentered(240, 78, "VDO", cream, 2);
+  drawTextCentered(240, 108, "OEL-TEMP.", cream, 2);
+  drawTextCentered(240, 132, "C", dim, 2);
 
   const bool tempValid = dataFresh() && g_g123Valid && g_g123Temp > -40.0f && g_g123Temp < 180.0f;
   const float oilTemp = tempValid ? g_g123Temp : mainMin;
-  drawGaugeNeedle(mainCx, mainCy, oilTemp, mainMin, mainMax, mainA0, mainA1, 142, 5, yellow);
+  drawVdoNeedle(mainCx, mainCy, gaugeValueAngle(oilTemp, mainMin, mainMax, mainA0, mainA1), 144, yellow);
   fillCircleFast(mainCx, mainCy, 24, vdoHubColor());
   drawCircleLine(mainCx, mainCy, 24, 2, dim);
 
@@ -3243,9 +3300,8 @@ static void drawCombiInstrument() {
   drawCombiSmallGauge(376, 326, "VOLT", "V", volt, g_battValid, 10.0f, 16.0f,
                       voltLabels, sizeof(voltLabels) / sizeof(voltLabels[0]));
 
-  drawCircleLine(MB_CLOCK_CX, MB_CLOCK_CY, MB_CLOCK_R + 8, 2, vdoDarkRimColor());
-  drawMercedesSubClock();
-  if (!tempValid) drawTextCentered(240, 156, "---", dim, 2);
+  drawVdoSubClockAt(240, 344, 43);
+  if (!tempValid) drawTextCentered(240, 152, "---", dim, 2);
   drawTextCentered(240, 438, "MADE IN GERMANY", cream, 2);
 }
 
@@ -3267,38 +3323,41 @@ static void drawTachClockCombiPage() {
   const uint16_t warn = vdoWarnColor();
   fillCircleFast(240, 240, 216, vdoFaceColor());
   drawCircleLine(240, 240, 223, 8, vdoDarkRimColor());
-  drawCircleLine(240, 240, 211, 1, g_nightMode ? RGB565(46, 66, 52) : RGB565(70, 67, 60));
+  drawCircleLine(240, 240, 211, 1, g_nightMode ? RGB565(60, 64, 58) : RGB565(73, 68, 60));
 
   const int cx = 240, cy = 240;
-  const int ringR = 208;
+  const int ringR = 214;
   const int maxScale = g_rpmScaleMax / 100;
   const float redlineScale = constrain((float)g_rpmRedline / 100.0f,
                                        (float)RPM_SCALE_MIN_VALUE, rpmScaleMaxValue());
-  drawArcRing(cx, cy, ringR - 18, 13, redlineScale, rpmScaleMaxValue(), warn);
-  drawArcRing(cx, cy, ringR - 13, 1, (float)RPM_SCALE_MIN_VALUE, rpmScaleMaxValue(), dim);
-  drawRpmTick(cx, cy, ringR, ringR - 31, 4.0f, cream);
+  drawArcRing(cx, cy, ringR - 21, 18, redlineScale, rpmScaleMaxValue(), warn);
+  drawArcRing(cx, cy, ringR - 7, 1, (float)RPM_SCALE_MIN_VALUE, rpmScaleMaxValue(), dim);
+  drawRpmTick(cx, cy, ringR, ringR - 34, 4.0f, cream);
   for (int v = 10; v <= maxScale; v += 5) {
     const bool major = (v % 10) == 0;
-    drawRpmTick(cx, cy, ringR, ringR - (major ? 34 : 23), (float)v, cream);
+    drawRpmTick(cx, cy, ringR, ringR - (major ? 38 : 25), (float)v, cream);
   }
   for (int v = 10; v <= maxScale; v += 10) {
     char lab[6];
     snprintf(lab, sizeof(lab), "%d", v);
-    drawRpmScaleLabel(cx, cy, 146, (float)v, lab);
+    const float angle = rpmScaleAngle((float)v);
+    const int scale = 3;
+    const int lx = cx + (int)lroundf(cosf(angle) * 166.0f) - textWidthSmall(lab, scale) / 2;
+    const int ly = cy + (int)lroundf(sinf(angle) * 166.0f) - (7 * scale) / 2;
+    drawTextSmall(lx, ly, lab, cream, scale);
   }
 
   drawTextCentered(240, 84, "VDO", cream, 2);
   drawTextCentered(240, 112, "UPM", cream, 2);
-  drawTextCentered(240, 136, "X100", cream, 2);
+  drawTextCentered(240, 136, "x100", cream, 2);
 
   const bool fresh = dataFresh();
   const float rpmVal = fresh ? rpmScaleValue(g_rpm) : (float)RPM_SCALE_MIN_VALUE;
-  drawHandAngle(rpmScaleAngle(rpmVal), 182, 5, yellow);
+  drawVdoNeedle(cx, cy, rpmScaleAngle(rpmVal), 184, yellow);
   fillCircleFast(cx, cy, 31, vdoHubColor());
   drawCircleLine(cx, cy, 31, 2, dim);
 
-  drawCircleLine(MB_CLOCK_CX, MB_CLOCK_CY + 6, MB_CLOCK_R + 18, 2, vdoDarkRimColor());
-  drawMercedesSubClock();
+  drawVdoSubClockAt(240, 342, 43);
   drawTextCentered(240, 438, "MADE IN GERMANY", cream, 2);
   presentFrame();
 }
