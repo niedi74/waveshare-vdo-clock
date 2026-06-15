@@ -252,13 +252,17 @@ static int       g_dialScalePct = DIAL_SCALE_DEFAULT;
 static int       g_dialCenterOffsetX = DIAL_CENTER_OFF_X_DEFAULT;
 static int       g_dialCenterOffsetY = DIAL_CENTER_OFF_Y_DEFAULT;
 static int       g_brightnessPct = 100;
+static bool      g_nightMode = false;
 static int       g_rotationDeg  = 0;
-static const int RPM_SCALE_MIN_VALUE = 4;        // VDO tach: 4 at ~7 o'clock (×100 RPM)
-static const int RPM_SCALE_MAX_VALUE = 80;       // 80 at ~5 o'clock (×100 RPM → 8000)
+static const int RPM_SCALE_MIN_VALUE = 4;        // VDO tach: 4 at ~7 o'clock (x100 RPM)
+static const int RPM_SCALE_MAX_DEFAULT = 6000;   // Bulli default: scale ends at 60 (x100 RPM)
+static const int RPM_SCALE_MAX_MIN     = 4000;
+static const int RPM_SCALE_MAX_MAX     = 8000;
 static const int RPM_REDLINE_DEFAULT = 4200;
 static const int RPM_REDLINE_MIN     = 2000;
-static const int RPM_REDLINE_MAX     = 5500;
+static const int RPM_REDLINE_MAX     = 8000;
 static int       g_rpmRedline        = RPM_REDLINE_DEFAULT;
+static int       g_rpmScaleMax       = RPM_SCALE_MAX_DEFAULT;
 static const uint8_t MOTOR_STYLE_VDO       = 0;
 static const uint8_t MOTOR_STYLE_MERCEDES  = 1;
 static const int     MB_SCALE_MAX_VALUE    = 70;   // Mercedes tach 0–70 (×100 RPM)
@@ -267,7 +271,7 @@ static const int     MB_CLOCK_CX           = 240;
 static const int     MB_CLOCK_CY           = 318;
 static const int     MB_CLOCK_R            = 54;
 static uint8_t       g_motorStyle          = MOTOR_STYLE_VDO;
-static const uint8_t PAGE_MAX            = 6;   // 0=UHR .. 6=IMU (5=SETUP)
+static const uint8_t PAGE_MAX            = 9;   // 0=UHR .. 9=SETUP2 (5=SETUP1, 6=IMU)
 static float     g_rotSin       = 0.0f;
 static float     g_rotCos       = 1.0f;
 // Throttled debug logging (115200 baud Serial)
@@ -322,6 +326,7 @@ static void stopApOnlyMode();
 static void cycleWifiNetworkMode();
 static void cycleSourceMode();
 static void applySourceMode(const char* mode);
+static void saveNightMode(bool enabled);
 static void updateRotationCache();
 static void logicalToDisplay(int lx, int ly, int *dx, int *dy);
 static bool readTouch(uint16_t *x, uint16_t *y);
@@ -496,6 +501,19 @@ static uint8_t hubWifiProfileIndex() {
     if (strcmp(WIFI_PROFILES[i].ssid, HUB_SETUP_WIFI_SSID) == 0) return i;
   }
   return 0xFF;
+}
+
+static uint8_t preferredHomeWifiProfileIndex() {
+  const uint8_t count = wifiProfileCount();
+#ifdef WIFI_SSID_2
+  for (uint8_t i = 0; i < count; i++) {
+    if (strcmp(WIFI_PROFILES[i].ssid, WIFI_SSID_2) == 0) return i;
+  }
+#endif
+  for (uint8_t i = 0; i < count; i++) {
+    if (WIFI_PROFILES[i].ssid[0] != 0 && strcmp(WIFI_PROFILES[i].ssid, HUB_SETUP_WIFI_SSID) != 0) return i;
+  }
+  return 0;
 }
 
 static bool isBusWifiSsid(const char* ssid) {
@@ -915,6 +933,10 @@ static bool espNowDataFresh() {
   return g_espNowLastRxMs != 0 && (millis() - g_espNowLastRxMs) < DATA_FRESH_MS;
 }
 
+static bool espNowFallbackAllowed() {
+  return !g_featureEspNow;
+}
+
 static void applyEspNowFrame(const SpartanCockpitFrame& frame) {
   g_espNowSeq = frame.seq;
   const bool lambdaValid = (frame.flags & kSpartanFlagLambdaValid) != 0;
@@ -1115,7 +1137,7 @@ static bool parseHubStatusJson(const String& json) {
   maybeSyncClockFromHubJson(json);
 
 #if ENABLE_ESP_NOW_CLIENT
-  if (espNowDataFresh()) {
+  if (!espNowFallbackAllowed()) {
     float bm6v = 0, auxv = 0, volt = 0, speed = 0;
     if (jsonExtractFloat(json, "bm6_voltage", &bm6v) && bm6v > 0.5f) {
       g_battVolt = bm6v;
@@ -1372,8 +1394,8 @@ static const char* sourceModeLabel() {
 #if ENABLE_ESP_NOW_CLIENT
   if (espNowDataFresh()) return "HUB ESP-NOW";
 #endif
-  if (g_dataPath == DATA_PATH_WIFI_HUB) return "HUB WiFi";
-  if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) return "HUB BLE";
+  if (g_dataPath == DATA_PATH_WIFI_HUB) return g_featureEspNow ? "HTTP Diagnose" : "HTTP Live";
+  if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) return g_featureEspNow ? "BLE Diagnose" : "BLE Live";
   return "123 dir";
 }
 
@@ -2156,14 +2178,37 @@ static void drawCircleLine(int cx, int cy, int radius, int thickness, uint16_t c
 }
 
 // VDO tach arc: 4 @ ~7 o'clock, 40 @ 12 o'clock, 80 @ ~5 o'clock (270° CW sweep).
+static uint16_t vdoFaceColor() { return g_nightMode ? RGB565(24, 34, 31) : DIAL_FACE_BG; }
+static uint16_t vdoMarkColor() { return g_nightMode ? RGB565(178, 224, 194) : RGB565(218, 202, 172); }
+static uint16_t vdoDimMarkColor() { return g_nightMode ? RGB565(72, 112, 88) : RGB565(150, 145, 130); }
+static uint16_t vdoNeedleColor() { return g_nightMode ? RGB565(230, 190, 62) : RGB565(244, 178, 0); }
+static uint16_t vdoWarnColor() { return g_nightMode ? RGB565(142, 76, 38) : RGB565(190, 54, 28); }
+static uint16_t vdoDarkRimColor() { return g_nightMode ? RGB565(10, 17, 14) : RGB565(17, 16, 15); }
+static uint16_t vdoHubColor() { return g_nightMode ? RGB565(30, 38, 34) : RGB565(42, 41, 39); }
+
+static float degToRad(float deg) {
+  return deg * PI / 180.0f;
+}
+
+static float gaugeValueAngle(float value, float vMin, float vMax, float degStart, float degEnd) {
+  if (value < vMin) value = vMin;
+  if (value > vMax) value = vMax;
+  return degToRad(degStart + (value - vMin) / (vMax - vMin) * (degEnd - degStart));
+}
+
+static float rpmScaleMaxValue() {
+  return (float)g_rpmScaleMax / 100.0f;
+}
+
 static float rpmDialFrac(float scaleVal) {
+  const float maxValue = rpmScaleMaxValue();
   if (scaleVal <= (float)RPM_SCALE_MIN_VALUE) return 7.0f / 12.0f;
-  if (scaleVal >= (float)RPM_SCALE_MAX_VALUE) return 5.0f / 12.0f;
+  if (scaleVal >= maxValue) return 5.0f / 12.0f;
   float d;
   if (scaleVal <= 40.0f)
     d = (scaleVal - (float)RPM_SCALE_MIN_VALUE) / (40.0f - (float)RPM_SCALE_MIN_VALUE) * (5.0f / 12.0f);
   else
-    d = 5.0f / 12.0f + (scaleVal - 40.0f) / ((float)RPM_SCALE_MAX_VALUE - 40.0f) * (5.0f / 12.0f);
+    d = 5.0f / 12.0f + (scaleVal - 40.0f) / (maxValue - 40.0f) * (5.0f / 12.0f);
   float frac = 7.0f / 12.0f + d;
   if (frac >= 1.0f) frac -= 1.0f;
   return frac;
@@ -2174,13 +2219,14 @@ static float rpmScaleAngle(float scaleVal) {
 }
 
 static float rpmScaleAtDialFrac(float frac) {
+  const float maxValue = rpmScaleMaxValue();
   float d = frac - 7.0f / 12.0f;
   if (d < 0.0f) d += 1.0f;
   const float arcLen = 10.0f / 12.0f;
   if (d > arcLen + 0.02f) return -1.0f;
   if (d <= 5.0f / 12.0f)
     return (float)RPM_SCALE_MIN_VALUE + d / (5.0f / 12.0f) * (40.0f - (float)RPM_SCALE_MIN_VALUE);
-  return 40.0f + (d - 5.0f / 12.0f) / (5.0f / 12.0f) * ((float)RPM_SCALE_MAX_VALUE - 40.0f);
+  return 40.0f + (d - 5.0f / 12.0f) / (5.0f / 12.0f) * (maxValue - 40.0f);
 }
 
 static void drawArcRing(int cx, int cy, int radius, int thickness,
@@ -2225,7 +2271,7 @@ static void drawArcRingLinear(int cx, int cy, int radius, int thickness,
 static float rpmScaleValue(float rpm) {
   float v = rpm / 100.0f;
   if (v < (float)RPM_SCALE_MIN_VALUE) v = (float)RPM_SCALE_MIN_VALUE;
-  if (v > (float)RPM_SCALE_MAX_VALUE) v = (float)RPM_SCALE_MAX_VALUE;
+  if (v > rpmScaleMaxValue()) v = rpmScaleMaxValue();
   return v;
 }
 
@@ -2309,6 +2355,56 @@ static void drawLineFast(int x0, int y0, int x1, int y1, uint16_t color, int thi
   }
 }
 
+static void drawTextSmall(int x, int y, const char *text, uint16_t color, int scale);
+static int textWidthSmall(const char *text, int scale);
+
+static void drawGaugeArcRing(int cx, int cy, int radius, int thickness,
+                             float degStart, float degEnd, uint16_t color) {
+  if (degEnd <= degStart) return;
+  const int outer = radius * radius;
+  const int innerR = radius - thickness;
+  const int inner = innerR > 0 ? innerR * innerR : 0;
+  for (int y = cy - radius; y <= cy + radius; y++) {
+    for (int x = cx - radius; x <= cx + radius; x++) {
+      const int dx = x - cx, dy = y - cy;
+      const int d = dx * dx + dy * dy;
+      if (d > outer || d < inner) continue;
+      float deg = atan2f((float)dy, (float)dx) * 180.0f / PI;
+      if (deg < 0.0f) deg += 360.0f;
+      if (deg >= degStart - 0.5f && deg <= degEnd + 0.5f) setPixel(x, y, color);
+    }
+  }
+}
+
+static void drawGaugeTick(int cx, int cy, int rOuter, int rInner,
+                          float value, float vMin, float vMax,
+                          float degStart, float degEnd, uint16_t color, int thick) {
+  const float angle = gaugeValueAngle(value, vMin, vMax, degStart, degEnd);
+  const int x0 = cx + (int)lroundf(cosf(angle) * (float)rInner);
+  const int y0 = cy + (int)lroundf(sinf(angle) * (float)rInner);
+  const int x1 = cx + (int)lroundf(cosf(angle) * (float)rOuter);
+  const int y1 = cy + (int)lroundf(sinf(angle) * (float)rOuter);
+  drawLineFast(x0, y0, x1, y1, color, thick);
+}
+
+static void drawGaugeLabel(int cx, int cy, int radius, float value, float vMin, float vMax,
+                           float degStart, float degEnd, const char* label,
+                           uint16_t color, int scale) {
+  const float angle = gaugeValueAngle(value, vMin, vMax, degStart, degEnd);
+  const int lx = cx + (int)lroundf(cosf(angle) * (float)radius) - textWidthSmall(label, scale) / 2;
+  const int ly = cy + (int)lroundf(sinf(angle) * (float)radius) - (7 * scale) / 2;
+  drawTextSmall(lx, ly, label, color, scale);
+}
+
+static void drawGaugeNeedle(int cx, int cy, float value, float vMin, float vMax,
+                            float degStart, float degEnd, int length, int thickness,
+                            uint16_t color) {
+  const float angle = gaugeValueAngle(value, vMin, vMax, degStart, degEnd);
+  const int x1 = cx + (int)lroundf(cosf(angle) * (float)length);
+  const int y1 = cy + (int)lroundf(sinf(angle) * (float)length);
+  drawLineFast(cx, cy, x1, y1, color, thickness);
+}
+
 static void drawMbTick(int cx, int cy, int rOuter, int rInner, float scaleVal, uint16_t color, int thick) {
   const float angle = mbScaleAngle(scaleVal);
   const int x0 = cx + (int)lroundf(cosf(angle) * (float)rInner);
@@ -2319,7 +2415,7 @@ static void drawMbTick(int cx, int cy, int rOuter, int rInner, float scaleVal, u
 }
 
 static uint16_t faceColorAtFb(int px, int py) {
-  if ((unsigned)px >= 480 || (unsigned)py >= 480) return DIAL_FACE_BG;
+  if ((unsigned)px >= 480 || (unsigned)py >= 480) return vdoFaceColor();
   int pct = g_dialScalePct;
   if (pct < DIAL_SCALE_MIN) pct = DIAL_SCALE_MIN;
   if (pct > DIAL_SCALE_MAX) pct = DIAL_SCALE_MAX;
@@ -2330,7 +2426,7 @@ static uint16_t faceColorAtFb(int px, int py) {
       && !g_dialRebuilding) {
     return g_dialCache[py * 480 + px];
   }
-  return DIAL_FACE_BG;
+  return vdoFaceColor();
 }
 
 static bool clockFaceSourceReady() {
@@ -2414,6 +2510,7 @@ static uint8_t glyphColumn(char c, uint8_t col) {
     case 'B': { static const uint8_t v[5]={0x7F,0x49,0x49,0x49,0x36}; g=v; break; }
     case 'D': { static const uint8_t v[5]={0x7F,0x41,0x41,0x22,0x1C}; g=v; break; }
     case 'E': { static const uint8_t v[5]={0x7F,0x49,0x49,0x49,0x41}; g=v; break; }
+    case 'G': { static const uint8_t v[5]={0x3E,0x41,0x49,0x49,0x7A}; g=v; break; }
     case 'H': { static const uint8_t v[5]={0x7F,0x08,0x08,0x08,0x7F}; g=v; break; }
     case 'I': { static const uint8_t v[5]={0x00,0x41,0x7F,0x41,0x00}; g=v; break; }
     case 'K': { static const uint8_t v[5]={0x7F,0x08,0x14,0x22,0x41}; g=v; break; }
@@ -2519,8 +2616,8 @@ static void drawMbScaleLabel(int cx, int cy, int radius, float scaleVal, const c
 
 static void drawMercedesSubClock() {
   const int cx = MB_CLOCK_CX, cy = MB_CLOCK_CY, r = MB_CLOCK_R;
-  const uint16_t white = RGB565(235, 235, 225);
-  const uint16_t yellow = RGB565(255, 215, 0);
+  const uint16_t white = vdoMarkColor();
+  const uint16_t yellow = vdoNeedleColor();
   for (int h = 0; h < 12; h++) {
     const float angle = ((float)h / 12.0f) * 2.0f * PI - PI / 2.0f;
     const int thick = (h % 3 == 0) ? 3 : 2;
@@ -2541,8 +2638,8 @@ static void drawMercedesSubClock() {
   const float hourValue   = (now.tm_hour % 12) + minuteValue / 60.0f;
   drawHandAt(cx, cy, hourValue,   12.0f, 20, 4, yellow);
   drawHandAt(cx, cy, minuteValue, 60.0f, 30, 3, yellow);
-  fillCircleFast(cx, cy, 7, RGB565(175, 175, 168));
-  fillCircleFast(cx, cy, 4, RGB565(130, 130, 125));
+  fillCircleFast(cx, cy, 7, vdoHubColor());
+  fillCircleFast(cx, cy, 4, white);
 }
 
 static void drawGlyphPixelRotated(int x, int y, int lx, int ly, int w, int h, int scale, int rot, uint16_t color) {
@@ -2635,7 +2732,7 @@ static void dialCacheBeginRebuild(int pct, int rot, int offX, int offY) {
   g_dialRebuildRow = 0;
   g_dialRebuilding = true;
   g_dialCacheScale = -1;
-  for (int i = 0; i < 480 * 480; i++) g_dialCache[i] = DIAL_FACE_BG;
+  for (int i = 0; i < 480 * 480; i++) g_dialCache[i] = vdoFaceColor();
 }
 
 static void dialCacheRebuildRows(int pct, int rot, int offX, int offY, int rowStart, int rowEnd) {
@@ -2760,7 +2857,7 @@ static void copyVdoDialToFrame() {
   }
 
   // Letzter Ausweg ohne Cache (PSRAM fehlgeschlagen): Hintergrund, Zeiger bleiben sichtbar.
-  for (int i = 0; i < 480 * 480; i++) fb[i] = DIAL_FACE_BG;
+  for (int i = 0; i < 480 * 480; i++) fb[i] = vdoFaceColor();
 }
 
 static void logicalToDisplay(int lx, int ly, int *dx, int *dy) {
@@ -2858,15 +2955,15 @@ static void drawVdoClock() {
   presentFrame();
 }
 
-// 2x3 menu grid on 480 round display: gaps between tiles, inset for round clip.
-#define MENU_ROWS        3
+// 2-column menu grid on 480 round display: gaps between tiles, inset for round clip.
+#define MENU_ROWS        5
 #define MENU_COLS        2
 #define MENU_COL0_X      84
 #define MENU_COL1_X      252
 #define MENU_COL_W       152
-#define MENU_GRID_Y0     96
-#define MENU_ROW_H       64    // zone per row (tile + vertical gap)
-#define MENU_TILE_H      50
+#define MENU_GRID_Y0     82
+#define MENU_ROW_H       52    // zone per row (tile + vertical gap)
+#define MENU_TILE_H      42
 #define MENU_LABEL_SCALE 2
 #define EDGE_TAP_W       48    // linker/rechter Rand: Seite vor/zurueck
 
@@ -2878,7 +2975,11 @@ static const MenuEntry MENU_ENTRIES[MENU_ROWS * MENU_COLS] = {
   {"LAMBDA", RGB565(60,  185, 90),  3},
   {"HUB",    RGB565(190, 90,  210), 4},
   {"IMU",    RGB565(200, 100, 50),  6},
+  {"OEL",    RGB565(230, 135, 40),  7},
   {"SETUP",  RGB565(210, 170, 45),  5},
+  {"DZM UHR",RGB565(225, 185, 75),  8},
+  {"SETUP 2",RGB565(185, 145, 50),  9},
+  {"",       RGB565(80, 80, 80),    0},
 };
 
 static void menuTileRect(int index, int *x, int *y, int *w, int *h) {
@@ -2898,7 +2999,9 @@ static int menuIndexFromTap(uint16_t tapX, uint16_t tapY) {
   if      (tapX >= MENU_COL0_X && tapX < MENU_COL0_X + MENU_COL_W) col = 0;
   else if (tapX >= MENU_COL1_X && tapX < MENU_COL1_X + MENU_COL_W) col = 1;
   if (col < 0) return -1;
-  return row * MENU_COLS + col;
+  const int idx = row * MENU_COLS + col;
+  if (MENU_ENTRIES[idx].label[0] == 0) return -1;
+  return idx;
 }
 
 static void drawMenuTile(int x, int y, int w, int h, const char *label, uint16_t accent) {
@@ -2920,6 +3023,7 @@ static void drawMenuOverview() {
   for (int i = 0; i < MENU_ROWS * MENU_COLS; i++) {
     int x, y, w, h;
     menuTileRect(i, &x, &y, &w, &h);
+    if (MENU_ENTRIES[i].label[0] == 0) continue;
     drawMenuTile(x, y, w, h, MENU_ENTRIES[i].label, MENU_ENTRIES[i].accent);
     if (i == 2 || i == 4) webServerPoll(2);
   }
@@ -2979,18 +3083,18 @@ static void drawMotorPageVdo() {
   const uint16_t ringBase  = RGB565(40, 110, 160);
   const uint16_t redZone   = RGB565(100, 18, 18);
   const uint16_t needleCol = RGB565(255, 130, 40);
+  const int maxScale = g_rpmScaleMax / 100;
   drawTextCentered(240, 52, "MOTOR", RGB565(60, 170, 230), 5);
   drawCircleLine(240, 240, ringR, ringT, ringBase);
   const float redlineScale = (float)g_rpmRedline / 100.0f;
-  drawArcRing(240, 240, ringR, ringT, redlineScale, (float)RPM_SCALE_MAX_VALUE, redZone);
-  static const int majors[] = {4, 20, 40, 60, 80};
-  for (int i = 0; i < 5; i++)
-    drawRpmTick(240, 240, ringR + 4, ringR - ringT - 8, (float)majors[i], RGB565(235, 235, 225));
-  drawRpmScaleLabel(240, 240, labelR, 4.0f,  "4");
-  drawRpmScaleLabel(240, 240, labelR, 20.0f, "20");
-  drawRpmScaleLabel(240, 240, labelR, 40.0f, "40");
-  drawRpmScaleLabel(240, 240, labelR, 60.0f, "60");
-  drawRpmScaleLabel(240, 240, labelR, 80.0f, "80");
+  drawArcRing(240, 240, ringR, ringT, redlineScale, rpmScaleMaxValue(), redZone);
+  drawRpmTick(240, 240, ringR + 4, ringR - ringT - 8, 4.0f, RGB565(235, 235, 225));
+  for (int v = 10; v <= maxScale; v += 10) {
+    drawRpmTick(240, 240, ringR + 4, ringR - ringT - 8, (float)v, RGB565(235, 235, 225));
+    char lab[4];
+    snprintf(lab, sizeof(lab), "%d", v);
+    drawRpmScaleLabel(240, 240, labelR, (float)v, lab);
+  }
   const bool fresh = dataFresh();
   const float rpmVal = fresh ? rpmScaleValue(g_rpm) : (float)RPM_SCALE_MIN_VALUE;
   drawHandAngle(rpmScaleAngle(rpmVal), 168, 6, needleCol);
@@ -3009,30 +3113,38 @@ static void drawMotorPageVdo() {
 }
 
 static void drawMotorPageMercedes() {
-  const int ringR = 212, labelR = ringR - 34;
-  const uint16_t white = RGB565(235, 235, 225);
-  const uint16_t redZone = RGB565(220, 55, 18);
-  const uint16_t yellow = RGB565(255, 215, 0);
-  drawMbMajorTicks(240, 240, ringR, white);
-  static const int labels[] = {5, 10, 20, 30, 40, 50, 60, 70};
-  static const char* labelTxt[] = {"5", "10", "20", "30", "40", "50", "60", "70"};
-  for (int i = 0; i < 8; i++)
-    drawMbScaleLabel(240, 240, labelR, (float)labels[i], labelTxt[i]);
-  drawTextCentered(240, 198, "x100 1/min", white, 2);
-  drawMercedesSubClock();
+  const int ringR = 212, ringT = 10, labelR = 158;
+  const uint16_t cream = vdoMarkColor();
+  const uint16_t redZone = vdoWarnColor();
+  const uint16_t yellow = vdoNeedleColor();
+  fillCircleFast(240, 240, 214, vdoFaceColor());
+  drawCircleLine(240, 240, 222, 9, RGB565(18, 18, 17));
+  drawCircleLine(240, 240, 211, 2, g_nightMode ? RGB565(58, 76, 54) : RGB565(65, 63, 58));
   const float redlineScale = (float)g_rpmRedline / 100.0f;
-  if (redlineScale < (float)MB_SCALE_MAX_VALUE)
-    drawMbArcRing(240, 240, labelR + 8, 20, redlineScale, (float)MB_SCALE_MAX_VALUE, redZone);
+  drawArcRing(240, 240, ringR - 18, 24, redlineScale, rpmScaleMaxValue(), redZone);
+  drawRpmTick(240, 240, ringR, ringR - 24, 4.0f, cream);
+  const int maxScale = g_rpmScaleMax / 100;
+  for (int v = 10; v <= maxScale; v += 10) {
+    drawRpmTick(240, 240, ringR, ringR - ((v % 20 == 0) ? 30 : 22), (float)v, cream);
+    char lab[4];
+    snprintf(lab, sizeof(lab), "%d", v);
+    drawRpmScaleLabel(240, 240, labelR, (float)v, lab);
+  }
+  drawTextCentered(240, 124, "VDO", cream, 2);
+  drawTextCentered(240, 148, "UPM", cream, 2);
+  drawTextCentered(240, 172, "X100", cream, 2);
+  drawCircleLine(MB_CLOCK_CX, MB_CLOCK_CY, MB_CLOCK_R + 12, 2, RGB565(12, 12, 12));
+  drawMercedesSubClock();
   const bool fresh = dataFresh();
-  const float rpmVal = fresh ? mbScaleValue(g_rpm) : 0.0f;
-  drawHandAt(240, 240, rpmVal, (float)MB_SCALE_MAX_VALUE, 188, 3, yellow);
-  fillCircleFast(240, 240, 30, RGB565(175, 175, 168));
-  fillCircleFast(240, 240, 18, RGB565(130, 130, 125));
-  drawMotorStatusFooter(392, 418);
+  const float rpmVal = fresh ? rpmScaleValue(g_rpm) : (float)RPM_SCALE_MIN_VALUE;
+  drawHandAngle(rpmScaleAngle(rpmVal), 182, 5, yellow);
+  fillCircleFast(240, 240, 33, RGB565(42, 41, 39));
+  drawCircleLine(240, 240, 33, 2, g_nightMode ? RGB565(70, 100, 62) : RGB565(85, 83, 76));
+  drawTextCentered(240, 438, "MADE IN GERMANY", cream, 2);
 }
 
 static const char* motorStyleLabel() {
-  return g_motorStyle == MOTOR_STYLE_MERCEDES ? "Mercedes" : "VDO";
+  return "VDO";
 }
 
 static void drawMotorPage() {
@@ -3057,6 +3169,137 @@ static void drawMotorPage() {
     drawDataRow(304, "BAT", buf, cv);
   } else drawDataRow(304, "BAT", na, cv);
   drawMotorStatusFooter(360, 400);
+  presentFrame();
+}
+
+static void drawCombiSmallGauge(int cx, int cy, const char* title, const char* unit,
+                                float value, bool valid, float vMin, float vMax,
+                                const int* labels, size_t labelCount) {
+  const uint16_t cream = vdoMarkColor();
+  const uint16_t dim = vdoDimMarkColor();
+  const uint16_t yellow = vdoNeedleColor();
+  const float a0 = 210.0f, a1 = 330.0f;
+  drawCircleLine(cx, cy, 58, 2, vdoDarkRimColor());
+  drawGaugeArcRing(cx, cy, 51, 2, a0, a1, dim);
+  for (int i = (int)vMin; i <= (int)vMax; i++) {
+    const bool major = (i == (int)vMin || i == (int)vMax || (i % 5) == 0);
+    drawGaugeTick(cx, cy, 51, major ? 39 : 44, (float)i, vMin, vMax, a0, a1, cream, major ? 3 : 2);
+  }
+  char buf[8];
+  for (size_t i = 0; i < labelCount; i++) {
+    snprintf(buf, sizeof(buf), "%d", labels[i]);
+    drawGaugeLabel(cx, cy, 31, (float)labels[i], vMin, vMax, a0, a1, buf, cream, 1);
+  }
+  drawGaugeNeedle(cx, cy, valid ? value : vMin, vMin, vMax, a0, a1, 38, 3, yellow);
+  fillCircleFast(cx, cy, 8, vdoHubColor());
+  drawCircleLine(cx, cy, 8, 1, dim);
+  drawTextCentered(cx, cy + 36, title, cream, 1);
+  drawTextCentered(cx, cy + 48, unit, dim, 1);
+}
+
+static void drawCombiInstrument() {
+  const uint16_t cream = vdoMarkColor();
+  const uint16_t dim = vdoDimMarkColor();
+  const uint16_t yellow = vdoNeedleColor();
+  const uint16_t redZone = vdoWarnColor();
+  fillCircleFast(240, 240, 216, vdoFaceColor());
+  drawCircleLine(240, 240, 222, 8, vdoDarkRimColor());
+  drawCircleLine(240, 240, 211, 1, g_nightMode ? RGB565(46, 66, 52) : RGB565(70, 67, 60));
+
+  const int mainCx = 240, mainCy = 216;
+  const float mainMin = 50.0f, mainMax = 150.0f;
+  const float mainA0 = 205.0f, mainA1 = 335.0f;
+  drawGaugeArcRing(mainCx, mainCy, 176, 2, mainA0, mainA1, dim);
+  drawGaugeArcRing(mainCx, mainCy, 174, 12,
+                   205.0f + (120.0f - mainMin) / (mainMax - mainMin) * (mainA1 - mainA0),
+                   mainA1, redZone);
+  for (int t = 50; t <= 150; t += 10) {
+    const bool major = (t % 25) == 0 || t == 50 || t == 150;
+    drawGaugeTick(mainCx, mainCy, 178, major ? 148 : 158,
+                  (float)t, mainMin, mainMax, mainA0, mainA1, cream, major ? 4 : 2);
+  }
+  const int mainLabels[] = {50, 100, 150};
+  for (size_t i = 0; i < sizeof(mainLabels) / sizeof(mainLabels[0]); i++) {
+    char lab[8];
+    snprintf(lab, sizeof(lab), "%d", mainLabels[i]);
+    drawGaugeLabel(mainCx, mainCy, 126, (float)mainLabels[i], mainMin, mainMax,
+                   mainA0, mainA1, lab, cream, 2);
+  }
+  drawTextCentered(240, 88, "VDO", cream, 2);
+  drawTextCentered(240, 120, "OEL-TEMP.", cream, 2);
+  drawTextCentered(240, 144, "C", dim, 2);
+
+  const bool tempValid = dataFresh() && g_g123Valid && g_g123Temp > -40.0f && g_g123Temp < 180.0f;
+  const float oilTemp = tempValid ? g_g123Temp : mainMin;
+  drawGaugeNeedle(mainCx, mainCy, oilTemp, mainMin, mainMax, mainA0, mainA1, 142, 5, yellow);
+  fillCircleFast(mainCx, mainCy, 24, vdoHubColor());
+  drawCircleLine(mainCx, mainCy, 24, 2, dim);
+
+  const int pressureLabels[] = {0, 5, 10};
+  drawCombiSmallGauge(104, 326, "OEL-DRUCK", "BAR", 0.0f, false, 0.0f, 10.0f,
+                      pressureLabels, sizeof(pressureLabels) / sizeof(pressureLabels[0]));
+  const int voltLabels[] = {10, 12, 16};
+  const float volt = g_battValid ? g_battVolt : 10.0f;
+  drawCombiSmallGauge(376, 326, "VOLT", "V", volt, g_battValid, 10.0f, 16.0f,
+                      voltLabels, sizeof(voltLabels) / sizeof(voltLabels[0]));
+
+  drawCircleLine(MB_CLOCK_CX, MB_CLOCK_CY, MB_CLOCK_R + 8, 2, vdoDarkRimColor());
+  drawMercedesSubClock();
+  if (!tempValid) drawTextCentered(240, 156, "---", dim, 2);
+  drawTextCentered(240, 438, "MADE IN GERMANY", cream, 2);
+}
+
+static void drawCombiPage() {
+  if (!ensureFrame()) return;
+  g_clockFacePage = currentPage;
+  fillFrame(RGB565_BLACK);
+  drawCombiInstrument();
+  presentFrame();
+}
+
+static void drawTachClockCombiPage() {
+  if (!ensureFrame()) return;
+  g_clockFacePage = currentPage;
+  fillFrame(RGB565_BLACK);
+  const uint16_t cream = vdoMarkColor();
+  const uint16_t dim = vdoDimMarkColor();
+  const uint16_t yellow = vdoNeedleColor();
+  const uint16_t warn = vdoWarnColor();
+  fillCircleFast(240, 240, 216, vdoFaceColor());
+  drawCircleLine(240, 240, 223, 8, vdoDarkRimColor());
+  drawCircleLine(240, 240, 211, 1, g_nightMode ? RGB565(46, 66, 52) : RGB565(70, 67, 60));
+
+  const int cx = 240, cy = 240;
+  const int ringR = 208;
+  const int maxScale = g_rpmScaleMax / 100;
+  const float redlineScale = constrain((float)g_rpmRedline / 100.0f,
+                                       (float)RPM_SCALE_MIN_VALUE, rpmScaleMaxValue());
+  drawArcRing(cx, cy, ringR - 18, 13, redlineScale, rpmScaleMaxValue(), warn);
+  drawArcRing(cx, cy, ringR - 13, 1, (float)RPM_SCALE_MIN_VALUE, rpmScaleMaxValue(), dim);
+  drawRpmTick(cx, cy, ringR, ringR - 31, 4.0f, cream);
+  for (int v = 10; v <= maxScale; v += 5) {
+    const bool major = (v % 10) == 0;
+    drawRpmTick(cx, cy, ringR, ringR - (major ? 34 : 23), (float)v, cream);
+  }
+  for (int v = 10; v <= maxScale; v += 10) {
+    char lab[6];
+    snprintf(lab, sizeof(lab), "%d", v);
+    drawRpmScaleLabel(cx, cy, 146, (float)v, lab);
+  }
+
+  drawTextCentered(240, 84, "VDO", cream, 2);
+  drawTextCentered(240, 112, "UPM", cream, 2);
+  drawTextCentered(240, 136, "X100", cream, 2);
+
+  const bool fresh = dataFresh();
+  const float rpmVal = fresh ? rpmScaleValue(g_rpm) : (float)RPM_SCALE_MIN_VALUE;
+  drawHandAngle(rpmScaleAngle(rpmVal), 182, 5, yellow);
+  fillCircleFast(cx, cy, 31, vdoHubColor());
+  drawCircleLine(cx, cy, 31, 2, dim);
+
+  drawCircleLine(MB_CLOCK_CX, MB_CLOCK_CY + 6, MB_CLOCK_R + 18, 2, vdoDarkRimColor());
+  drawMercedesSubClock();
+  drawTextCentered(240, 438, "MADE IN GERMANY", cream, 2);
   presentFrame();
 }
 
@@ -3123,49 +3366,66 @@ static void drawSetupPage() {
   g_clockFacePage = currentPage;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
-  drawTextCentered(240, 54, "SETUP", RGB565(230, 190, 70), 5);
+  drawTextCentered(240, 54, "SETUP 1", RGB565(230, 190, 70), 4);
+  drawTextCentered(240, 82, "ANZEIGE / WLAN", RGB565(170, 160, 135), 2);
   char buf[28];
   snprintf(buf, sizeof(buf), "%d %%", g_dialScalePct);
-  drawDataRow(110, "UHR",   buf, RGB565(235, 235, 225));
+  drawDataRow(124, "UHR",   buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d %%", g_brightnessPct);
-  drawDataRow(146, "HELL",  buf, RGB565(235, 235, 225));
+  drawDataRow(172, "HELL",  buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d DEG", g_rotationDeg);
-  drawDataRow(182, "ROT",   buf, RGB565(235, 235, 225));
+  drawDataRow(220, "ROT",   buf, RGB565(235, 235, 225));
   char wbuf[20];
   if (g_wifiApOnly || (g_apOn && WiFi.status() != WL_CONNECTED)) {
-    drawDataRow(218, "WIFI", "AP Setup", RGB565(235, 180, 60));
+    drawDataRow(268, "WIFI", "AP Setup", RGB565(235, 180, 60));
   } else if (!g_featureWifi) {
-    drawDataRow(218, "WIFI", "AUS", RGB565(220, 130, 50));
+    drawDataRow(268, "WIFI", "AUS", RGB565(220, 130, 50));
   } else if (WiFi.status() == WL_CONNECTED && strlen(currentWifiSsid()) > 0) {
     if (isOnBusWifi()) {
-      drawDataRow(218, "WIFI", "BUS OK", RGB565(60, 210, 100));
+      drawDataRow(268, "WIFI", "BUS OK", RGB565(60, 210, 100));
     } else {
       snprintf(wbuf, sizeof(wbuf), "%.16s", currentWifiSsid());
-      drawDataRow(218, "WIFI", wbuf, RGB565(60, 210, 100));
+      drawDataRow(268, "WIFI", wbuf, RGB565(60, 210, 100));
     }
   } else {
-    drawDataRow(218, "WIFI", "Home...", RGB565(220, 130, 50));
+    drawDataRow(268, "WIFI", "Home...", RGB565(220, 130, 50));
   }
-  drawDataRow(254, "BLE",    g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
+  drawDataRow(316, "NACHT", g_nightMode ? "GRUEN" : "TAG",
+              g_nightMode ? RGB565(80, 220, 120) : RGB565(235, 235, 225));
+  drawDataRow(364, "WEITER", "SETUP 2", RGB565(230, 190, 70));
+  drawTextCentered(240, 432, "TIP MENU", RGB565(180, 180, 170), 2);
+  drawTextCentered(240, 456, "RAND = SEITE", RGB565(120, 120, 115), 1);
+  presentFrame();
+}
+
+static void drawSetup2Page() {
+  if (!ensureFrame()) return;
+  g_clockFacePage = currentPage;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
+  drawTextCentered(240, 54, "SETUP 2", RGB565(230, 190, 70), 4);
+  drawTextCentered(240, 82, "FUNK / QUELLE", RGB565(170, 160, 135), 2);
+  drawDataRow(124, "BLE",    g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
               g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   {
     char ebuf[20];
     if (!g_featureEspNow) snprintf(ebuf, sizeof(ebuf), "AUS");
     else if (espNowDataFresh()) snprintf(ebuf, sizeof(ebuf), "OK rx%lu", (unsigned long)g_espNowRx);
     else snprintf(ebuf, sizeof(ebuf), "AN %s", espNowChannelLabel());
-    drawDataRow(290, "ESPNOW", ebuf,
+    drawDataRow(172, "ESPNOW", ebuf,
                 g_featureEspNow && espNowDataFresh() ? RGB565(60, 210, 100) :
                 (g_featureEspNow ? RGB565(220, 180, 60) : RGB565(150, 150, 150)));
   }
-  drawDataRow(326, "ESPN CH", espNowChannelLabel(), RGB565(120, 180, 240));
-  drawDataRow(362, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
+  drawDataRow(220, "ESPN CH", espNowChannelLabel(), RGB565(120, 180, 240));
+  drawDataRow(268, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
               g_featureBuzzer ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
-  drawDataRow(398, "QUELLE", sourceModeLabel(),
+  drawDataRow(316, "QUELLE", sourceModeLabel(),
               g_dataPath == DATA_PATH_WIFI_HUB ? RGB565(80, 160, 240) :
               (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? RGB565(120, 200, 120) : RGB565(235, 150, 60)));
-  drawDataRow(434, "IMU NULL", g_imuTrimmed ? "SET" : "TAP",
+  drawDataRow(364, "IMU NULL", g_imuTrimmed ? "SET" : "TAP",
               g_imuTrimmed ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawTextCentered(240, 468, "TIP MENU", RGB565(180, 180, 170), 2);
+  drawTextCentered(240, 432, "TIP MENU", RGB565(180, 180, 170), 2);
+  drawTextCentered(240, 456, "RAND = SEITE", RGB565(120, 120, 115), 1);
   presentFrame();
 }
 
@@ -3173,34 +3433,87 @@ static void drawImuPage() {
   if (!ensureFrame()) return;
   g_clockFacePage = currentPage;
   fillFrame(RGB565_BLACK);
-  drawCircleLine(240, 240, 216, 3, RGB565(200, 100, 50));
-  drawTextCentered(240, 52, "IMU", RGB565(220, 130, 60), 5);
-  if (g_imuTrimmed) {
-    drawTextCentered(240, 78, "NULL", RGB565(60, 200, 90), 2);
+  const int cx = 240, cy = 240;
+  const uint16_t cream = vdoMarkColor();
+  const uint16_t dim = vdoDimMarkColor();
+  const uint16_t lower = g_nightMode ? RGB565(23, 30, 27) : RGB565(43, 36, 31);
+  fillCircleFast(cx, cy, 216, vdoFaceColor());
+  for (int y = cy; y <= cy + 204; y++) {
+    for (int x = cx - 204; x <= cx + 204; x++) {
+      const int dx = x - cx, dy = y - cy;
+      if (dx * dx + dy * dy <= 204 * 204) setPixel(x, y, lower);
+    }
   }
+  drawCircleLine(cx, cy, 223, 8, vdoDarkRimColor());
+  drawCircleLine(cx, cy, 211, 2, g_nightMode ? RGB565(58, 82, 52) : RGB565(84, 80, 72));
+  drawLineFast(cx - 190, cy, cx + 190, cy, dim, 3);
 
-  char buf[16];
+  for (int a = -40; a <= 40; a += 10) {
+    const float ar = (float)a * PI / 180.0f - PI / 2.0f;
+    const int ro = 190;
+    const int ri = (a % 20 == 0) ? 164 : 176;
+    drawLineFast(cx + (int)lroundf(cosf(ar) * ri), cy + (int)lroundf(sinf(ar) * ri),
+                 cx + (int)lroundf(cosf(ar) * ro), cy + (int)lroundf(sinf(ar) * ro),
+                 cream, (a % 20 == 0) ? 3 : 2);
+    if (a != 0 && a % 20 == 0) {
+      char lab[8];
+      snprintf(lab, sizeof(lab), "%d", abs(a));
+      const int tx = cx + (int)lroundf(cosf(ar) * 136.0f);
+      const int ty = cy + (int)lroundf(sinf(ar) * 136.0f);
+      drawTextCentered(tx, ty - 7, lab, cream, 2);
+    }
+  }
+  drawLineFast(cx - 17, cy - 176, cx, cy - 144, cream, 3);
+  drawLineFast(cx + 17, cy - 176, cx, cy - 144, cream, 3);
+  drawLineFast(cx - 17, cy - 176, cx + 17, cy - 176, cream, 3);
+
   if (g_imuPresent) {
-    snprintf(buf, sizeof(buf), "%.1f", g_imuPitch);
-    drawDataRow(112, "PITCH", buf, RGB565(235, 235, 225));
-    snprintf(buf, sizeof(buf), "%.1f", g_imuRoll);
-    drawDataRow(152, "ROLL", buf, RGB565(235, 235, 225));
-    snprintf(buf, sizeof(buf), "%.2fg", g_imuGForce);
-    drawDataRow(192, "G-FORCE", buf, RGB565(235, 235, 225));
+    const float pitch = constrain(g_imuPitch, -45.0f, 45.0f);
+    const float roll = constrain(g_imuRoll, -45.0f, 45.0f);
+    const int pitchOffset = (int)lroundf(pitch * 1.8f);
+    for (int p = -40; p <= 40; p += 10) {
+      if (p == 0) continue;
+      const int y = cy - pitchOffset + p * 3;
+      const int half = (p % 20 == 0) ? 74 : 48;
+      drawLineFast(cx - half, y, cx + half, y, dim, 2);
+      if (p % 20 == 0) {
+        char lab[8];
+        snprintf(lab, sizeof(lab), "%d", abs(p));
+        drawTextCentered(cx - half - 34, y - 7, lab, dim, 1);
+        drawTextCentered(cx + half + 34, y - 7, lab, dim, 1);
+      }
+    }
+
+    const float rr = -roll * PI / 180.0f;
+    const int rx = (int)lroundf(cosf(rr) * 66.0f);
+    const int ry = (int)lroundf(sinf(rr) * 66.0f);
+    drawLineFast(cx - rx, cy - ry, cx + rx, cy + ry, cream, 4);
+    fillCircleFast(cx, cy, 5, cream);
+    drawLineFast(cx, cy - 24, cx, cy + 92, cream, 3);
+    drawLineFast(cx - 45, cy + 92, cx + 45, cy + 92, cream, 3);
+    drawLineFast(cx - 45, cy + 92, cx - 66, cy + 66, cream, 3);
+    drawLineFast(cx + 45, cy + 92, cx + 66, cy + 66, cream, 3);
+
+    const float gradePct = constrain(tanf(pitch * PI / 180.0f) * 100.0f, -99.0f, 99.0f);
+    char gradeLine[18];
+    char degLine[18];
+    snprintf(gradeLine, sizeof(gradeLine), "%+.0f%%", gradePct);
+    snprintf(degLine, sizeof(degLine), "%+.1f DEG", pitch);
+    drawTextCentered(240, 382, "STEIGUNG", dim, 2);
+    drawTextCentered(240, 412, gradeLine, cream, 4);
+    drawTextCentered(240, 446, degLine, dim, 2);
+    if (g_imuTrimmed) drawTextCentered(240, 96, "NULL", dim, 1);
 
     static bool buzzerOn = false;
-    const bool wantBuzz = g_featureBuzzer && qmi8658ShakeDetected(1.5f);
-    if (qmi8658ShakeDetected(1.5f)) {
-      drawTextCentered(240, 250, "SHAKE!", RGB565(255, 50, 50), 4);
-    } else {
-      drawTextCentered(240, 250, "OK", RGB565(60, 200, 90), 4);
-    }
-    if (wantBuzz != buzzerOn) {   // nur bei Zustandswechsel schalten
+    const bool shake = qmi8658ShakeDetected(1.5f);
+    const bool wantBuzz = g_featureBuzzer && shake;
+    if (shake) drawTextCentered(240, 112, "SHAKE", RGB565(255, 70, 50), 2);
+    if (wantBuzz != buzzerOn) {
       buzzerOn = wantBuzz;
       hal_buzzer(buzzerOn);
     }
   } else {
-    drawTextCentered(240, 200, "KEIN IMU", RGB565(200, 60, 60), 4);
+    drawTextCentered(240, 210, "KEIN IMU", RGB565(200, 60, 60), 4);
   }
   presentFrame();
 }
@@ -3214,6 +3527,9 @@ static void drawCurrentPage() {
   else if (currentPage == 4) drawHubPage();
   else if (currentPage == 5) drawSetupPage();
   else if (currentPage == 6) drawImuPage();
+  else if (currentPage == 7) drawCombiPage();
+  else if (currentPage == 8) drawTachClockCombiPage();
+  else if (currentPage == 9) drawSetup2Page();
   else { currentPage = 0; drawVdoClock(); }
 }
 
@@ -3231,6 +3547,7 @@ static void loadSettings() {
   g_dialCenterOffsetX  = p.getInt("dial_off_x", DIAL_CENTER_OFF_X_DEFAULT);
   g_dialCenterOffsetY  = p.getInt("dial_off_y", DIAL_CENTER_OFF_Y_DEFAULT);
   g_brightnessPct = p.getInt("bright",    100);
+  g_nightMode     = p.getBool("night",    false);
   g_rotationDeg   = p.getInt("rot_deg",   0);
   g_wifiProfile   = p.getUChar("wifi_prof", 0);
   if (g_wifiProfile >= wifiProfileCount()) g_wifiProfile = 0;
@@ -3270,8 +3587,10 @@ static void loadSettings() {
   g_timezoneIdx = p.getUChar("tz_idx", TIMEZONE_DEFAULT);
   if (g_timezoneIdx >= TIMEZONE_COUNT) g_timezoneIdx = TIMEZONE_DEFAULT;
   g_rpmRedline = p.getInt("rpm_red", RPM_REDLINE_DEFAULT);
+  g_rpmScaleMax = p.getInt("rpm_max", RPM_SCALE_MAX_DEFAULT);
   g_motorStyle   = p.getUChar("motor_style", MOTOR_STYLE_VDO);
   if (g_motorStyle > MOTOR_STYLE_MERCEDES) g_motorStyle = MOTOR_STYLE_VDO;
+  g_motorStyle = MOTOR_STYLE_VDO;
   g_dataPath = p.getUChar("data_path", DATA_PATH_WIFI_HUB) == DATA_PATH_BLE ?
                DATA_PATH_BLE : DATA_PATH_WIFI_HUB;
   g_wifiApOnly = p.getBool("wifi_ap_only", false);
@@ -3295,8 +3614,12 @@ static void loadSettings() {
   if (g_dialCenterOffsetY >  20) g_dialCenterOffsetY =  20;
   if (g_brightnessPct < 5)   g_brightnessPct = 5;
   if (g_brightnessPct > 100) g_brightnessPct = 100;
+  if (g_rpmScaleMax < RPM_SCALE_MAX_MIN) g_rpmScaleMax = RPM_SCALE_MAX_MIN;
+  if (g_rpmScaleMax > RPM_SCALE_MAX_MAX) g_rpmScaleMax = RPM_SCALE_MAX_MAX;
+  g_rpmScaleMax = (g_rpmScaleMax / 100) * 100;
   if (g_rpmRedline < RPM_REDLINE_MIN) g_rpmRedline = RPM_REDLINE_MIN;
   if (g_rpmRedline > RPM_REDLINE_MAX) g_rpmRedline = RPM_REDLINE_MAX;
+  if (g_rpmRedline > g_rpmScaleMax) g_rpmRedline = g_rpmScaleMax;
   g_rotationDeg %= 360;
   if (g_rotationDeg < 0) g_rotationDeg += 360;
   updateRotationCache();
@@ -3341,6 +3664,7 @@ static void saveBrightness(int pct) {
 static void saveRpmRedline(int rpm) {
   if (rpm < RPM_REDLINE_MIN) rpm = RPM_REDLINE_MIN;
   if (rpm > RPM_REDLINE_MAX) rpm = RPM_REDLINE_MAX;
+  if (rpm > g_rpmScaleMax) rpm = g_rpmScaleMax;
   rpm = (rpm / 100) * 100;
   g_rpmRedline = rpm;
   Preferences p;
@@ -3349,12 +3673,34 @@ static void saveRpmRedline(int rpm) {
   p.end();
 }
 
-static void saveMotorStyle(uint8_t style) {
-  if (style > MOTOR_STYLE_MERCEDES) style = MOTOR_STYLE_VDO;
-  g_motorStyle = style;
+static void saveNightMode(bool enabled) {
+  g_nightMode = enabled;
+  requestDialCacheRebuild();
   Preferences p;
   p.begin("clock", false);
-  p.putUChar("motor_style", style);
+  p.putBool("night", enabled);
+  p.end();
+}
+
+static void saveRpmScaleMax(int rpm) {
+  if (rpm < RPM_SCALE_MAX_MIN) rpm = RPM_SCALE_MAX_MIN;
+  if (rpm > RPM_SCALE_MAX_MAX) rpm = RPM_SCALE_MAX_MAX;
+  rpm = (rpm / 100) * 100;
+  g_rpmScaleMax = rpm;
+  if (g_rpmRedline > g_rpmScaleMax) g_rpmRedline = g_rpmScaleMax;
+  Preferences p;
+  p.begin("clock", false);
+  p.putInt("rpm_max", g_rpmScaleMax);
+  p.putInt("rpm_red", g_rpmRedline);
+  p.end();
+}
+
+static void saveMotorStyle(uint8_t style) {
+  (void)style;
+  g_motorStyle = MOTOR_STYLE_VDO;
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("motor_style", g_motorStyle);
   p.end();
 }
 
@@ -3508,8 +3854,11 @@ static const char* webPageLabel(uint8_t page) {
     case 2: return "MOTOR";
     case 3: return "LAMBDA";
     case 4: return "HUB";
-    case 5: return "SETUP";
+    case 5: return "SETUP 1";
     case 6: return "IMU";
+    case 7: return "OEL";
+    case 8: return "DZM UHR";
+    case 9: return "SETUP 2";
     default: return "???";
   }
 }
@@ -3521,6 +3870,9 @@ static const char* webPageAccent(uint8_t page) {
     case 4: return "#be5ad2";
     case 5: return "#d2bc2d";
     case 6: return "#c86432";
+    case 7: return "#e68728";
+    case 8: return "#d8c172";
+    case 9: return "#b99132";
     default: return "#505050";
   }
 }
@@ -3596,13 +3948,13 @@ static void webAppendPageMockSvg(String& svg, uint8_t page) {
   svg += F("</text>");
 
   if (page == 1) {
-    const char* items[] = {"UHR", "MOTOR", "LAMBDA", "HUB", "IMU", "SETUP"};
-    const char* cols[] = {"#c82823", "#2896d2", "#3cb95a", "#be5ad2", "#c86432", "#d2bc2d"};
-    for (int i = 0; i < 6; i++) {
+    const char* items[] = {"UHR", "MOTOR", "LAMBDA", "HUB", "IMU", "OEL", "SETUP 1", "DZM UHR", "SETUP 2"};
+    const char* cols[] = {"#c82823", "#2896d2", "#3cb95a", "#be5ad2", "#c86432", "#e68728", "#d2bc2d", "#d8c172", "#b99132"};
+    for (int i = 0; i < 9; i++) {
       const int row = i / 2;
       const int col = i % 2;
       const int tx = 42 + col * 78;
-      const int ty = 72 + row * 34;
+      const int ty = 68 + row * 29;
       char rowBuf[160];
       snprintf(rowBuf, sizeof(rowBuf),
                "<rect x='%d' y='%d' width='72' height='26' rx='3' fill='#121212' stroke='#333'/>"
@@ -3652,12 +4004,35 @@ static void webAppendPageMockSvg(String& svg, uint8_t page) {
     svg += String((unsigned long)g_liveRxCnt);
     svg += F("</tspan></text>");
   } else if (page == 5) {
-    svg += F("<text x='72' y='118' fill='#888' font-size='9' font-family='system-ui,sans-serif'>WLAN</text>"
-             "<text x='168' y='118' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
+    svg += F("<text x='72' y='104' fill='#888' font-size='9' font-family='system-ui,sans-serif'>UHR</text>"
+             "<text x='168' y='104' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
+    svg += String(g_dialScalePct);
+    svg += F("%</text><text x='72' y='124' fill='#888' font-size='9' font-family='system-ui,sans-serif'>HELL</text>"
+             "<text x='168' y='124' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
+    svg += String(g_brightnessPct);
+    svg += F("%</text><text x='72' y='144' fill='#888' font-size='9' font-family='system-ui,sans-serif'>ROT</text>"
+             "<text x='168' y='144' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
+    svg += String(g_rotationDeg);
+    svg += F("</text><text x='72' y='164' fill='#888' font-size='9' font-family='system-ui,sans-serif'>WLAN</text>"
+             "<text x='168' y='164' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
     svg += g_featureWifi ? F("an") : F("aus");
-    svg += F("</text><text x='72' y='142' fill='#888' font-size='9' font-family='system-ui,sans-serif'>BLE</text>"
-             "<text x='168' y='142' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
+    svg += F("</text><text x='72' y='184' fill='#888' font-size='9' font-family='system-ui,sans-serif'>NACHT</text>"
+             "<text x='168' y='184' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
+    svg += g_nightMode ? F("gruen") : F("tag");
+    svg += F("</text>");
+  } else if (page == 9) {
+    svg += F("<text x='72' y='108' fill='#888' font-size='9' font-family='system-ui,sans-serif'>BLE</text>"
+             "<text x='168' y='118' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
     svg += g_featureBle ? F("an") : F("aus");
+    svg += F("</text><text x='72' y='138' fill='#888' font-size='9' font-family='system-ui,sans-serif'>ESPNOW</text>"
+             "<text x='168' y='138' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
+    svg += g_featureEspNow ? F("an") : F("aus");
+    svg += F("</text><text x='72' y='158' fill='#888' font-size='9' font-family='system-ui,sans-serif'>CH</text>"
+             "<text x='168' y='158' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
+    svg += espNowChannelLabel();
+    svg += F("</text><text x='72' y='178' fill='#888' font-size='9' font-family='system-ui,sans-serif'>QUELLE</text>"
+             "<text x='168' y='178' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
+    svg += sourceModeLabel();
     svg += F("</text>");
   } else if (page == 6) {
     if (g_imuPresent) {
@@ -3675,6 +4050,19 @@ static void webAppendPageMockSvg(String& svg, uint8_t page) {
     } else {
       svg += F("<text x='120' y='132' text-anchor='middle' fill='#c84040' font-size='12' font-family='system-ui,sans-serif'>KEIN IMU</text>");
     }
+  } else if (page == 7) {
+    const bool fresh = dataFresh();
+    char line[24];
+    svg += F("<circle cx='120' cy='128' r='72' fill='#151515' stroke='#d8cbb0' stroke-width='2'/>"
+             "<path d='M62 128 A58 58 0 0 1 178 128' fill='none' stroke='#cfc2a8' stroke-width='4'/>"
+             "<path d='M164 104 A58 58 0 0 1 178 128' fill='none' stroke='#d94b25' stroke-width='7'/>"
+             "<line x1='120' y1='128' x2='74' y2='140' stroke='#f0b000' stroke-width='5' stroke-linecap='round'/>"
+             "<circle cx='120' cy='128' r='10' fill='#202020' stroke='#555'/>"
+             "<circle cx='120' cy='166' r='24' fill='#111' stroke='#666'/>");
+    snprintf(line, sizeof(line), "%d RPM", fresh ? (int)g_rpm : 0);
+    svg += F("<text x='120' y='92' text-anchor='middle' fill='#eee' font-size='11' class='pv-rpm' font-family='system-ui,sans-serif'>");
+    svg += fresh ? line : "--- RPM";
+    svg += F("</text>");
   }
   svg += F("</svg>");
 }
@@ -3735,8 +4123,8 @@ static void handleWebRoot() {
     "main{max-width:760px;margin:0 auto}h1{margin:10px 0 4px;color:var(--gold);font-weight:700}.sub{color:var(--muted);margin-bottom:16px}"
     ".tabs{display:flex;gap:7px;overflow:auto;margin-bottom:12px}.tabs label{background:#202020;border:1px solid var(--line);border-radius:999px;padding:10px 13px;white-space:nowrap;cursor:pointer}"
     "input.tab{display:none}.page{display:none}.card{background:rgba(21,21,21,.95);border:1px solid var(--line);border-radius:18px;padding:17px;margin:12px 0;box-shadow:0 10px 30px #0005}"
-    "#t0:checked~.tabs label[for=t0],#t1:checked~.tabs label[for=t1],#t2:checked~.tabs label[for=t2],#t3:checked~.tabs label[for=t3],#t4:checked~.tabs label[for=t4]{background:var(--gold);color:#161100;border-color:var(--gold)}"
-    "#t0:checked~#p0,#t1:checked~#p1,#t2:checked~#p2,#t3:checked~#p3,#t4:checked~#p4{display:block}"
+    "#t0:checked~.tabs label[for=t0],#t1:checked~.tabs label[for=t1],#t2:checked~.tabs label[for=t2],#t3:checked~.tabs label[for=t3],#t4:checked~.tabs label[for=t4],#t5:checked~.tabs label[for=t5]{background:var(--gold);color:#161100;border-color:var(--gold)}"
+    "#t0:checked~#p0,#t1:checked~#p1,#t2:checked~#p2,#t3:checked~#p3,#t4:checked~#p4,#t5:checked~#p5{display:block}"
     ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.metric{background:#0c0c0c;border:1px solid #262626;border-radius:14px;padding:14px;text-align:left}"
     ".metric b{display:block;font-size:1.7rem;color:#fff}.metric span{color:var(--muted);font-size:.9rem}.ok{color:var(--ok)}.warn{color:var(--warn)}"
     "button{background:var(--gold);border:0;border-radius:10px;padding:11px 15px;margin:5px 4px;color:#171200;font-weight:700;cursor:pointer}a{color:#9bd1ff;text-decoration:none}"
@@ -3749,8 +4137,8 @@ static void handleWebRoot() {
   html += String(g_ipStr);
   html += F(" &middot; <span id='headerTime'>");
   html += String(timeStr);
-  html += F("</span></div><input class='tab' id='t0' name='tab' type='radio' checked><input class='tab' id='t1' name='tab' type='radio'><input class='tab' id='t2' name='tab' type='radio'><input class='tab' id='t3' name='tab' type='radio'><input class='tab' id='t4' name='tab' type='radio'>"
-            "<nav class='tabs'><label for='t0'>Dashboard</label><label for='t1'>WLAN</label><label for='t2'>Display</label><label for='t3'>Live</label><label for='t4'>Setup</label></nav>");
+  html += F("</span></div><input class='tab' id='t0' name='tab' type='radio' checked><input class='tab' id='t1' name='tab' type='radio'><input class='tab' id='t2' name='tab' type='radio'><input class='tab' id='t3' name='tab' type='radio'><input class='tab' id='t4' name='tab' type='radio'><input class='tab' id='t5' name='tab' type='radio'>"
+            "<nav class='tabs'><label for='t0'>Dashboard</label><label for='t1'>WLAN</label><label for='t2'>Display</label><label for='t3'>Live</label><label for='t4'>Setup</label><label for='t5'>Setup 2</label></nav>");
 
   html += F("<section class='page' id='p0'><div class='card row'><div><b>Aktive Display-Seite</b><br><span id='dashPageLabel' style='font-size:1.4rem;color:var(--gold)'>");
   html += webPageLabel(currentPage);
@@ -3797,7 +4185,7 @@ static void handleWebRoot() {
   html += F("<section class='page' id='p2'><div class='card'><h2>Display</h2><div id='displayPreviewHost'>");
   html += webDisplayPreviewShell(&now);
   html += F("</div><div class='grid'>"
-            "<a href='/page?p=0'><button>Uhr</button></a><a href='/page?p=1'><button>Menu</button></a><a href='/page?p=2'><button>Motor</button></a><a href='/page?p=3'><button>Lambda</button></a><a href='/page?p=4'><button>Hub</button></a><a href='/page?p=6'><button>IMU</button></a><a href='/page?p=5'><button>Setup</button></a></div></div>"
+            "<a href='/page?p=0'><button>Uhr</button></a><a href='/page?p=1'><button>Menu</button></a><a href='/page?p=2'><button>Motor</button></a><a href='/page?p=8'><button>DZM Uhr</button></a><a href='/page?p=7'><button>Oel</button></a><a href='/page?p=3'><button>Lambda</button></a><a href='/page?p=4'><button>Hub</button></a><a href='/page?p=6'><button>IMU</button></a><a href='/page?p=5'><button>Setup 1</button></a><a href='/page?p=9'><button>Setup 2</button></a></div></div>"
             "<div class='card'><h3>Zifferblatt-Groesse</h3><form action='/set' method='get'><div class='row'><b><span id='scaleVal'>");
   html += String(g_dialScalePct);
   html += F("</span>%</b><button type='submit'>Uebernehmen</button></div><input type='range' name='scale' min='30' max='120' step='1' value='");
@@ -3809,25 +4197,30 @@ static void handleWebRoot() {
   html += F(" &middot; Y ");
   html += String(g_dialCenterOffsetY);
   html += F("</b></div><div class='row'><span><a href='/set?dial_x_delta=-1'><button>X -1</button></a><a href='/set?dial_x_delta=1'><button>X +1</button></a></span></div><div class='row'><span><a href='/set?dial_y_delta=-1'><button>Y -1</button></a><a href='/set?dial_y_delta=1'><button>Y +1</button></a><a href='/set?dial_reset=1'><button>Zentrum</button></a></span></div></div>"
-            "<div class='card'><h3>Rotbereich (RPM)</h3><p class='sub'>Roter Bereich ab Redline (VDO 4–80 oder Mercedes 0–70, &times;100 RPM).</p>"
-            "<form action='/set' method='get'><div class='row'><label>Redline "
-            "<input type='number' name='rpm_redline' min='2000' max='5500' step='100' value='");
+            "<div class='card'><h3>Drehzahlmesser</h3><p class='sub'>VDO Einzeldrehzahlmesser. Skalenende 6000 passt fuer den Bulli.</p>"
+            "<form action='/set' method='get'><div class='row'><label>Rot ab "
+            "<input type='number' name='rpm_redline' min='2000' max='8000' step='100' value='");
   html += String(g_rpmRedline);
-  html += F("'></label><button type='submit'>Uebernehmen</button></div></form></div>"
-            "<div class='card'><h3>Motor-Anzeige</h3><p class='sub'>Daten-Seite MOTOR (RPM/ADV/MAP). Stil w&auml;hlbar: VDO-Tacho oder Mercedes mit Uhr.</p>"
-            "<form action='/set' method='get'><select name='motor_style'>"
-            "<option value='0'");
-  if (g_motorStyle == MOTOR_STYLE_VDO) html += F(" selected");
-  html += F(">VDO (Uhr Mitte)</option><option value='1'");
-  if (g_motorStyle == MOTOR_STYLE_MERCEDES) html += F(" selected");
-  html += F(">Mercedes (Uhr unten)</option></select><button type='submit'>Uebernehmen</button></form>"
-            "<p class='sub'>Aktiv: <b>");
-  html += motorStyleLabel();
-  html += F("</b></p></div></section>");
+  html += F("'></label></div><div class='row'><label>Skala bis "
+            "<input type='number' name='rpm_max' min='4000' max='8000' step='100' value='");
+  html += String(g_rpmScaleMax);
+  html += F("'></label><button type='submit'>Uebernehmen</button></div></form>"
+            "<p class='sub'>Aktiv: <b>VDO</b> &middot; Anzeige in x100 RPM.</p></div>"
+            "<div class='card'><h3>Beleuchtung</h3><p class='sub'>Nachtmodus: matte gruene Instrumentenbeleuchtung wie LED im T2B-Cockpit.</p><div class='row'><a href='/set?night=0'><button");
+  if (!g_nightMode) html += F(" style='background:#54d273'");
+  html += F(">Tag</button></a><a href='/set?night=1'><button");
+  if (g_nightMode) html += F(" style='background:#54d273'");
+  html += F(">Nacht gruen</button></a></div></div></section>");
 
   html += F("<section class='page' id='p3'><div class='card'><h2>Live</h2><pre id='liveBox'>Lade /api/status ...</pre></div></section>");
 
-  html += F("<section class='page' id='p4'><div class='card'><h2>Setup</h2><form action='/features' method='get'>"
+  html += F("<section class='page' id='p4'><div class='card'><h2>Setup: Daten & Funk</h2><div class='grid'>"
+            "<div class='metric'><span>ESP-NOW</span><b id='setupEspnowOn'>-</b></div>"
+            "<div class='metric'><span>Kanal</span><b id='setupEspnowCh'>-</b></div>"
+            "<div class='metric'><span>RX / Seq</span><b id='setupEspnowRx'>-</b></div>"
+            "<div class='metric'><span>Fresh</span><b id='setupEspnowFresh'>-</b></div>"
+            "</div><p class='sub'>Bus-Betrieb: Hub, M5 und 2.8C auf denselben ESP-NOW-Kanal stellen. Meist: Bus (Kanal 6).</p>"
+            "<form action='/features' method='get'>"
             "<p><label><input type='checkbox' name='wifi' value='1' ");
   html += g_featureWifi ? F("checked") : F("");
   html += F("> WLAN/Web aktiv</label></p><p><label><input type='checkbox' name='ble' value='1' ");
@@ -3842,21 +4235,24 @@ static void handleWebRoot() {
   if (g_espNowChannelPref == 6) html += F(" selected");
   html += F(">Bus (Kanal 6 / Spartan3-Setup)</option><option value='11'");
   if (g_espNowChannelPref == 11) html += F(" selected");
-  html += F(">Handy-Test (Kanal 11)</option></select></p><p>Hub IP: <input name='hub_host' value='");
+  html += F(">Handy-Test (Kanal 11)</option></select></p><p class='sub'>Automatisch folgt WLAN. Bus fixiert Kanal 6. Handy-Test fixiert Kanal 11.</p><p>Hub IP: <input name='hub_host' value='");
   html += String(g_hubHost);
   html += F("' style='width:100%;max-width:220px;padding:8px;background:#0d0d0d;border:1px solid #333;border-radius:8px;color:#eee'></p>"
-            "<p>Datenweg Hub: <select name='data_path'><option value='wifi'");
+            "<p>Fallback wenn ESP-NOW nicht frisch ist: <select name='data_path'><option value='wifi'");
   if (g_dataPath == DATA_PATH_WIFI_HUB) html += F(" selected");
-  html += F(">WiFi HTTP (empfohlen)</option><option value='ble'");
+  html += F(">Hub HTTP /api/status</option><option value='ble'");
   if (g_dataPath == DATA_PATH_BLE) html += F(" selected");
-  html += F(">BLE (Fallback)</option></select></p><p>Datenquelle (Kurz): "
+  html += F(">Hub BLE</option></select></p><p class='sub'>Live bevorzugt ESP-NOW. HTTP/BLE sind nur Rueckfall und Diagnose.</p><p>Datenquelle (Kurz): "
             "<a href='/source?m=hub_wifi'><button");
   if (g_dataPath == DATA_PATH_WIFI_HUB) html += F(" style='background:#54d273'");
-  html += F(">HUB WiFi</button></a><a href='/source?m=hub_ble'><button");
+  html += F(">HTTP Fallback</button></a><a href='/source?m=hub_ble'><button");
   if (g_dataPath == DATA_PATH_BLE && g_bleConnMode == BLE_MODE_SPARTAN_HUB) html += F(" style='background:#54d273'");
-  html += F(">HUB BLE</button></a><a href='/source?m=123'><button");
+  html += F(">BLE Fallback</button></a><a href='/source?m=123'><button");
   if (g_dataPath == DATA_PATH_BLE && g_bleConnMode == BLE_MODE_DIRECT_123) html += F(" style='background:#54d273'");
-  html += F(">123 direkt</button></a></p><button type='submit'>Speichern</button></form></div>"
+  html += F(">123 direkt</button></a></p><button type='submit'>Speichern</button></form></div></section>"
+            "<section class='page' id='p5'><div class='card'><h2>Setup 2: System</h2><p class='sub'>Zeit, BLE-Ziele, IMU, OTA und Neustart.</p>"
+            "<div class='row'><span><b>IMU Nullpunkt</b><br><span class='sub'>Display in Einbaulage ruhig halten, dann setzen.</span></span>"
+            "<a href='/imu_zero'><button>IMU NULL SET</button></a></div></div>"
             "<div class='card'><h2>Zeitzone</h2><p class='sub'>Uhrzeit per NTP (WLAN). Aktuell: <b id='tzLabel'>");
   html += String(timezoneLabel(g_timezoneIdx));
   html += F("</b> &middot; ");
@@ -3905,7 +4301,7 @@ static void handleWebRoot() {
             "<div class='card'><h2>Restart</h2><a href='/restart'><button>ESP32 neu starten</button></a></div></section>");
 
   html += F("<script>"
-            "const pageNames=['UHR','MENU','MOTOR','LAMBDA','HUB','SETUP','IMU'];"
+            "const pageNames=['UHR','MENU','MOTOR','LAMBDA','HUB','SETUP 1','IMU','OEL','DZM UHR','SETUP 2'];"
             "function num(v){const n=Number(v);return Number.isFinite(n)?n:0;}"
             "let lastPreviewPage=-2,espH=0,espM=0,espS=0,espSync=0,liveTimer=null,handTimer=null;"
             "function pvSet(sel,v){document.querySelectorAll(sel).forEach(e=>e.textContent=v);}"
@@ -3935,6 +4331,10 @@ static void handleWebRoot() {
             "set('dashLambda',d.lambda_valid?num(d.lambda).toFixed(2):'---');set('dashVolt',d.volt_valid?num(d.volt).toFixed(1):'---');"
             "const ht=document.getElementById('headerTime');if(ht&&d.hour!=null)ht.textContent=String(d.hour).padStart(2,'0')+':'+String(d.min).padStart(2,'0')+':'+String(d.sec).padStart(2,'0');"
             "set('dashPage',String(d.page));set('dashPageLabel',pageNames[d.page]||'?');set('dashRx',String(d.live_rx||0));"
+            "set('setupEspnowOn',d.esp_now_enabled?(d.esp_now_ready?'AN':'AN / wartet'):'AUS');"
+            "set('setupEspnowCh',d.esp_now_channel_label||String(d.esp_now_channel||'-'));"
+            "set('setupEspnowRx',String(d.esp_now_rx||0)+' / '+String(d.esp_now_seq||0));"
+            "set('setupEspnowFresh',d.esp_now_fresh?'ja':'nein');"
             "const ble=document.getElementById('dashBle');if(ble){"
             "const ok=(d.data_path==='wifi'?d.hub_wifi_ok:(d.ble_enabled&&d.ble_connected));"
             "ble.textContent=d.data_path==='wifi'?(d.hub_wifi_ok?'WiFi OK':'WiFi wartet'):(d.ble_enabled?(d.ble_connected?'BLE OK':'BLE scan'):'aus');"
@@ -4277,6 +4677,8 @@ static void handleWebStatus() {
   json += String(g_dialCenterOffsetY);
   json += F(",\"rpm_redline\":");
   json += String(g_rpmRedline);
+  json += F(",\"rpm_scale_max\":");
+  json += String(g_rpmScaleMax);
   json += F(",\"motor_style\":\"");
   json += motorStyleLabel();
   json += F("\",\"motor_style_idx\":");
@@ -4362,10 +4764,20 @@ static void handleWebSet() {
     g_redrawPage = true;
     DLOG("Web: Zifferblatt-Offset reset X=%d Y=%d\n", g_dialCenterOffsetX, g_dialCenterOffsetY);
   }
+  if (webServer.hasArg("rpm_max")) {
+    saveRpmScaleMax(webServer.arg("rpm_max").toInt());
+    g_redrawPage = true;
+    DLOG("Web: RPM Skala max = %d\n", g_rpmScaleMax);
+  }
   if (webServer.hasArg("rpm_redline")) {
     saveRpmRedline(webServer.arg("rpm_redline").toInt());
     g_redrawPage = true;
     DLOG("Web: RPM Redline = %d\n", g_rpmRedline);
+  }
+  if (webServer.hasArg("night")) {
+    saveNightMode(webServer.arg("night").toInt() != 0);
+    g_redrawPage = true;
+    DLOG("Web: Nachtmodus = %s\n", g_nightMode ? "on" : "off");
   }
   if (webServer.hasArg("motor_style")) {
     saveMotorStyle((uint8_t)webServer.arg("motor_style").toInt());
@@ -4592,6 +5004,15 @@ static void cycleWifiNetworkMode() {
     g_redrawPage = true;
     return;
   }
+  if (isOnBusWifi()) {
+    saveWifiProfile(0);
+    saveDataPath(DATA_PATH_WIFI_HUB);
+    saveHubHost(HUB_WIFI_DEFAULT_HOST);
+    saveFeatures(true, g_featureBle, g_featureBuzzer);
+    reconnectWifiProfile();
+    g_redrawPage = true;
+    return;
+  }
   const uint8_t count = wifiProfileCount();
   if (count > 1 && g_wifiProfile + 1 < count) {
     saveWifiProfile((uint8_t)(g_wifiProfile + 1));
@@ -4658,54 +5079,71 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
   Serial.printf("[TOUCH] setup y=%u dur=%lums rot=%d\n", y, (unsigned long)durMs, g_rotationDeg);
 #endif
 
-  // Zonen passend zu drawSetupPage (Zeilen-Mitte = Zonenstart + 18, Hoehe 36)
+  if (currentPage == 9) {
+    if (y >= 420) {
+      requestPage(1);
+      DLOGN("setup2 tap: menu");
+    } else if (y >= 100 && y < 148) {
+      saveFeatures(g_featureWifi, !g_featureBle, g_featureBuzzer);
+      g_redrawPage = true;
+      DLOG("setup2 tap: ble=%s\n", g_featureBle ? "on" : "off");
+    } else if (y >= 148 && y < 196) {
+      saveEspNowFeature(!g_featureEspNow);
+      g_redrawPage = true;
+      DLOG("setup2 tap: espnow=%s\n", g_featureEspNow ? "on" : "off");
+    } else if (y >= 196 && y < 244) {
+      cycleEspNowChannelPref();
+      g_redrawPage = true;
+      DLOG("setup2 tap: espnow_ch=%s\n", espNowChannelLabel());
+    } else if (y >= 244 && y < 292) {
+      saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
+      g_redrawPage = true;
+      DLOG("setup2 tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
+    } else if (y >= 292 && y < 340) {
+      cycleSourceMode();
+      DLOG("setup2 tap: source=%s\n", sourceModeLabel());
+    } else if (y >= 340 && y < 388) {
+      if (calibrateImuZero()) g_redrawPage = true;
+      DLOGN("setup2 tap: imu_null");
+    } else {
+      g_redrawPage = true;
+      DLOGN("setup2 tap: no action");
+    }
+    return;
+  }
+
+  // Zonen passend zu drawSetupPage.
   if (y >= 452) {
     requestPage(1);
     DLOGN("setup tap: menu");
     return;
   }
 
-  if (y >= 92 && y < 128) {
+  if (y >= 100 && y < 148) {
     int next = (g_dialScalePct < 115) ? 115 : (g_dialScalePct < 120 ? 120 : 115);
     saveDialScale(next);
     g_redrawPage = true;
     DLOG("setup tap: dial=%d%%\n", g_dialScalePct);
-  } else if (y >= 128 && y < 164) {
+  } else if (y >= 148 && y < 196) {
     int next = (g_brightnessPct < 63) ? 75 : (g_brightnessPct < 88 ? 100 : 50);
     saveBrightness(next);
     g_redrawPage = true;
     DLOG("setup tap: brightness=%d%%\n", g_brightnessPct);
-  } else if (y >= 164 && y < 200) {
+  } else if (y >= 196 && y < 244) {
     int next = (g_rotationDeg < 90) ? 90 : (g_rotationDeg < 180 ? 180 : (g_rotationDeg < 270 ? 270 : 0));
     saveRotation(next);
     g_redrawPage = true;
     DLOG("[ROT] setup tap -> %d deg\n", g_rotationDeg);
-  } else if (y >= 200 && y < 236) {
-    if (!isOnBusWifi()) applyBusProfile(true);
-    else cycleWifiNetworkMode();
+  } else if (y >= 244 && y < 292) {
+    cycleWifiNetworkMode();
     DLOG("setup tap: wifi network\n");
-  } else if (y >= 236 && y < 272) {
-    saveFeatures(g_featureWifi, !g_featureBle, g_featureBuzzer);
+  } else if (y >= 292 && y < 340) {
+    saveNightMode(!g_nightMode);
     g_redrawPage = true;
-    DLOG("setup tap: ble=%s\n", g_featureBle ? "on" : "off");
-  } else if (y >= 272 && y < 308) {
-    saveEspNowFeature(!g_featureEspNow);
-    g_redrawPage = true;
-    DLOG("setup tap: espnow=%s\n", g_featureEspNow ? "on" : "off");
-  } else if (y >= 308 && y < 344) {
-    cycleEspNowChannelPref();
-    g_redrawPage = true;
-    DLOG("setup tap: espnow_ch=%s\n", espNowChannelLabel());
-  } else if (y >= 344 && y < 380) {
-    saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
-    g_redrawPage = true;
-    DLOG("setup tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
-  } else if (y >= 380 && y < 416) {
-    cycleSourceMode();
-    DLOG("setup tap: source=%s\n", sourceModeLabel());
-  } else if (y >= 416 && y < 452) {
-    if (calibrateImuZero()) g_redrawPage = true;
-    DLOGN("setup tap: imu_null");
+    DLOG("setup tap: night=%s\n", g_nightMode ? "on" : "off");
+  } else if (y >= 340 && y < 404) {
+    requestPage(9);
+    DLOGN("setup tap: setup2");
   } else {
     g_redrawPage = true;
     DLOGN("setup tap: no action");
@@ -4715,13 +5153,20 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
 #if FEATURE_TOUCH
 static void pageNext() {
   if      (currentPage == 4) requestPage(6);
-  else if (currentPage == 6) requestPage(0);
+  else if (currentPage == 6) requestPage(7);
+  else if (currentPage == 7) requestPage(8);
+  else if (currentPage == 8) requestPage(0);
+  else if (currentPage == 5) requestPage(9);
+  else if (currentPage == 9) requestPage(1);
   else if (currentPage == 0) requestPage(1);
   else requestPage(currentPage + 1);
 }
 
 static void pagePrev() {
-  if      (currentPage == 0) requestPage(6);
+  if      (currentPage == 0) requestPage(8);
+  else if (currentPage == 9) requestPage(5);
+  else if (currentPage == 8) requestPage(7);
+  else if (currentPage == 7) requestPage(6);
   else if (currentPage == 6) requestPage(4);
   else if (currentPage == 1) requestPage(0);
   else requestPage(currentPage - 1);
@@ -4742,7 +5187,7 @@ static void handleTouchTap(uint16_t tapX, uint16_t tapY) {
     const int idx = menuIndexFromTap(tapX, tapY);
     if (idx >= 0) requestPage(MENU_ENTRIES[idx].page);
     else requestPage(0);
-  } else if (currentPage == 5) {
+  } else if (currentPage == 5 || currentPage == 9) {
     handleSetupLongPress(tapY, 0);
   } else {
     pageNext();
@@ -4785,12 +5230,12 @@ static void processTouchInput(bool *touchBusyOut) {
       touchLastY = y;
       blePauseForTouch();
     }
-    if (currentPage == 5 && !touchLongHandled && nowMs - touchStartMs >= 600) {
+    if ((currentPage == 5 || currentPage == 9) && !touchLongHandled && nowMs - touchStartMs >= 600) {
       touchLongHandled = true;
       lastTouch = nowMs;
       handleSetupLongPress(touchLastY, nowMs - touchStartMs);
     }
-  } else if (touchActive && nowMs - touchLastSeenMs > (currentPage == 5 ? 700UL : TOUCH_RELEASE_MS)) {
+  } else if (touchActive && nowMs - touchLastSeenMs > ((currentPage == 5 || currentPage == 9) ? 700UL : TOUCH_RELEASE_MS)) {
     const uint32_t durMs = touchLastSeenMs - touchStartMs;
     const uint16_t tapX = touchHadPos ? touchLastX : touchStartX;
     const uint16_t tapY = touchHadPos ? touchLastY : touchStartY;
@@ -4866,9 +5311,22 @@ void setup() {
     Serial.println("Boot: WiFi hub (was BLE hub)");
   }
 
-  if (hubWifiProfileIndex() != 0xFF &&
-      (strlen(currentWifiSsid()) == 0 || !isBusWifiSsid(currentWifiSsid()))) {
-    applyBusProfile(false);
+  Preferences pRecover;
+  pRecover.begin("clock", false);
+  const bool homeRecovered = pRecover.getBool("home_rec", false);
+  pRecover.end();
+  const uint8_t preferredHomeProfile = preferredHomeWifiProfileIndex();
+  if (!homeRecovered && wifiProfileCount() > 1 && g_wifiProfile != preferredHomeProfile) {
+    saveWifiProfile(preferredHomeProfile);
+    saveDataPath(DATA_PATH_WIFI_HUB);
+    saveHubHost(HUB_WIFI_DEFAULT_HOST);
+    g_featureBle = false;
+    Preferences pBoot;
+    pBoot.begin("clock", false);
+    pBoot.putBool("feat_ble", false);
+    pBoot.putBool("home_rec", true);
+    pBoot.end();
+    Serial.printf("Boot: Home-WLAN bevorzugt '%s'\n", currentWifiSsid());
   }
 
   // WiFi and BLE MUST init before the RGB panel. WiFi/BLE PHY init temporarily
@@ -5057,15 +5515,35 @@ void loop() {
     }
   }
   // Data pages: update at 1 Hz
-  if (!touchBusy && currentPage >= 2 && currentPage <= PAGE_MAX && currentPage != 6 && millis() - lastDraw >= 1000) {
+  if (!touchBusy && currentPage >= 2 && currentPage <= PAGE_MAX
+      && currentPage != 6 && currentPage != 7 && currentPage != 8
+      && millis() - lastDraw >= 1000) {
     lastDraw = millis();
     drawCurrentPage();
   }
-  // IMU page: ~5 Hz
-  if (!touchBusy && currentPage == 6 && millis() - lastDraw >= 200) {
-    lastDraw = millis();
-    qmi8658Read();
-    drawCurrentPage();
+  // IMU page: sensor read is cheap, but the full dial redraw clears the frame.
+  // Redraw only on visible motion, otherwise keep a slow heartbeat update.
+  if (!touchBusy && currentPage == 6) {
+    static uint32_t lastImuReadMs = 0;
+    static uint32_t lastImuDrawMs = 0;
+    static float lastImuDrawPitch = 999.0f;
+    static float lastImuDrawRoll = 999.0f;
+    const uint32_t nowMs = millis();
+    if (nowMs - lastImuReadMs >= 250) {
+      lastImuReadMs = nowMs;
+      qmi8658Read();
+      const bool firstDraw = lastImuDrawPitch > 900.0f;
+      const bool movedEnough = fabsf(g_imuPitch - lastImuDrawPitch) >= 0.5f
+                            || fabsf(g_imuRoll - lastImuDrawRoll) >= 0.5f;
+      const bool heartbeat = nowMs - lastImuDrawMs >= 1500;
+      if (firstDraw || movedEnough || heartbeat) {
+        lastDraw = nowMs;
+        lastImuDrawMs = nowMs;
+        lastImuDrawPitch = g_imuPitch;
+        lastImuDrawRoll = g_imuRoll;
+        drawCurrentPage();
+      }
+    }
   }
 
   delay(touchBusy ? 0 : 1);
