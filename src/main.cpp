@@ -85,8 +85,9 @@
 #define BLE_RECONNECT_123_MS    1500
 #define BLE_CONNECT_TIMEOUT_MS      3000
 #define BLE_CONNECT_TIMEOUT_HUB_MS  8000
-// M5 Dial 123: conn itvl=40ms lat=0 to=4000ms (NimBLE: 1.25ms / 10ms units)
-#define BLE_123_CONN_ITVL       32     // 40ms
+// M5 Dial 123: conn itvl=20-40ms lat=0 to=4000ms (NimBLE: 1.25ms / 10ms units)
+#define BLE_123_CONN_ITVL_MIN   16     // 20ms
+#define BLE_123_CONN_ITVL_MAX   32     // 40ms
 #define BLE_123_CONN_LATENCY    0
 #define BLE_123_CONN_TIMEOUT    400    // 4000ms
 #define BLE_123_KICK_DELAY_MS   900    // ~1s after NUS subscribe before $+CR
@@ -1288,7 +1289,7 @@ static void bleWaitScanStopped(NimBLEScan* s, uint32_t timeoutMs) {
 }
 
 static void bleWifiSleepRestore() {
-  if (g_bleScanWifiSleepWasOn) {
+  if (g_featureWifi && g_bleScanWifiSleepWasOn) {
     WiFi.setSleep(true);
     g_bleScanWifiSleepWasOn = false;
   }
@@ -1301,8 +1302,12 @@ static void bleDiscoveryScanEnded() {
 
 static void bleOpScanBegin() {
   if (!g_bleOpScanActive) {
-    g_bleScanWifiSleepWasOn = (WiFi.getSleep() != WIFI_PS_NONE);
-    WiFi.setSleep(WIFI_PS_NONE);
+    if (g_featureWifi) {
+      g_bleScanWifiSleepWasOn = (WiFi.getSleep() != WIFI_PS_NONE);
+      WiFi.setSleep(WIFI_PS_NONE);
+    } else {
+      g_bleScanWifiSleepWasOn = false;
+    }
     g_bleOpScanActive = true;
   }
 }
@@ -1563,6 +1568,42 @@ class SpartanClientCB : public NimBLEClientCallbacks {
   }
 };
 
+static bool bleIsUsable123Company(uint16_t company) {
+  return company == 133 || company == 1674 || company == 2330;  // BlueRadios, Raytac, Albertronic
+}
+
+static bool bleLooksLike123TuneAdvert(const NimBLEAdvertisedDevice* dev, const String& lname) {
+  if (lname.indexOf("bm6") >= 0 || lname.indexOf("123") >= 0 ||
+      lname.indexOf("tune") >= 0 || lname.indexOf("ign") >= 0) {
+    return true;
+  }
+  if (dev->isAdvertisingService(NimBLEUUID(NUS_SVC))) return true;
+  if (!dev->haveManufacturerData()) return false;
+
+  for (uint8_t i = 0; i < dev->getManufacturerDataCount(); i++) {
+    const std::string mfg = dev->getManufacturerData(i);
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(mfg.data());
+    const size_t len = mfg.size();
+    if (len < 4) continue;
+
+    uint16_t company = static_cast<uint16_t>(data[0]) |
+                       (static_cast<uint16_t>(data[1]) << 8);
+    size_t offset = 0;
+    if (bleIsUsable123Company(company)) {
+      offset = 2;
+    } else {
+      // 123Tune+ treats short legacy adverts without a company prefix as Albertronic.
+      company = 2330;
+      offset = 0;
+    }
+    if (!bleIsUsable123Company(company) || len <= offset + 1) continue;
+
+    const uint8_t deviceType = data[offset + 1];
+    if (deviceType == 0 || deviceType == 1 || deviceType == 5) return true;  // 123Tune+ app filter
+  }
+  return false;
+}
+
 static void bleScanListAdd(const NimBLEAdvertisedDevice* dev) {
   if (g_bleScanCount >= BLE_SCAN_MAX) return;
   String addr = dev->getAddress().toString().c_str();
@@ -1570,10 +1611,7 @@ static void bleScanListAdd(const NimBLEAdvertisedDevice* dev) {
   String name = dev->getName().c_str();
   name.toLowerCase();
   const bool is123Mac = macEquals(addr, DEFAULT_123_MAC) || macEquals(addr, g_bleTargetMac);
-  const bool is123Name = name.indexOf("123") >= 0 || name.indexOf("bm6") >= 0 ||
-                         name.indexOf("micro") >= 0 || name.indexOf("tune") >= 0 ||
-                         name.indexOf("squirt") >= 0 || name.indexOf("ign") >= 0;
-  const bool hasNus = dev->isAdvertisingService(NimBLEUUID(NUS_SVC)) || is123Mac || is123Name;
+  const bool hasNus = is123Mac || bleLooksLike123TuneAdvert(dev, name);
   const bool hasSpartan = dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC)) ||
                           name.indexOf("spartan") >= 0 || macEquals(addr, SPARTAN_MAC);
   for (uint8_t i = 0; i < g_bleScanCount; i++) {
@@ -1610,8 +1648,8 @@ static bool bleScanMatchesTarget(const NimBLEAdvertisedDevice* dev, String& addr
            macEquals(addr, SPARTAN_MAC) ||
            dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC));
   }
-  // 123 direkt: nur konfigurierte Ziel-MAC (nicht jedes BM6 im Scan)
-  return macEquals(addr, bleSavedMacForMode());
+  if (macEquals(addr, bleSavedMacForMode())) return true;
+  return bleLooksLike123TuneAdvert(dev, lname);
 }
 
 class SpartanScanCB : public NimBLEScanCallbacks {
@@ -1695,14 +1733,26 @@ static void bleStartScan() {
   s->setScanCallbacks(&spartanScanCB);
   s->setMaxResults(0xFF);
   s->setActiveScan(true);
-  s->setInterval(200);
-  s->setWindow(80);
+  if (g_bleConnMode == BLE_MODE_DIRECT_123) {
+    // Match M5Dial direct-123 behavior: near-continuous 10s scan catches the
+    // short ignition-on advertising window much more reliably.
+    s->setInterval(100);
+    s->setWindow(99);
+  } else {
+    s->setInterval(200);
+    s->setWindow(80);
+  }
   const uint32_t scanMs = (g_bleConnMode == BLE_MODE_DIRECT_123) ?
                           BLE_OP_SCAN_123_MS : BLE_DISCOVERY_SCAN_MS;
   bleLogSetState("scanning");
   BLELOG("BLE: Scan %lus (%s @ %s)",
          (unsigned long)(scanMs / 1000), bleConnModeLabel(), bleSavedMacForMode());
-  s->start(scanMs, false, true);
+  const bool started = s->start(scanMs, false, true);
+  if (!started) {
+    bleLogSetState("scan_start_fail");
+    bleNextScanAt = millis() + BLE_RECONNECT_123_MS;
+    bleWifiSleepRestore();
+  }
 }
 
 static bool bleStartDiscoveryScan() {
@@ -1746,14 +1796,10 @@ static void ble123PingTick();
 static bool bleLinkUp();
 
 static void bleIoYield() {
-#if FEATURE_TOUCH
-  bool tb = false;
-  processTouchInput(&tb);
-  if (g_redrawPage) {
-    g_redrawPage = false;
-    drawCurrentPage();
-  }
-#endif
+  // NOTE: do NOT poll the touch FSM here. processTouchInput() keeps static
+  // gesture state and must be driven from a single site (the main loop).
+  // Calling it re-entrantly from BLE blocking waits splits touch frames and
+  // corrupts menu navigation. Web poll + yield only.
   if (g_webStarted) webServerPoll(1);
   yield();
 }
@@ -1837,7 +1883,7 @@ static void bleConnect() {
     bleClient->setClientCallbacks(&spartanClientCB, false);
   }
   if (g_bleConnMode == BLE_MODE_DIRECT_123) {
-    bleClient->setConnectionParams(BLE_123_CONN_ITVL, BLE_123_CONN_ITVL,
+    bleClient->setConnectionParams(BLE_123_CONN_ITVL_MIN, BLE_123_CONN_ITVL_MAX,
                                    BLE_123_CONN_LATENCY, BLE_123_CONN_TIMEOUT);
   }
   bleClient->setConnectTimeout(g_bleConnMode == BLE_MODE_SPARTAN_HUB ?
@@ -1855,7 +1901,9 @@ static void bleConnect() {
       if (bleClient->isConnected()) bleClient->disconnect();
       blePauseMs(80);
     }
-    if (!bleClient->connect(bleTarget, false, false, true)) {
+    const bool deleteAttributes = (g_bleConnMode == BLE_MODE_DIRECT_123);
+    const bool asyncConnect = (g_bleConnMode != BLE_MODE_DIRECT_123);
+    if (!bleClient->connect(bleTarget, deleteAttributes, false, asyncConnect)) {
       BLELOG("BLE: connect FAIL err=%d (%s)", bleClient->getLastError(), bleConnModeLabel());
       continue;
     }
@@ -1968,14 +2016,12 @@ static void bleTick() {
   if (g_bleConn || g_bleDiscoveryScan) return;
   if (bleNextScanAt == 0 || millis() < bleNextScanAt) return;
   bleNextScanAt = 0;
-  // 123 direkt: Direct und Scan abwechseln (BM6 advertisiert selten)
+  // 123 direkt: wie beim M5 erst scannen und die tatsaechlich gefundene
+  // Adresse verwenden. Blind-Direct auf gespeicherte MAC/Adress-Typ ist bei
+  // 123/BM6 unzuverlaessig, weil das Advertising-Fenster kurz ist.
   if (g_bleConnMode == BLE_MODE_DIRECT_123) {
-    if (g_ble123ScanNext) {
-      g_ble123ScanNext = false;
-      bleStartScan();
-    } else if (!bleTryConnectSavedMac()) {
-      bleStartScan();
-    }
+    g_ble123ScanNext = false;
+    bleStartScan();
     return;
   }
   // Hub: Scan und Direct abwechseln — Direct allein scheitert wenn Hub nicht advertisiert
@@ -3651,22 +3697,15 @@ static void loadSettings() {
   g_wifiProfile   = p.getUChar("wifi_prof", 0);
   if (g_wifiProfile >= wifiProfileCount()) g_wifiProfile = 0;
   g_featureWifi   = p.getBool("feat_wifi", strlen(currentWifiSsid()) > 0);
-  g_featureBle    = p.getBool("feat_ble",  false);
+  g_featureBle    = p.getBool("feat_ble",  true);
   g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
   g_featureEspNow = p.getBool("feat_espnow", true);
   g_espNowChannelPref = p.getUChar("espnow_ch", 0);
-  g_bleConnMode   = p.getUChar("ble_mode", BLE_MODE_SPARTAN_HUB) == BLE_MODE_DIRECT_123 ?
+  g_bleConnMode   = p.getUChar("ble_mode", BLE_MODE_DIRECT_123) == BLE_MODE_DIRECT_123 ?
                     BLE_MODE_DIRECT_123 : BLE_MODE_SPARTAN_HUB;
   String mac123 = p.getString("ble_mac_123", "");
   if (mac123.length() == 0) mac123 = p.getString("ble_mac", DEFAULT_123_MAC);
   strncpy(g_bleTargetMac, mac123.c_str(), sizeof(g_bleTargetMac) - 1);
-  if (mac123.equalsIgnoreCase("3c:ab:72:7f:d0:bc")) {
-    mac123 = DEFAULT_123_MAC;
-    Preferences pw;
-    pw.begin("clock", false);
-    pw.putString("ble_mac_123", mac123);
-    pw.end();
-  }
   g_bleTargetMac[sizeof(g_bleTargetMac) - 1] = 0;
   g_ble123AddrType = p.getUChar("ble_addr_123", BLE_ADDR_RANDOM);
   String macHub = p.getString("ble_mac_hub", "");
@@ -3690,15 +3729,21 @@ static void loadSettings() {
   g_motorStyle   = p.getUChar("motor_style", MOTOR_STYLE_VDO);
   if (g_motorStyle > MOTOR_STYLE_MERCEDES) g_motorStyle = MOTOR_STYLE_VDO;
   g_motorStyle = MOTOR_STYLE_VDO;
-  g_dataPath = p.getUChar("data_path", DATA_PATH_WIFI_HUB) == DATA_PATH_BLE ?
+  g_dataPath = p.getUChar("data_path", DATA_PATH_BLE) == DATA_PATH_BLE ?
                DATA_PATH_BLE : DATA_PATH_WIFI_HUB;
+  // NOTE: data_path is independent of the BLE mode. Do NOT force data_path=BLE
+  // just because ble_mode is "direct" — that overrode the saved Hub/ESP-NOW
+  // source on every boot, so the user's source choice never survived a reboot.
+  // The source selector (applySourceMode) already sets data_path + feat_ble
+  // consistently when 123-direct / hub-BLE is chosen.
   g_wifiApOnly = p.getBool("wifi_ap_only", false);
   String hubHost = p.getString("hub_host", HUB_WIFI_DEFAULT_HOST);
   hubHost.trim();
   if (hubHost.length() == 0) hubHost = HUB_WIFI_DEFAULT_HOST;
   strncpy(g_hubHost, hubHost.c_str(), sizeof(g_hubHost) - 1);
   g_hubHost[sizeof(g_hubHost) - 1] = 0;
-  if (isBusWifiSsid(currentWifiSsid()) && strcmp(g_hubHost, HUB_BUS_HOST) != 0) {
+  if (g_dataPath != DATA_PATH_BLE &&
+      isBusWifiSsid(currentWifiSsid()) && strcmp(g_hubHost, HUB_BUS_HOST) != 0) {
     strncpy(g_hubHost, HUB_BUS_HOST, sizeof(g_hubHost) - 1);
     g_hubHost[sizeof(g_hubHost) - 1] = 0;
   }
@@ -3911,6 +3956,7 @@ static void saveFeatures(bool wifi, bool ble, bool buzzer) {
   } else if (!wasBle) {
     NimBLEDevice::init("VDO-Clock");
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    NimBLEDevice::setMTU(23);
     bleNextScanAt = millis() + 5000;
     Serial.println("BLE: AN, Scan startet...");
   } else if (!g_bleConn && !bleDoConnect && bleNextScanAt == 0) {
@@ -4799,6 +4845,10 @@ static void handleWebStatus() {
   json += jsonEscape(String(g_bleState));
   json += F("\",\"ble_log\":\"");
   json += jsonEscape(String(g_bleLogLine));
+  json += F("\",\"ble_last_error\":");
+  json += String(bleClient ? bleClient->getLastError() : 0);
+  json += F(",\"ble_addr_type\":");
+  json += String((unsigned)g_ble123AddrType);
   json += F("\",\"page\":");
   json += String(currentPage);
   json += F(",\"page_label\":\"");
@@ -5461,6 +5511,13 @@ void setup() {
 
   loadSettings();
 
+  // Boot follows the saved data source (NVS) instead of forcing 123 BLE
+  // direct. 123-direct stays selectable via menu/web, but the default is
+  // whatever the user last chose (e.g. Hub ESP-NOW) so a reboot does not
+  // drop into a no-data BLE-scan mode and freeze the UI.
+  Serial.printf("Boot: data source feat_ble=%d path=%u mode=%u\n",
+                g_featureBle ? 1 : 0, (unsigned)g_dataPath, (unsigned)g_bleConnMode);
+
   if (g_dataPath == DATA_PATH_BLE && g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
     g_dataPath = DATA_PATH_WIFI_HUB;
     g_featureBle = false;
@@ -5477,7 +5534,8 @@ void setup() {
   const bool homeRecovered = pRecover.getBool("home_rec", false);
   pRecover.end();
   const uint8_t preferredHomeProfile = preferredHomeWifiProfileIndex();
-  if (!homeRecovered && wifiProfileCount() > 1 && g_wifiProfile != preferredHomeProfile) {
+  if (g_dataPath != DATA_PATH_BLE &&
+      !homeRecovered && wifiProfileCount() > 1 && g_wifiProfile != preferredHomeProfile) {
     saveWifiProfile(preferredHomeProfile);
     saveDataPath(DATA_PATH_WIFI_HUB);
     saveHubHost(HUB_WIFI_DEFAULT_HOST);
@@ -5510,6 +5568,7 @@ void setup() {
   if (g_featureBle && g_dataPath == DATA_PATH_BLE) {
     NimBLEDevice::init("VDO-Clock");
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    NimBLEDevice::setMTU(23);
     g_bleStackReady = true;
     const uint32_t bootDelay = (g_bleConnMode == BLE_MODE_DIRECT_123) ? 1500u : 3000u;
     bleNextScanAt = millis() + bootDelay;
@@ -5667,7 +5726,13 @@ void loop() {
 
   if (!touchBusy) tickDialCacheRebuild();
 
-  // WiFi/NTP background tick; redraw clock on fresh sync
+  const bool bleDirectDrive =
+      g_featureBle && g_dataPath == DATA_PATH_BLE && g_bleConnMode == BLE_MODE_DIRECT_123;
+
+  // WiFi/NTP background tick — runs in ALL modes (incl. 123 BLE direct) so the
+  // web server starts and the dashboard stays reachable in the car, same as the
+  // M5 which runs WiFi + BLE direct simultaneously. (startWebServer() lives
+  // inside wifiNtpTick(), so gating this out also kills port 80.)
   if (!touchBusy && wifiNtpTick() && currentPage == 0) drawVdoClock();
 
   // Hub data via WiFi HTTP (default path; no BLE slot conflict with M5 Dial)
@@ -5680,8 +5745,9 @@ void loop() {
     ble123KickTick();
   }
 
-  // BLE: only when explicitly selected (fallback); avoids fighting M5 for hub slot
-  if (g_featureBle && g_dataPath == DATA_PATH_BLE && (!touchBusy || bleDoConnect)) {
+  // BLE direct 123 is the primary drive path, same as the M5. Keep it ticking
+  // even while touch/web work is active so short 123 advertising windows are not missed.
+  if (bleDirectDrive || (g_featureBle && g_dataPath == DATA_PATH_BLE && (!touchBusy || bleDoConnect))) {
     static uint32_t bleTickMs = 0;
     if (millis() - bleTickMs >= BLE_TICK_MS) {
       bleTickMs = millis();
