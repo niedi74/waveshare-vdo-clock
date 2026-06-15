@@ -3560,9 +3560,31 @@ static void drawImuPage() {
     char degLine[18];
     snprintf(gradeLine, sizeof(gradeLine), "%+.0f%%", gradePct);
     snprintf(degLine, sizeof(degLine), "%+.1f DEG", pitch);
-    drawTextCentered(240, 382, "STEIGUNG", dim, 2);
-    drawTextCentered(240, 412, gradeLine, cream, 4);
-    drawTextCentered(240, 446, degLine, dim, 2);
+    drawTextCentered(240, 360, "STEIGUNG", dim, 2);
+    drawTextCentered(240, 390, gradeLine, cream, 4);
+    drawTextCentered(240, 420, degLine, dim, 2);
+    const int barY = 448;
+    const int barX0 = 78;
+    const int barX1 = 402;
+    const int barCx = 240;
+    drawLineFast(barX0, barY, barX1, barY, dim, 4);
+    drawLineFast(barCx, barY - 15, barCx, barY + 15, cream, 3);
+    for (int g = -20; g <= 20; g += 10) {
+      const int tx = barCx + (int)lroundf((float)g / 25.0f * 150.0f);
+      drawLineFast(tx, barY - 9, tx, barY + 9, dim, 2);
+      if (g != 0) {
+        char gl[8];
+        snprintf(gl, sizeof(gl), "%d", abs(g));
+        drawTextCentered(tx, barY - 32, gl, dim, 1);
+      }
+    }
+    const int markerX = constrain(barCx + (int)lroundf(gradePct / 25.0f * 150.0f), barX0, barX1);
+    const uint16_t markerCol = gradePct >= 0.0f ? RGB565(235, 175, 45) : RGB565(120, 180, 240);
+    drawLineFast(markerX - 12, barY - 18, markerX, barY - 2, markerCol, 4);
+    drawLineFast(markerX + 12, barY - 18, markerX, barY - 2, markerCol, 4);
+    drawLineFast(markerX, barY - 2, markerX, barY + 18, markerCol, 4);
+    drawTextCentered(105, 466, "AB", dim, 1);
+    drawTextCentered(375, 466, "AUF", dim, 1);
     if (g_imuTrimmed) drawTextCentered(240, 96, "NULL", dim, 1);
 
     static bool buzzerOn = false;
@@ -4313,7 +4335,7 @@ static void handleWebRoot() {
   html += F(">123 direkt</button></a></p><button type='submit'>Speichern</button></form></div></section>"
             "<section class='page' id='p5'><div class='card'><h2>Setup 2: System</h2><p class='sub'>Zeit, BLE-Ziele, IMU, OTA und Neustart.</p>"
             "<div class='row'><span><b>IMU Nullpunkt</b><br><span class='sub'>Display in Einbaulage ruhig halten, dann setzen.</span></span>"
-            "<a href='/imu_zero'><button>IMU NULL SET</button></a></div></div>"
+            "<a href='/imu/zero'><button>IMU NULL SET</button></a></div></div>"
             "<div class='card'><h2>Zeitzone</h2><p class='sub'>Uhrzeit per NTP (WLAN). Aktuell: <b id='tzLabel'>");
   html += String(timezoneLabel(g_timezoneIdx));
   html += F("</b> &middot; ");
@@ -4992,6 +5014,7 @@ static void startWebServer() {
   webServer.on("/api/preview", HTTP_GET, handleWebPreview);
   webServer.on("/restart", HTTP_GET, handleWebRestart);
   webServer.on("/imu/zero", HTTP_GET, handleWebImuZero);
+  webServer.on("/imu_zero", HTTP_GET, handleWebImuZero);
   webServer.on("/update", HTTP_POST, []() {
     const bool ok = !Update.hasError() && Update.remaining() == 0;
     webServer.sendHeader("Connection", "close");
