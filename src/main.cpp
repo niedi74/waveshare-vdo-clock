@@ -3464,21 +3464,23 @@ static void drawSetup2Page() {
   drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
   drawTextCentered(240, 54, "SETUP 2", RGB565(230, 190, 70), 4);
   drawTextCentered(240, 82, "FUNK / QUELLE", RGB565(170, 160, 135), 2);
-  drawDataRow(124, "BLE",    g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
+  drawDataRow(112, "BLE",    g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
               g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(154, "BLE SRC", g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "SPARTAN" : "123 DIREKT",
+              g_bleConnMode == BLE_MODE_SPARTAN_HUB ? RGB565(120, 200, 120) : RGB565(235, 150, 60));
   {
     char ebuf[20];
     if (!g_featureEspNow) snprintf(ebuf, sizeof(ebuf), "AUS");
     else if (espNowDataFresh()) snprintf(ebuf, sizeof(ebuf), "OK rx%lu", (unsigned long)g_espNowRx);
     else snprintf(ebuf, sizeof(ebuf), "AN %s", espNowChannelLabel());
-    drawDataRow(172, "ESPNOW", ebuf,
+    drawDataRow(196, "ESPNOW", ebuf,
                 g_featureEspNow && espNowDataFresh() ? RGB565(60, 210, 100) :
                 (g_featureEspNow ? RGB565(220, 180, 60) : RGB565(150, 150, 150)));
   }
-  drawDataRow(220, "ESPN CH", espNowChannelLabel(), RGB565(120, 180, 240));
-  drawDataRow(268, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
+  drawDataRow(238, "ESPN CH", espNowChannelLabel(), RGB565(120, 180, 240));
+  drawDataRow(280, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
               g_featureBuzzer ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
-  drawDataRow(316, "QUELLE", sourceModeLabel(),
+  drawDataRow(322, "QUELLE", sourceModeLabel(),
               g_dataPath == DATA_PATH_WIFI_HUB ? RGB565(80, 160, 240) :
               (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? RGB565(120, 200, 120) : RGB565(235, 150, 60)));
   drawDataRow(364, "IMU NULL", g_imuTrimmed ? "SET" : "TAP",
@@ -5142,26 +5144,29 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     if (y >= 420) {
       requestPage(1);
       DLOGN("setup2 tap: menu");
-    } else if (y >= 100 && y < 148) {
+    } else if (y >= 96 && y < 133) {
       saveFeatures(g_featureWifi, !g_featureBle, g_featureBuzzer);
       g_redrawPage = true;
       DLOG("setup2 tap: ble=%s\n", g_featureBle ? "on" : "off");
-    } else if (y >= 148 && y < 196) {
+    } else if (y >= 133 && y < 175) {
+      applySourceMode(g_bleConnMode == BLE_MODE_DIRECT_123 ? "hub_ble" : "123");
+      DLOG("setup2 tap: ble source=%s\n", bleConnModeLabel());
+    } else if (y >= 175 && y < 217) {
       saveEspNowFeature(!g_featureEspNow);
       g_redrawPage = true;
       DLOG("setup2 tap: espnow=%s\n", g_featureEspNow ? "on" : "off");
-    } else if (y >= 196 && y < 244) {
+    } else if (y >= 217 && y < 259) {
       cycleEspNowChannelPref();
       g_redrawPage = true;
       DLOG("setup2 tap: espnow_ch=%s\n", espNowChannelLabel());
-    } else if (y >= 244 && y < 292) {
+    } else if (y >= 259 && y < 301) {
       saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
       g_redrawPage = true;
       DLOG("setup2 tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
-    } else if (y >= 292 && y < 340) {
+    } else if (y >= 301 && y < 343) {
       cycleSourceMode();
       DLOG("setup2 tap: source=%s\n", sourceModeLabel());
-    } else if (y >= 340 && y < 388) {
+    } else if (y >= 343 && y < 397) {
       if (calibrateImuZero()) g_redrawPage = true;
       DLOGN("setup2 tap: imu_null");
     } else {
