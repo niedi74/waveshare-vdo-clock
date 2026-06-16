@@ -1572,11 +1572,13 @@ static bool bleIsUsable123Company(uint16_t company) {
   return company == 133 || company == 1674 || company == 2330;  // BlueRadios, Raytac, Albertronic
 }
 
-static bool bleLooksLike123TuneAdvert(const NimBLEAdvertisedDevice* dev, const String& lname) {
-  if (lname.indexOf("bm6") >= 0 || lname.indexOf("123") >= 0 ||
-      lname.indexOf("tune") >= 0 || lname.indexOf("ign") >= 0) {
-    return true;
-  }
+// Identify the 123 the way the original 123Tune+ app does: by MANUFACTURER DATA
+// (company 133/1674/2330 + a 123\TUNE+ device-type byte), never by name. The old
+// name match ("bm6"/"123"/"tune"/"ign") grabbed the BM6 battery monitors, which
+// is fatal in a bus full of BM6s. The company filter alone already excludes every
+// BM6 (different company id). With a single 123 in range this is unambiguous and
+// needs no serial number. The fixed user MAC is matched separately as a fallback.
+static bool bleLooksLike123TuneAdvert(const NimBLEAdvertisedDevice* dev, const String& /*lname*/) {
   if (dev->isAdvertisingService(NimBLEUUID(NUS_SVC))) return true;
   if (!dev->haveManufacturerData()) return false;
 
@@ -1586,20 +1588,15 @@ static bool bleLooksLike123TuneAdvert(const NimBLEAdvertisedDevice* dev, const S
     const size_t len = mfg.size();
     if (len < 4) continue;
 
-    uint16_t company = static_cast<uint16_t>(data[0]) |
-                       (static_cast<uint16_t>(data[1]) << 8);
-    size_t offset = 0;
-    if (bleIsUsable123Company(company)) {
-      offset = 2;
-    } else {
-      // 123Tune+ treats short legacy adverts without a company prefix as Albertronic.
-      company = 2330;
-      offset = 0;
-    }
-    if (!bleIsUsable123Company(company) || len <= offset + 1) continue;
+    // Require an EXPLICIT 123 company prefix (Raytac 1674 / Albertronic 2330 /
+    // BlueRadios 133). No "assume Albertronic" fallback — that mis-parsed BM6
+    // adverts and produced false matches. App layout: [company:2][?][type][serial:2].
+    const uint16_t company = static_cast<uint16_t>(data[0]) |
+                             (static_cast<uint16_t>(data[1]) << 8);
+    if (!bleIsUsable123Company(company)) continue;
 
-    const uint8_t deviceType = data[offset + 1];
-    if (deviceType == 0 || deviceType == 1 || deviceType == 5) return true;  // 123Tune+ app filter
+    const uint8_t deviceType = data[3];
+    if (deviceType == 1 || deviceType == 5) return true;  // 123\TUNE+ BlueRadios/Raytac
   }
   return false;
 }
@@ -1648,8 +1645,12 @@ static bool bleScanMatchesTarget(const NimBLEAdvertisedDevice* dev, String& addr
            macEquals(addr, SPARTAN_MAC) ||
            dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC));
   }
-  if (macEquals(addr, bleSavedMacForMode())) return true;
-  return bleLooksLike123TuneAdvert(dev, lname);
+  // 123 direct auto-connect: match ONLY the fixed 123 MAC, exactly like the M5.
+  // The 123's connectable address (ef:a8:b2..) is stable; the bus is full of
+  // rotating name="123" NRPA decoys that are NOT the connectable device, so any
+  // name/manufacturer heuristic just makes us chase un-connectable addresses.
+  // (bleLooksLike123TuneAdvert is still used for the discovery scan LIST.)
+  return macEquals(addr, bleSavedMacForMode());
 }
 
 class SpartanScanCB : public NimBLEScanCallbacks {
@@ -1663,7 +1664,10 @@ class SpartanScanCB : public NimBLEScanCallbacks {
     g_bleHubName = name.length() > 0 ? name :
                    (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? SPARTAN_NAME : "123");
     if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) saveBleMacHub(addr.c_str());
-    else saveBleMac123(addr.c_str(), dev->getAddress().getType());
+    // 123: connect to the live advertised address but do NOT persist it. The 123
+    // can rotate its BLE address; auto-overwriting the saved MAC made the next
+    // reconnect chase a stale/rotating address (the 33:9f:c1 connect-timeout
+    // loop). Re-match fresh by manufacturer data each scan instead, like the app.
     bleTarget    = dev->getAddress();
     g_ble123ScanNext = false;
     g_ble123AddrFlip = 0;
