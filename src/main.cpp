@@ -98,7 +98,7 @@
 #define BLE_SCAN_WEB_WAIT_MS  800
 #define BLE_STATUS_LOG_MS     8000   // periodischer Offline-Status (Serial + API)
 #define BLE_LIVE_LOG_MS       4000   // rpm/adv wenn LIVE-Daten ankommen
-#define DEVICE_HOSTNAME       "vdo-touch-28"
+#define DEVICE_HOSTNAME       "esp-touch2.8"
 // Throttled BLE logs on USB serial @115200. Set 0 in platformio.ini to silence serial.
 #ifndef BLE_LOG_SERIAL
 #define BLE_LOG_SERIAL 1
