@@ -204,7 +204,7 @@ enum DataPath : uint8_t { DATA_PATH_WIFI_HUB = 0, DATA_PATH_BLE = 1 };
 #define HUB_BUS_HOST          "192.168.4.1"
 #define HUB_BUS_CLIENT_IP     "192.168.4.3"   // M5 Dial uses .2 on Spartan3-Setup
 #define HUB_WIFI_POLL_MS      300
-#define HUB_WIFI_TIMEOUT_MS   1200
+#define HUB_WIFI_TIMEOUT_MS   400   // hart begrenzt: HTTP darf den Renderloop nie lange blockieren
 #define DATA_FRESH_MS         3000
 static constexpr uint8_t kSettingsVersion = 1;  // v1: Bus-Profil Standard beim Boot
 static DataPath  g_dataPath       = DATA_PATH_WIFI_HUB;
@@ -1232,6 +1232,14 @@ static void hubWifiPollTick() {
   static uint32_t nextPollMs = 0;
   const uint32_t now = millis();
   if (now < nextPollMs) return;
+  // ESP-NOW ist der Live-Pfad. Solange frische ESP-NOW-Frames kommen, NICHT
+  // den synchronen HTTP-GET fahren — der blockiert den Renderloop bis zu
+  // HUB_WIFI_TIMEOUT_MS und lässt das Cockpit "einfrieren". HTTP nur als
+  // Fallback/Diagnose, wenn ESP-NOW still ist.
+  if (g_featureEspNow && espNowDataFresh()) {
+    nextPollMs = now + 1000;  // entspannt im Hintergrund weiterprüfen
+    return;
+  }
   nextPollMs = now + HUB_WIFI_POLL_MS;
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -4338,7 +4346,9 @@ static void handleWebRoot() {
        (g_hubWifiOk ? "WiFi OK" : "WiFi wartet") :
        (g_featureBle ? (g_bleConn ? "BLE OK" : "BLE scan") : "aus")) + "</span></div>";
   html += "<div class='pill'>" + String(dataPathLabel()) + " RX <span id='dashRx'>" +
-          String((unsigned long)g_liveRxCnt) + "</span></div></div></section>";
+          String((unsigned long)g_liveRxCnt) + "</span></div></div>";
+  html += F("<div class='card'><a href='/sport'><button style='width:100%;padding:14px;font-size:1.1rem;background:#c0392b;color:#fff;border:0;border-radius:10px'>&#127937; SPORT / Cockpit live</button></a>"
+            "<p class='sub'>Ein Druck: ESP-NOW live + 123 direkt + Kombi-Tacho, fl&uuml;ssige Drehzahl. Am besten im Bus.</p></div></section>");
 
   html += F("<section class='page' id='p1'><div class='card'><h2>WLAN</h2><div>Aktiv: <b>");
   html += String(currentWifiSsid()[0] ? currentWifiSsid() : "(kein)");
@@ -5128,6 +5138,33 @@ static void handleWebSource() {
   webServer.send(303);
 }
 
+// SPORT / Cockpit: Ein-Tasten-Livebetrieb. ESP-NOW als Live-Quelle (push,
+// kein blockierender HTTP-Poll), direkt aufs Kombiinstrument, Buzzer aus.
+// Mit den schnellen Renderraten fühlt sich die Drehzahl wie ein echtes
+// Cockpit an. Funktioniert am besten im Bus (alle Geräte gleicher Kanal).
+static void applySportCockpit() {
+#if ENABLE_ESP_NOW_CLIENT
+  if (!g_featureEspNow) saveEspNowFeature(true);
+#endif
+  // BLE 123-direkt als Rückfall, falls ESP-NOW mal still ist (gleiche Logik
+  // wie der M5, der direkt am 123 "echt" wirkt).
+  saveDataPath(DATA_PATH_BLE);
+  if (!g_featureBle) saveFeatures(g_featureWifi, true, g_featureBuzzer);
+  if (g_bleConnMode != BLE_MODE_DIRECT_123) {
+    saveBleConnMode(BLE_MODE_DIRECT_123);
+    disconnectBleForModeChange();
+  }
+  if (g_featureBuzzer) saveFeatures(g_featureWifi, g_featureBle, false);
+  requestPage(8);  // TACHO + UHR Kombi = das Cockpit
+  Serial.println("SPORT: Cockpit live (ESP-NOW push + 123 direkt, Tacho-Kombi)");
+}
+
+static void handleWebSport() {
+  applySportCockpit();
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
 static void startWebServer() {
   webServer.on("/",        handleWebRoot);
   webServer.on("/set",     handleWebSet);
@@ -5158,6 +5195,7 @@ static void startWebServer() {
     webServer.send(303);
   });
   webServer.on("/source",  handleWebSource);
+  webServer.on("/sport",   handleWebSport);
   webServer.on("/scan",    HTTP_GET, handleWebScan);
   webServer.on("/ble/scan", HTTP_POST, handleWebBleScanStart);
   webServer.on("/ble/scan", HTTP_GET, handleWebBleScanStart);
@@ -5697,6 +5735,7 @@ void loop() {
 #endif
         else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
         else if (cmd == "bus" || cmd == "bus:on") { applyBusProfile(true); g_redrawPage = true; }
+        else if (cmd == "sport") { applySportCockpit(); }
         else if (cmd == "wifi:off")  { saveFeatures(false, g_featureBle, g_featureBuzzer); g_redrawPage = true; }
         else if (cmd == "rot:+") { saveRotation(g_rotationDeg + 1); g_redrawPage = true; }
         else if (cmd == "rot:-") { saveRotation(g_rotationDeg - 1); g_redrawPage = true; }
@@ -5805,10 +5844,29 @@ void loop() {
       }
     }
   }
-  // Data pages: update at 1 Hz
-  if (!touchBusy && currentPage >= 2 && currentPage <= PAGE_MAX
-      && currentPage != 6 && currentPage != 7
-      && millis() - lastDraw >= 1000) {
+  // Live-Tacho-Seiten: datengetrieben mit hoher Rate => flüssige Nadel wie ein
+  // echtes Cockpit. Doppelpuffer (num_fbs=2) => kein Tearing trotz Vollredraw.
+  // 2=MOTOR, 7=KOMBI, 8=TACHO+UHR. (Seite 7 war früher GANZ vom Redraw
+  // ausgeschlossen — deshalb stand dort nie eine Drehzahl.)
+  const bool liveTachPage = (currentPage == 2 || currentPage == 7 || currentPage == 8);
+  // Ruhige Datenseiten (3=LAMBDA, 4=HUB) + Setup (5,9): 1 Hz reicht.
+  const bool slowDataPage = (currentPage == 3 || currentPage == 4 ||
+                             currentPage == 5 || currentPage == 9);
+  if (!touchBusy && liveTachPage) {
+    static int      lastRpmDraw   = -100000;
+    static uint32_t lastTachDraw  = 0;
+    const uint32_t nowMs = millis();
+    const int rpmNow = (int)g_rpm;
+    const bool rpmMoved   = abs(rpmNow - lastRpmDraw) >= 15;
+    const bool minElapsed = (nowMs - lastTachDraw) >= 45;    // <= ~22 Hz Obergrenze
+    const bool heartbeat  = (nowMs - lastTachDraw) >= 400;   // Volt/Temp/Lambda/Stale
+    if ((rpmMoved && minElapsed) || heartbeat) {
+      lastRpmDraw  = rpmNow;
+      lastTachDraw = nowMs;
+      lastDraw     = nowMs;
+      drawCurrentPage();
+    }
+  } else if (!touchBusy && slowDataPage && millis() - lastDraw >= 1000) {
     lastDraw = millis();
     drawCurrentPage();
   }
