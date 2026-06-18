@@ -98,6 +98,7 @@
 #define BLE_SCAN_WEB_WAIT_MS  800
 #define BLE_STATUS_LOG_MS     8000   // periodischer Offline-Status (Serial + API)
 #define BLE_LIVE_LOG_MS       4000   // rpm/adv wenn LIVE-Daten ankommen
+#define DEVICE_HOSTNAME       "vdo-touch-28"
 // Throttled BLE logs on USB serial @115200. Set 0 in platformio.ini to silence serial.
 #ifndef BLE_LOG_SERIAL
 #define BLE_LOG_SERIAL 1
@@ -5368,6 +5369,7 @@ static void reconnectWifiProfile() {
   g_featureWifi = true;
   stopApOnlyMode();
   strcpy(g_ipStr, "...");
+  WiFi.setHostname(DEVICE_HOSTNAME);
   WiFi.mode(WIFI_STA);
   applyWifiIpConfig();
   WiFi.begin(currentWifiSsid(), currentWifiPassword());
@@ -5389,6 +5391,7 @@ void setup() {
   uint32_t serialWait = millis();
   while (!Serial && millis() - serialWait < 2000) delay(10);
   Serial.println("\n=== Waveshare 2.8C VDO Clock ===");
+  Serial.printf("Hostname: %s\n", DEVICE_HOSTNAME);
   otaNoteBootState();
   Serial.printf("PSRAM found: %s, size: %u bytes\n", psramFound() ? "yes" : "no", ESP.getPsramSize());
 
