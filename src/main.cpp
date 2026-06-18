@@ -3357,15 +3357,20 @@ static void drawTachClockCombiPage() {
     drawTextSmall(lx, ly, lab, cream, scale);
   }
 
-  drawTextCentered(240, 84, "VDO", cream, 2);
-  drawTextCentered(240, 112, "UPM", cream, 2);
-  drawTextCentered(240, 136, "x100", cream, 2);
+  drawTextCentered(240, 98, "VDO", cream, 1);
+  drawTextCentered(240, 114, "UPM", cream, 1);
+  drawTextCentered(240, 130, "x100", cream, 1);
+  char lambdaBuf[12];
+  if (dataFresh() && g_lambdaValid) snprintf(lambdaBuf, sizeof(lambdaBuf), "L %.2f", g_lambda);
+  else snprintf(lambdaBuf, sizeof(lambdaBuf), "L --");
+  drawTextCentered(240, 154, lambdaBuf, g_lambdaValid ? RGB565(120, 220, 150) : dim, 2);
 
   const bool fresh = dataFresh();
   const float rpmVal = fresh ? rpmScaleValue(g_rpm) : (float)RPM_SCALE_MIN_VALUE;
   drawVdoNeedle(cx, cy, rpmScaleAngle(rpmVal), 184, yellow);
-  fillCircleFast(cx, cy, 31, vdoHubColor());
-  drawCircleLine(cx, cy, 31, 2, dim);
+  fillCircleFast(cx, cy, 19, vdoHubColor());
+  drawCircleLine(cx, cy, 19, 2, dim);
+  fillCircleFast(cx, cy, 8, yellow);
 
   drawVdoSubClockAt(240, 342, 43);
   drawTextCentered(240, 438, "MADE IN GERMANY", cream, 2);
@@ -5637,7 +5642,7 @@ void loop() {
   }
   // Data pages: update at 1 Hz
   if (!touchBusy && currentPage >= 2 && currentPage <= PAGE_MAX
-      && currentPage != 6 && currentPage != 7 && currentPage != 8
+      && currentPage != 6 && currentPage != 7
       && millis() - lastDraw >= 1000) {
     lastDraw = millis();
     drawCurrentPage();
