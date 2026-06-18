@@ -37,3 +37,20 @@ https://github.com/niedi74/waveshare-vdo-clock.git
 ```
 
 The old ESP32-S3-Touchscreen/Copit repo is a different project and should not be used as this repo's remote.
+
+## Cursor Cloud specific instructions
+
+- This is ESP32-S3 firmware built with PlatformIO. There is no host application to run; the
+  "application" is firmware that is flashed onto the physical Waveshare board over `COM13`. That
+  hardware is not present in the cloud VM, so `-t upload` and `pio device monitor` cannot be used
+  here. The build (`pio run -e waveshare_s3_28c`) is the end-to-end verification in this environment.
+- `pio` is installed in a venv at `~/.pio-venv` and symlinked onto `PATH` (`/usr/local/bin/pio`).
+  The startup update script recreates/refreshes it, so just run `pio ...` directly.
+- First build downloads the pioarduino espressif32 platform + toolchain + NimBLE (a few minutes);
+  incremental rebuilds are ~20s. Build artifacts land in `.pio/build/waveshare_s3_28c/`
+  (`firmware.bin`, `firmware.elf`), which is gitignored.
+- `scripts/inject_time.py` (pre) injects the host build time as `RTC_BUILD_*` flags; the build is
+  therefore non-deterministic by design (RTC seed changes each build) — this is expected.
+- There is no separate lint step configured; `pio run` (compiler warnings/errors) is the check.
+- `platformio.ini` pins `upload_port`/`monitor_port` to `COM13` (Windows host). These are ignored
+  for plain `pio run`.
