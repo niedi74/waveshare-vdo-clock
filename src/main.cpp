@@ -4341,7 +4341,7 @@ static void handleWebRoot() {
   html += "<div class='pill'>" + String(dataPathLabel()) + " RX <span id='dashRx'>" +
           String((unsigned long)g_liveRxCnt) + "</span></div></div>";
   html += F("<div class='card'><a href='/sport'><button style='width:100%;padding:14px;font-size:1.1rem;background:#c0392b;color:#fff;border:0;border-radius:10px'>&#127937; SPORT / Cockpit live</button></a>"
-            "<p class='sub'>Ein Druck: ESP-NOW live vom Hub + Kombi-Tacho (Seite 8), fl&uuml;ssige Drehzahl, BLE aus. Am besten im Bus.</p></div></section>");
+            "<p class='sub'>Ein Druck: 123 direkt (BLE, schnelle Drehzahl) + Lambda via ESP-NOW Kanal 6 vom Hub + Kombi-Tacho (Seite 8).</p></div></section>");
 
   html += F("<section class='page' id='p1'><div class='card'><h2>WLAN</h2><div>Aktiv: <b>");
   html += String(currentWifiSsid()[0] ? currentWifiSsid() : "(kein)");
@@ -5136,11 +5136,26 @@ static void handleWebSource() {
 // Mit den schnellen Renderraten fühlt sich die Drehzahl wie ein echtes
 // Cockpit an. Funktioniert am besten im Bus (alle Geräte gleicher Kanal).
 static void applySportCockpit() {
-  // SPORT = Funk-Bus (reines ESP-NOW Kanal 6, WLAN + BLE aus) + direkt aufs
-  // Cockpit. Maximal stabil und flüssig, keine Funk-Konkurrenz.
-  applyBusProfile(false);
+  // SPORT/Cockpit = 123 DIREKT (BLE) für Drehzahl/Zündung (schnell, displaynah)
+  // + Lambda via ESP-NOW Kanal 6 vom Hub (Spartan3 CAN). Der Hub ist hier NICHT
+  // 123-Central, darum ist sein "tune" nicht fresh -> ESP-NOW überschreibt die
+  // direkte Drehzahl NICHT, liefert nur Lambda dazu. WLAN-Assoziation nicht
+  // nötig (ESP-NOW hält den Radio auf Kanal 6).
+#if ENABLE_ESP_NOW_CLIENT
+  if (!g_featureEspNow) saveEspNowFeature(true);
+  g_espNowChannelPref = 6;
+  { Preferences p; p.begin("clock", false); p.putUChar("espnow_ch", 6); p.end(); }
+  teardownEspNowClient();
+#endif
+  saveDataPath(DATA_PATH_BLE);
+  if (!g_featureBle) saveFeatures(g_featureWifi, true, g_featureBuzzer);
+  if (g_bleConnMode != BLE_MODE_DIRECT_123) {
+    saveBleConnMode(BLE_MODE_DIRECT_123);
+    disconnectBleForModeChange();
+  }
+  if (g_featureBuzzer) saveFeatures(g_featureWifi, g_featureBle, false);
   requestPage(8);  // TACHO + UHR Kombi = das Cockpit
-  Serial.println("SPORT: Funk-Bus + Tacho-Kombi (ESP-NOW Kanal 6, WLAN+BLE aus)");
+  Serial.println("SPORT: 123 direkt (BLE) + Lambda via ESP-NOW Kanal 6");
 }
 
 static void handleWebSport() {

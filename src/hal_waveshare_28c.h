@@ -55,20 +55,37 @@ static esp_lcd_panel_handle_t hal_panel = nullptr;
 static uint16_t *hal_frame = nullptr;
 static bool hal_frame_owned = false;
 static bool hal_ready = false;
+static uint16_t *hal_fb_a = nullptr;   // echter Doppelpuffer: zwei Panel-FBs
+static uint16_t *hal_fb_b = nullptr;
 
 static bool hal_bind_framebuffer() {
   if (!hal_panel) return false;
-  void *fb0 = nullptr;
-  if (esp_lcd_rgb_panel_get_frame_buffer(hal_panel, 1, &fb0) != ESP_OK || !fb0) {
-    return false;
-  }
   if (hal_frame && hal_frame_owned) {
     heap_caps_free(hal_frame);
+    hal_frame = nullptr;
+    hal_frame_owned = false;
   }
-  hal_frame = (uint16_t *)fb0;
-  hal_frame_owned = false;
-  Serial.printf("hal_fb: panel FB0 %p\n", hal_frame);
-  return true;
+  // BEIDE Panel-Framebuffer holen (num_fbs=2). Abwechselnd in den NICHT
+  // angezeigten zeichnen und per draw_bitmap auf VSYNC umschalten = echter
+  // Doppelpuffer: kein Kopieren -> kein Flackern UND kein "Wisch".
+  void *fb0 = nullptr, *fb1 = nullptr;
+  if (esp_lcd_rgb_panel_get_frame_buffer(hal_panel, 2, &fb0, &fb1) == ESP_OK && fb0 && fb1) {
+    hal_fb_a = (uint16_t *)fb0;
+    hal_fb_b = (uint16_t *)fb1;
+    hal_frame = hal_fb_b;          // fb0 wird angezeigt, in fb1 zeichnen
+    hal_frame_owned = false;
+    Serial.printf("hal_fb: double-buffer A=%p B=%p\n", hal_fb_a, hal_fb_b);
+    return true;
+  }
+  // Fallback: nur ein FB
+  if (esp_lcd_rgb_panel_get_frame_buffer(hal_panel, 1, &fb0) == ESP_OK && fb0) {
+    hal_fb_a = hal_fb_b = (uint16_t *)fb0;
+    hal_frame = (uint16_t *)fb0;
+    hal_frame_owned = false;
+    Serial.printf("hal_fb: single FB %p\n", hal_frame);
+    return true;
+  }
+  return false;
 }
 
 static uint8_t hal_pca_write_once(uint8_t reg, uint8_t val) {
@@ -339,18 +356,12 @@ inline int hal_tacho_dimmer_read_pct() { return -1; }
 
 uint16_t *hal_fb() {
   if (!hal_frame) {
-    // OFF-SCREEN rendern: eigener PSRAM-Puffer, danach per draw_bitmap in den
-    // Panel-FB kopieren = sauberer Doppelpuffer-Swap auf VSYNC, KEIN Flackern
-    // auch bei hoher Bildrate. (Direkt an den Panel-Scan-Puffer gebunden würde
-    // jeder Vollbild-Lösch sofort sichtbar -> "wildes Blinken" beim schnellen
-    // Neuzeichnen des Tachos.)
-    hal_frame = (uint16_t *)heap_caps_malloc(480 * 480 * sizeof(uint16_t),
-                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    hal_frame_owned = (hal_frame != nullptr);
-    Serial.printf("hal_fb: off-screen buffer %p\n", hal_frame);
-    if (!hal_frame) {
-      // Notfall: doch an den Panel-FB binden (kein Speicher frei)
-      hal_bind_framebuffer();
+    if (!hal_bind_framebuffer()) {
+      // Notfall: eigener PSRAM-Puffer (wird per draw_bitmap kopiert)
+      hal_frame = (uint16_t *)heap_caps_malloc(480 * 480 * sizeof(uint16_t),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      hal_frame_owned = (hal_frame != nullptr);
+      Serial.printf("hal_fb: malloc fallback %p\n", hal_frame);
     }
   }
   return hal_frame;
@@ -358,9 +369,14 @@ uint16_t *hal_fb() {
 
 void hal_present() {
   if (!hal_frame || !hal_panel) return;
-  esp_lcd_panel_draw_bitmap(hal_panel, 0, 0, 480, 480, hal_frame);
+  // CPU-Schreibzugriffe in den PSRAM-FB flushen, dann umschalten (VSYNC-Swap).
   if (!hal_frame_owned) {
     esp_cache_msync(hal_frame, 480 * 480 * sizeof(uint16_t), 0);
+  }
+  esp_lcd_panel_draw_bitmap(hal_panel, 0, 0, 480, 480, hal_frame);
+  // Für den nächsten Frame in den jeweils ANDEREN Panel-FB zeichnen.
+  if (!hal_frame_owned && hal_fb_a && hal_fb_b && hal_fb_a != hal_fb_b) {
+    hal_frame = (hal_frame == hal_fb_a) ? hal_fb_b : hal_fb_a;
   }
 }
 
