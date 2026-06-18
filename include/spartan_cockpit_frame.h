@@ -5,10 +5,13 @@
 
 // Shared cockpit frame for Spartan hub -> display clients (ESP-NOW broadcast).
 // Copy this header into M5/Waveshare firmware for decoding.
+//
+// v2 (2026-06-17): added the 123 internal voltage / temperature / coil current
+// so ESP-NOW clients show the same Volt/Temp/Coil as a 123-direct connection.
 
 constexpr uint8_t kSpartanCockpitMagic = 0x53;  // 'S'
-constexpr uint8_t kSpartanCockpitVersion = 1;
-constexpr size_t kSpartanCockpitFrameSize = 14;
+constexpr uint8_t kSpartanCockpitVersion = 2;
+constexpr size_t kSpartanCockpitFrameSize = 17;
 
 #pragma pack(push, 1)
 struct SpartanCockpitFrame {
@@ -20,6 +23,9 @@ struct SpartanCockpitFrame {
   int16_t advance_x10;
   uint8_t map;
   uint8_t spartan_status;
+  uint8_t tune_volt_x10;  // 123 internal voltage * 10 (0..25.5 V)
+  int8_t tune_temp_c;     // 123 internal temperature (deg C)
+  uint8_t tune_coil_x10;  // 123 coil current * 10 (0..25.5 A)
   uint8_t flags;
   uint8_t crc8;
 };
@@ -51,6 +57,17 @@ inline bool spartanCockpitFrameValid(const SpartanCockpitFrame &frame)
   return frame.crc8 == expected;
 }
 
+// Decode helpers for the v2 tune fields.
+inline float spartanCockpitVolt(const SpartanCockpitFrame &frame)
+{
+  return frame.tune_volt_x10 / 10.0f;
+}
+
+inline float spartanCockpitCoil(const SpartanCockpitFrame &frame)
+{
+  return frame.tune_coil_x10 / 10.0f;
+}
+
 inline void spartanCockpitEncode(SpartanCockpitFrame *frame,
                                  uint16_t seq,
                                  float lambda,
@@ -60,7 +77,10 @@ inline void spartanCockpitEncode(SpartanCockpitFrame *frame,
                                  uint8_t map,
                                  uint8_t spartanStatus,
                                  bool tuneFresh,
-                                 bool tuneConnected)
+                                 bool tuneConnected,
+                                 float tuneVolt,
+                                 float tuneTemp,
+                                 float tuneCoil)
 {
   frame->magic = kSpartanCockpitMagic;
   frame->version = kSpartanCockpitVersion;
@@ -70,6 +90,22 @@ inline void spartanCockpitEncode(SpartanCockpitFrame *frame,
   frame->advance_x10 = static_cast<int16_t>(advance * 10.0f + (advance >= 0 ? 0.5f : -0.5f));
   frame->map = map;
   frame->spartan_status = spartanStatus;
+
+  float voltScaled = tuneVolt * 10.0f + 0.5f;
+  if (voltScaled < 0.0f) voltScaled = 0.0f;
+  if (voltScaled > 255.0f) voltScaled = 255.0f;
+  frame->tune_volt_x10 = static_cast<uint8_t>(voltScaled);
+
+  float tempRounded = tuneTemp + (tuneTemp >= 0 ? 0.5f : -0.5f);
+  if (tempRounded < -128.0f) tempRounded = -128.0f;
+  if (tempRounded > 127.0f) tempRounded = 127.0f;
+  frame->tune_temp_c = static_cast<int8_t>(tempRounded);
+
+  float coilScaled = tuneCoil * 10.0f + 0.5f;
+  if (coilScaled < 0.0f) coilScaled = 0.0f;
+  if (coilScaled > 255.0f) coilScaled = 255.0f;
+  frame->tune_coil_x10 = static_cast<uint8_t>(coilScaled);
+
   frame->flags = 0;
   if (lambdaValid) {
     frame->flags |= kSpartanFlagLambdaValid;

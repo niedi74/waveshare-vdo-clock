@@ -459,8 +459,9 @@ static void webOtaAbortUpload() {
 }
 
 struct WifiProfile {
-  const char* ssid;
-  const char* pass;
+  char ssid[33];
+  char pass[65];
+  const char* label;
 };
 
 #ifndef HUB_SETUP_WIFI_SSID
@@ -470,15 +471,12 @@ struct WifiProfile {
 #define HUB_SETUP_WIFI_PASS "lambda123"
 #endif
 
-static const WifiProfile WIFI_PROFILES[] = {
-  { WIFI_SSID, WIFI_PASSWORD },
-#ifdef WIFI_SSID_2
-  { WIFI_SSID_2, WIFI_PASSWORD_2 },
-#endif
-#ifdef WIFI_SSID_3
-  { WIFI_SSID_3, WIFI_PASSWORD_3 },
-#endif
-  { HUB_SETUP_WIFI_SSID, HUB_SETUP_WIFI_PASS },
+// Slot 0 = Bus (Spartan3-Setup, fest), Slot 1 = Zuhause, Slot 2 = Handy
+// Slot 1+2 SSIDs werden aus NVS geladen (p1_ssid/p1_pass, p2_ssid/p2_pass)
+static WifiProfile WIFI_PROFILES[3] = {
+  { HUB_SETUP_WIFI_SSID, HUB_SETUP_WIFI_PASS, "Bus" },
+  { "", "", "Zuhause" },
+  { "", "", "Handy"   },
 };
 
 static uint8_t wifiProfileCount() {
@@ -500,24 +498,15 @@ static const char* currentWifiPassword() {
 }
 
 static uint8_t hubWifiProfileIndex() {
-  const uint8_t count = wifiProfileCount();
-  for (uint8_t i = 0; i < count; i++) {
-    if (strcmp(WIFI_PROFILES[i].ssid, HUB_SETUP_WIFI_SSID) == 0) return i;
-  }
-  return 0xFF;
+  return 0;  // Bus ist immer Slot 0
 }
 
 static uint8_t preferredHomeWifiProfileIndex() {
-  const uint8_t count = wifiProfileCount();
-#ifdef WIFI_SSID_2
-  for (uint8_t i = 0; i < count; i++) {
-    if (strcmp(WIFI_PROFILES[i].ssid, WIFI_SSID_2) == 0) return i;
+  // Erstes Nicht-Bus-Profil mit nicht-leerem SSID
+  for (uint8_t i = 1; i < wifiProfileCount(); i++) {
+    if (WIFI_PROFILES[i].ssid[0] != 0) return i;
   }
-#endif
-  for (uint8_t i = 0; i < count; i++) {
-    if (WIFI_PROFILES[i].ssid[0] != 0 && strcmp(WIFI_PROFILES[i].ssid, HUB_SETUP_WIFI_SSID) != 0) return i;
-  }
-  return 0;
+  return 1;  // Zuhause-Slot, auch wenn leer
 }
 
 static bool isBusWifiSsid(const char* ssid) {
@@ -533,18 +522,23 @@ static void syncHubHostForWifi() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (WiFi.SSID() == HUB_SETUP_WIFI_SSID) {
     if (strcmp(g_hubHost, HUB_BUS_HOST) != 0) saveHubHost(HUB_BUS_HOST);
-  } else if (strcmp(WiFi.SSID().c_str(), WIFI_SSID) == 0
-#ifdef WIFI_SSID_2
-             || strcmp(WiFi.SSID().c_str(), WIFI_SSID_2) == 0
-#endif
-            ) {
-    if (strcmp(g_hubHost, HUB_WIFI_DEFAULT_HOST) != 0) saveHubHost(HUB_WIFI_DEFAULT_HOST);
   } else {
-    IPAddress gw = WiFi.gatewayIP();
-    if (gw[0] != 0) {
-      char buf[20];
-      snprintf(buf, sizeof(buf), "%s", gw.toString().c_str());
-      if (strcmp(g_hubHost, buf) != 0) saveHubHost(buf);
+    // Bekanntes Heim/Handy-Profil → Hub-Standard-IP
+    bool knownHome = false;
+    for (uint8_t i = 1; i < wifiProfileCount(); i++) {
+      if (WIFI_PROFILES[i].ssid[0] && strcmp(WiFi.SSID().c_str(), WIFI_PROFILES[i].ssid) == 0) {
+        knownHome = true; break;
+      }
+    }
+    if (knownHome) {
+      if (strcmp(g_hubHost, HUB_WIFI_DEFAULT_HOST) != 0) saveHubHost(HUB_WIFI_DEFAULT_HOST);
+    } else {
+      IPAddress gw = WiFi.gatewayIP();
+      if (gw[0] != 0) {
+        char buf[20];
+        snprintf(buf, sizeof(buf), "%s", gw.toString().c_str());
+        if (strcmp(g_hubHost, buf) != 0) saveHubHost(buf);
+      }
     }
   }
 }
@@ -564,11 +558,7 @@ static void applyWifiIpConfig() {
 }
 
 static void applyBusProfile(bool reconnect) {
-  const uint8_t idx = hubWifiProfileIndex();
-  if (idx == 0xFF) {
-    Serial.println("Bus: Spartan3-Setup Profil fehlt");
-    return;
-  }
+  const uint8_t idx = hubWifiProfileIndex();  // always 0
   stopApOnlyMode();
   saveWifiProfile(idx);
   saveDataPath(DATA_PATH_BLE);
@@ -958,6 +948,11 @@ static void applyEspNowFrame(const SpartanCockpitFrame& frame) {
     g_rpm = frame.rpm;
     g_adv = frame.advance_x10 / 10.0f;
     g_map = frame.map;
+    // v2: 123 Volt/Temp aus dem Frame uebernehmen (ESP-NOW Anzeige)
+    const float volt = spartanCockpitVolt(frame);
+    if (volt > 0.5f) { g_battVolt = volt; g_battValid = true; }
+    g_g123Temp = (float)frame.tune_temp_c;
+    g_g123Valid = true;
   }
   g_espNowLastRxMs = millis();
   strncpy(g_hubSourceTag, "espnow", sizeof(g_hubSourceTag));
@@ -3698,6 +3693,11 @@ static void loadSettings() {
   g_brightnessPct = p.getInt("bright",    100);
   g_nightMode     = p.getBool("night",    false);
   g_rotationDeg   = p.getInt("rot_deg",   0);
+  // Editierbare Profile aus NVS laden (vor wifi_prof, da currentWifiSsid() das braucht)
+  strlcpy(WIFI_PROFILES[1].ssid, p.getString("p1_ssid", WIFI_SSID).c_str(), sizeof(WIFI_PROFILES[1].ssid));
+  strlcpy(WIFI_PROFILES[1].pass, p.getString("p1_pass", WIFI_PASSWORD).c_str(), sizeof(WIFI_PROFILES[1].pass));
+  strlcpy(WIFI_PROFILES[2].ssid, p.getString("p2_ssid", "").c_str(), sizeof(WIFI_PROFILES[2].ssid));
+  strlcpy(WIFI_PROFILES[2].pass, p.getString("p2_pass", "").c_str(), sizeof(WIFI_PROFILES[2].pass));
   g_wifiProfile   = p.getUChar("wifi_prof", 0);
   if (g_wifiProfile >= wifiProfileCount()) g_wifiProfile = 0;
   g_featureWifi   = p.getBool("feat_wifi", strlen(currentWifiSsid()) > 0);
@@ -4341,19 +4341,31 @@ static void handleWebRoot() {
           String((unsigned long)g_liveRxCnt) + "</span></div></div></section>";
 
   html += F("<section class='page' id='p1'><div class='card'><h2>WLAN</h2><div>Aktiv: <b>");
-  html += String(currentWifiSsid());
+  html += String(currentWifiSsid()[0] ? currentWifiSsid() : "(kein)");
   html += F("</b> &middot; ");
   html += WiFi.status() == WL_CONNECTED ? F("<span class='ok'>verbunden</span>") : F("<span class='warn'>nicht verbunden</span>");
   html += F("</div>");
   html += "<div>DNS Name: <b>" + configuredHostname() + "</b></div>";
   html += "<form action='/hostname' method='get'><div class='row'><label>DNS-/Geraetename <input name='host' maxlength='31' pattern='[A-Za-z0-9.-]{1,31}' value='" + configuredHostname() + "'></label><button type='submit'>Name speichern + reboot</button></div></form>";
-  html += F("<div>");
+  html += F("<div style='margin:8px 0'>");
   for (uint8_t i = 0; i < wifiProfileCount(); i++) {
     html += "<a href='/wifi?prof=" + String(i) + "'><button";
     if (i == g_wifiProfile) html += F(" style='background:#54d273'");
-    html += ">" + String(WIFI_PROFILES[i].ssid) + "</button></a>";
+    html += ">" + String(WIFI_PROFILES[i].label);
+    if (WIFI_PROFILES[i].ssid[0]) html += " (" + String(WIFI_PROFILES[i].ssid) + ")";
+    html += F("</button></a> ");
   }
-  html += F("</div><button onclick='scanWifi()'>&#128269; Scan</button><table><thead><tr><th>SSID</th><th>RSSI</th><th>Status</th><th></th></tr></thead><tbody id='scanRows'><tr><td colspan='4'>Noch kein Scan</td></tr></tbody></table><p class='sub'>Scan-Zeile antippen oder Profil oben w&auml;hlen. Spartan3-Setup = Hub-AP @ 192.168.4.1</p></div>"
+  html += F("</div><details style='margin:8px 0'><summary>Profile bearbeiten</summary>");
+  for (uint8_t i = 1; i < wifiProfileCount(); i++) {
+    html += "<form action='/wifi_profile_save' method='post' style='margin:4px 0'>";
+    html += "<b>" + String(WIFI_PROFILES[i].label) + ":</b> ";
+    html += "<input name='ssid' value='" + String(WIFI_PROFILES[i].ssid) + "' placeholder='SSID' size='18'> ";
+    html += "<input name='pass' type='password' placeholder='Passwort' size='14'> ";
+    html += "<input type='hidden' name='slot' value='" + String(i) + "'>";
+    html += F("<button type='submit'>Speichern</button></form>");
+  }
+  html += F("</details>");
+  html += F("<button onclick='scanWifi()'>&#128269; Scan</button><table><thead><tr><th>SSID</th><th>RSSI</th><th>Status</th><th></th></tr></thead><tbody id='scanRows'><tr><td colspan='4'>Noch kein Scan</td></tr></tbody></table><p class='sub'>Scan-Zeile antippen oder Profil oben w&auml;hlen. Spartan3-Setup = Hub-AP @ 192.168.4.1</p></div>"
             "<div class='card'><h3>Bus (unterwegs)</h3><p class='sub'>Fahrtprofil: BLE direkt zum 123, ESP-NOW Lambda vom Hub, HTTP nur Status/Zeit. Display @ 192.168.4.3 (M5 @ .2).</p><div class='row'><a href='/wifi?mode=bus'><button");
   if (isOnBusWifi() && g_dataPath == DATA_PATH_BLE && g_bleConnMode == BLE_MODE_DIRECT_123 && g_featureEspNow) html += F(" style='background:#54d273'");
   html += F(">BUS / Spartan3-Setup</button></a></div></div>"
@@ -5124,6 +5136,27 @@ static void startWebServer() {
   webServer.on("/page",    handleWebPage);
   webServer.on("/wifi",    handleWebWifi);
   webServer.on("/hostname", handleWebHostname);
+  webServer.on("/wifi_profile_save", HTTP_POST, []() {
+    int slot = webServer.arg("slot").toInt();
+    if (slot < 1 || slot > 2) { webServer.send(400, "text/plain", "Ungültiger Slot"); return; }
+    String ssid = webServer.arg("ssid"); ssid.trim();
+    String pass = webServer.arg("pass");
+    strlcpy(WIFI_PROFILES[slot].ssid, ssid.c_str(), sizeof(WIFI_PROFILES[slot].ssid));
+    if (pass.length() > 0)
+      strlcpy(WIFI_PROFILES[slot].pass, pass.c_str(), sizeof(WIFI_PROFILES[slot].pass));
+    Preferences p; p.begin("clock", false);
+    if (slot == 1) {
+      p.putString("p1_ssid", ssid);
+      if (pass.length() > 0) p.putString("p1_pass", pass);
+    } else {
+      p.putString("p2_ssid", ssid);
+      if (pass.length() > 0) p.putString("p2_pass", pass);
+    }
+    p.end();
+    DLOG("WiFi: Profil %d gespeichert SSID='%s'\n", slot, ssid.c_str());
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+  });
   webServer.on("/source",  handleWebSource);
   webServer.on("/scan",    HTTP_GET, handleWebScan);
   webServer.on("/ble/scan", HTTP_POST, handleWebBleScanStart);
@@ -5214,7 +5247,7 @@ static void cycleWifiNetworkMode() {
     return;
   }
   if (isOnBusWifi()) {
-    saveWifiProfile(0);
+    saveWifiProfile(preferredHomeWifiProfileIndex());
     saveDataPath(DATA_PATH_WIFI_HUB);
     saveHubHost(HUB_WIFI_DEFAULT_HOST);
     saveFeatures(true, g_featureBle, g_featureBuzzer);
