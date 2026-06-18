@@ -3940,6 +3940,39 @@ static String jsonEscape(const String& value) {
   return out;
 }
 
+static String normalizeHostnameInput(const String& raw) {
+  String name = raw;
+  name.trim();
+  name.toLowerCase();
+  String out;
+  out.reserve(name.length());
+  bool lastDash = false;
+  for (size_t i = 0; i < name.length() && out.length() < 31; i++) {
+    const char c = name[i];
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.';
+    if (!ok) continue;
+    if (c == '-' || c == '.') {
+      if (out.length() == 0 || lastDash) continue;
+      lastDash = true;
+    } else {
+      lastDash = false;
+    }
+    out += c;
+  }
+  while (out.endsWith("-") || out.endsWith(".")) out.remove(out.length() - 1);
+  return out;
+}
+
+static String configuredHostname() {
+  Preferences p;
+  p.begin("clock", true);
+  String name = p.isKey("hostname") ? p.getString("hostname", DEVICE_HOSTNAME) : String(DEVICE_HOSTNAME);
+  p.end();
+  name = normalizeHostnameInput(name);
+  if (name.length() == 0) name = DEVICE_HOSTNAME;
+  return name;
+}
+
 static void jsonAppendFloat(String& json, float v, int decimals) {
   if (!isfinite(v)) json += F("0");
   else json += String(v, decimals);
@@ -4261,7 +4294,10 @@ static void handleWebRoot() {
   html += String(currentWifiSsid());
   html += F("</b> &middot; ");
   html += WiFi.status() == WL_CONNECTED ? F("<span class='ok'>verbunden</span>") : F("<span class='warn'>nicht verbunden</span>");
-  html += F("</div><div>");
+  html += F("</div>");
+  html += "<div>DNS Name: <b>" + configuredHostname() + "</b></div>";
+  html += "<form action='/hostname' method='get'><div class='row'><label>DNS-/Geraetename <input name='host' maxlength='31' pattern='[A-Za-z0-9.-]{1,31}' value='" + configuredHostname() + "'></label><button type='submit'>Name speichern + reboot</button></div></form>";
+  html += F("<div>");
   for (uint8_t i = 0; i < wifiProfileCount(); i++) {
     html += "<a href='/wifi?prof=" + String(i) + "'><button";
     if (i == g_wifiProfile) html += F(" style='background:#54d273'");
@@ -4675,6 +4711,8 @@ static void handleWebStatus() {
   json += jsonEscape(String(timezoneLabel(g_timezoneIdx)));
   json += F("\",\"ip\":\"");
   json += jsonEscape(String(g_ipStr));
+  json += F("\",\"hostname\":\"");
+  json += jsonEscape(configuredHostname());
   json += F("\",\"rpm\":");
   json += String((int)g_rpm);
   json += F(",\"adv\":");
@@ -5000,6 +5038,21 @@ static void handleWebWifi() {
   webServer.send(303);
 }
 
+static void handleWebHostname() {
+  String name = normalizeHostnameInput(webServer.arg("host"));
+  if (name.length() == 0) {
+    webServer.send(400, "text/plain", "DNS-Name ungueltig. Erlaubt: a-z, 0-9, Punkt und Bindestrich.");
+    return;
+  }
+  Preferences p;
+  p.begin("clock", false);
+  p.putString("hostname", name);
+  p.end();
+  webServer.send(200, "text/plain", "DNS name saved. Rebooting...");
+  delay(500);
+  ESP.restart();
+}
+
 static void handleWebSource() {
   if (webServer.hasArg("m")) {
     applySourceMode(webServer.arg("m").c_str());
@@ -5016,6 +5069,7 @@ static void startWebServer() {
   webServer.on("/tz",      handleWebTimezone);
   webServer.on("/page",    handleWebPage);
   webServer.on("/wifi",    handleWebWifi);
+  webServer.on("/hostname", handleWebHostname);
   webServer.on("/source",  handleWebSource);
   webServer.on("/scan",    HTTP_GET, handleWebScan);
   webServer.on("/ble/scan", HTTP_POST, handleWebBleScanStart);
@@ -5073,6 +5127,8 @@ static void enterApOnlyMode() {
   saveWifiApOnly(true);
   WiFi.disconnect(true);
   delay(50);
+  const String hostName = configuredHostname();
+  WiFi.setHostname(hostName.c_str());
   WiFi.mode(WIFI_AP);
   WiFi.softAP("VDO-Clock-Setup", "vdoclock");
   g_apOn = true;
@@ -5369,7 +5425,8 @@ static void reconnectWifiProfile() {
   g_featureWifi = true;
   stopApOnlyMode();
   strcpy(g_ipStr, "...");
-  WiFi.setHostname(DEVICE_HOSTNAME);
+  const String hostName = configuredHostname();
+  WiFi.setHostname(hostName.c_str());
   WiFi.mode(WIFI_STA);
   applyWifiIpConfig();
   WiFi.begin(currentWifiSsid(), currentWifiPassword());
@@ -5391,7 +5448,7 @@ void setup() {
   uint32_t serialWait = millis();
   while (!Serial && millis() - serialWait < 2000) delay(10);
   Serial.println("\n=== Waveshare 2.8C VDO Clock ===");
-  Serial.printf("Hostname: %s\n", DEVICE_HOSTNAME);
+  Serial.printf("Hostname: %s\n", configuredHostname().c_str());
   otaNoteBootState();
   Serial.printf("PSRAM found: %s, size: %u bytes\n", psramFound() ? "yes" : "no", ESP.getPsramSize());
 
@@ -5442,6 +5499,8 @@ void setup() {
   } else if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
     WiFi.persistent(false);  // keine WiFi-Flash-Schreibzugriffe -> kein Cache-Disable
     WiFi.setSleep(true);     // Modem-Sleep: weniger PSRAM-Bus-Konkurrenz
+    const String hostName = configuredHostname();
+    WiFi.setHostname(hostName.c_str());
     WiFi.mode(WIFI_STA);
     applyWifiIpConfig();
     WiFi.begin(currentWifiSsid(), currentWifiPassword());
