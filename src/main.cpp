@@ -558,29 +558,24 @@ static void applyWifiIpConfig() {
 }
 
 static void applyBusProfile(bool reconnect) {
-  const uint8_t idx = hubWifiProfileIndex();  // always 0
   stopApOnlyMode();
-  saveWifiProfile(idx);
-  // STABIL: Im Bus holt der Hub die Daten vom 123 (Single-Central) und schickt
-  // ALLES per ESP-NOW an M5 + Touch. Der Touch macht hier KEIN BLE-direkt-123 —
-  // das würde mit dem Hub um das eine 123 kämpfen UND BLE+WiFi gleichzeitig
-  // fahren (Funk-Konkurrenz) => "verliert die Verbindung". Darum: BLE AUS,
-  // ESP-NOW als Live-Quelle, HTTP nur als Fallback.
-  saveDataPath(DATA_PATH_WIFI_HUB);
-  saveHubHost(HUB_BUS_HOST);
-  saveFeatures(true, false, g_featureBuzzer);   // WiFi an, BLE AUS, Buzzer wie gehabt
+  // FUNK-BUS: reines ESP-NOW auf FESTEM Kanal 6 — KEIN WLAN (kein AP-Beacon,
+  // kein STA-Reconnect-Gezappel, kein Kanal-Folgen) und KEIN BLE. Das ist der
+  // stabilste, störungsärmste Zustand für die Fahrt: nur der eine ESP-NOW-
+  // Funkpfad vom Hub. Web-GUI ist dann nur über ein WLAN-Profil erreichbar.
+  saveFeatures(false, false, g_featureBuzzer);   // WiFi AUS, BLE AUS
+  saveDataPath(DATA_PATH_WIFI_HUB);              // ESP-NOW ist Live-Quelle (HTTP-Fallback ungenutzt)
 #if ENABLE_ESP_NOW_CLIENT
   saveEspNowFeature(true);
-  g_espNowChannelPref = 0;   // folgt dem Bus-AP-Kanal (6)
+  g_espNowChannelPref = 6;                       // FESTER Kanal 6, unabhängig von WLAN
   Preferences p;
   p.begin("clock", false);
   p.putUChar("espnow_ch", g_espNowChannelPref);
   p.end();
   teardownEspNowClient();
 #endif
-  Serial.printf("Bus: Spartan3-Setup + hub %s + client %s + ESP-NOW (BLE aus)\n",
-                HUB_BUS_HOST, HUB_BUS_CLIENT_IP);
-  if (reconnect) reconnectWifiProfile();
+  Serial.println("Bus: Funk-Bus = reines ESP-NOW Kanal 6 (WLAN + BLE aus)");
+  (void)reconnect;
   g_redrawPage = true;
 }
 
@@ -5141,18 +5136,11 @@ static void handleWebSource() {
 // Mit den schnellen Renderraten fühlt sich die Drehzahl wie ein echtes
 // Cockpit an. Funktioniert am besten im Bus (alle Geräte gleicher Kanal).
 static void applySportCockpit() {
-#if ENABLE_ESP_NOW_CLIENT
-  if (!g_featureEspNow) saveEspNowFeature(true);
-#endif
-  // Hub-zentrisches Setup: Live-Daten kommen per ESP-NOW vom Hub (Fan-out an
-  // M5 UND Touch). Der Touch darf hier NICHT BLE-direkt aufs 123/Hub-Emu gehen
-  // — das ist Single-Central und würde dem Hub die Quelle wegnehmen bzw. mit
-  // ESP-NOW kollidieren. Darum BLE aus, ESP-NOW live, HTTP nur als Rückfall.
-  if (g_featureBle) saveFeatures(g_featureWifi, false, g_featureBuzzer);
-  if (g_featureBuzzer) saveFeatures(g_featureWifi, g_featureBle, false);
-  saveDataPath(DATA_PATH_WIFI_HUB);  // Fallback wenn ESP-NOW mal still ist
+  // SPORT = Funk-Bus (reines ESP-NOW Kanal 6, WLAN + BLE aus) + direkt aufs
+  // Cockpit. Maximal stabil und flüssig, keine Funk-Konkurrenz.
+  applyBusProfile(false);
   requestPage(8);  // TACHO + UHR Kombi = das Cockpit
-  Serial.println("SPORT: Cockpit live (ESP-NOW Fan-out vom Hub, Tacho-Kombi, BLE aus)");
+  Serial.println("SPORT: Funk-Bus + Tacho-Kombi (ESP-NOW Kanal 6, WLAN+BLE aus)");
 }
 
 static void handleWebSport() {
