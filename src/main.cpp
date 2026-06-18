@@ -224,6 +224,7 @@ static uint16_t  g_espNowSeq      = 0;
 static uint32_t  g_espNowLastRxMs = 0;
 static volatile bool g_espNowPending = false;
 static SpartanCockpitFrame g_espNowPendingFrame;
+static portMUX_TYPE g_espNowMux = portMUX_INITIALIZER_UNLOCKED;
 #endif
 
 // ---- GT911 touch state ----
@@ -319,6 +320,7 @@ static void saveWifiProfile(uint8_t idx);
 static void cycleWifiProfile();
 static void enterApOnlyMode();
 #if ENABLE_ESP_NOW_CLIENT
+static void teardownEspNowClient();
 static void saveEspNowFeature(bool enabled);
 static const char* espNowChannelLabel();
 #endif
@@ -576,6 +578,12 @@ static void applyBusProfile(bool reconnect) {
   saveFeatures(true, true, g_featureBuzzer);
 #if ENABLE_ESP_NOW_CLIENT
   saveEspNowFeature(true);
+  g_espNowChannelPref = 0;
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("espnow_ch", g_espNowChannelPref);
+  p.end();
+  teardownEspNowClient();
 #endif
   Serial.printf("Bus: Spartan3-Setup + hub %s + client %s + BLE 123 direkt\n",
                 HUB_BUS_HOST, HUB_BUS_CLIENT_IP);
@@ -966,18 +974,20 @@ static void IRAM_ATTR onEspNowRecv(const uint8_t* mac, const uint8_t* data, int 
   SpartanCockpitFrame frame;
   memcpy(&frame, data, sizeof(frame));
   if (!spartanCockpitFrameValid(frame)) return;
+  portENTER_CRITICAL_ISR(&g_espNowMux);
   g_espNowPendingFrame = frame;
   g_espNowPending = true;
   if (g_espNowRx < UINT32_MAX) g_espNowRx++;
+  portEXIT_CRITICAL_ISR(&g_espNowMux);
 }
 
 static void espNowClientProcessPending() {
   if (!g_espNowPending) return;
   SpartanCockpitFrame frame;
-  noInterrupts();
+  portENTER_CRITICAL(&g_espNowMux);
   frame = g_espNowPendingFrame;
   g_espNowPending = false;
-  interrupts();
+  portEXIT_CRITICAL(&g_espNowMux);
   applyEspNowFrame(frame);
 }
 
@@ -3685,7 +3695,6 @@ static void loadSettings() {
   if (isBusWifiSsid(currentWifiSsid()) && strcmp(g_hubHost, HUB_BUS_HOST) != 0) {
     strncpy(g_hubHost, HUB_BUS_HOST, sizeof(g_hubHost) - 1);
     g_hubHost[sizeof(g_hubHost) - 1] = 0;
-    g_dataPath = DATA_PATH_WIFI_HUB;
   }
   p.end();
   applyTimezone();
@@ -5496,6 +5505,10 @@ void loop() {
   (void)touchBusy;
 #endif
 
+#if ENABLE_ESP_NOW_CLIENT
+  espNowClientTick();
+#endif
+
   // Page switch from touch/web/serial: redraw before BLE/NTP/cache so touch feels snappy
   if (g_redrawPage) {
     g_redrawPage = false;
@@ -5532,7 +5545,31 @@ void loop() {
         }
         else if (cmd == "ble:scan") { bleStartDiscoveryScan(); }
         else if (cmd == "imu:zero") { if (calibrateImuZero()) g_redrawPage = true; }
-        else { Serial.println("Commands: ble:on|off|hub|123|scan | buzzer:on|off | wifi:next|off | rot:+|-|NN | imu:zero | clock"); }
+        else if (cmd == "status") {
+          Serial.printf("STATUS ip=%s ssid=%s path=%s source=%s fresh=%d rx=%lu rpm=%.0f adv=%.1f map=%.0f lambda=%.3f lambda_valid=%d\n",
+                        g_ipStr,
+                        WiFi.SSID().c_str(),
+                        dataPathLabel(),
+                        g_hubSourceTag,
+                        dataFresh() ? 1 : 0,
+                        static_cast<unsigned long>(g_liveRxCnt),
+                        g_rpm,
+                        g_adv,
+                        g_map,
+                        g_lambda,
+                        g_lambdaValid ? 1 : 0);
+#if ENABLE_ESP_NOW_CLIENT
+          Serial.printf("STATUS espnow enabled=%d ready=%d ch=%u pref=%u rx=%lu seq=%u fresh=%d\n",
+                        g_featureEspNow ? 1 : 0,
+                        g_espNowReady ? 1 : 0,
+                        g_espNowActiveChannel,
+                        g_espNowChannelPref,
+                        static_cast<unsigned long>(g_espNowRx),
+                        g_espNowSeq,
+                        espNowDataFresh() ? 1 : 0);
+#endif
+        }
+        else { Serial.println("Commands: status | ble:on|off|hub|123|scan | buzzer:on|off | wifi:next|off | rot:+|-|NN | imu:zero | clock"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
@@ -5568,9 +5605,6 @@ void loop() {
 
   // Hub data via WiFi HTTP (default path; no BLE slot conflict with M5 Dial)
   if (!touchBusy && !g_otaBusy) {
-#if ENABLE_ESP_NOW_CLIENT
-    espNowClientTick();
-#endif
     hubWifiPollTick();
   }
 
