@@ -4348,7 +4348,7 @@ static void handleWebRoot() {
   html += "<div class='pill'>" + String(dataPathLabel()) + " RX <span id='dashRx'>" +
           String((unsigned long)g_liveRxCnt) + "</span></div></div>";
   html += F("<div class='card'><a href='/sport'><button style='width:100%;padding:14px;font-size:1.1rem;background:#c0392b;color:#fff;border:0;border-radius:10px'>&#127937; SPORT / Cockpit live</button></a>"
-            "<p class='sub'>Ein Druck: ESP-NOW live + 123 direkt + Kombi-Tacho, fl&uuml;ssige Drehzahl. Am besten im Bus.</p></div></section>");
+            "<p class='sub'>Ein Druck: ESP-NOW live vom Hub + Kombi-Tacho (Seite 8), fl&uuml;ssige Drehzahl, BLE aus. Am besten im Bus.</p></div></section>");
 
   html += F("<section class='page' id='p1'><div class='card'><h2>WLAN</h2><div>Aktiv: <b>");
   html += String(currentWifiSsid()[0] ? currentWifiSsid() : "(kein)");
@@ -5146,17 +5146,15 @@ static void applySportCockpit() {
 #if ENABLE_ESP_NOW_CLIENT
   if (!g_featureEspNow) saveEspNowFeature(true);
 #endif
-  // BLE 123-direkt als Rückfall, falls ESP-NOW mal still ist (gleiche Logik
-  // wie der M5, der direkt am 123 "echt" wirkt).
-  saveDataPath(DATA_PATH_BLE);
-  if (!g_featureBle) saveFeatures(g_featureWifi, true, g_featureBuzzer);
-  if (g_bleConnMode != BLE_MODE_DIRECT_123) {
-    saveBleConnMode(BLE_MODE_DIRECT_123);
-    disconnectBleForModeChange();
-  }
+  // Hub-zentrisches Setup: Live-Daten kommen per ESP-NOW vom Hub (Fan-out an
+  // M5 UND Touch). Der Touch darf hier NICHT BLE-direkt aufs 123/Hub-Emu gehen
+  // — das ist Single-Central und würde dem Hub die Quelle wegnehmen bzw. mit
+  // ESP-NOW kollidieren. Darum BLE aus, ESP-NOW live, HTTP nur als Rückfall.
+  if (g_featureBle) saveFeatures(g_featureWifi, false, g_featureBuzzer);
   if (g_featureBuzzer) saveFeatures(g_featureWifi, g_featureBle, false);
+  saveDataPath(DATA_PATH_WIFI_HUB);  // Fallback wenn ESP-NOW mal still ist
   requestPage(8);  // TACHO + UHR Kombi = das Cockpit
-  Serial.println("SPORT: Cockpit live (ESP-NOW push + 123 direkt, Tacho-Kombi)");
+  Serial.println("SPORT: Cockpit live (ESP-NOW Fan-out vom Hub, Tacho-Kombi, BLE aus)");
 }
 
 static void handleWebSport() {
