@@ -561,27 +561,25 @@ static void applyBusProfile(bool reconnect) {
   const uint8_t idx = hubWifiProfileIndex();  // always 0
   stopApOnlyMode();
   saveWifiProfile(idx);
-  saveDataPath(DATA_PATH_BLE);
+  // STABIL: Im Bus holt der Hub die Daten vom 123 (Single-Central) und schickt
+  // ALLES per ESP-NOW an M5 + Touch. Der Touch macht hier KEIN BLE-direkt-123 —
+  // das würde mit dem Hub um das eine 123 kämpfen UND BLE+WiFi gleichzeitig
+  // fahren (Funk-Konkurrenz) => "verliert die Verbindung". Darum: BLE AUS,
+  // ESP-NOW als Live-Quelle, HTTP nur als Fallback.
+  saveDataPath(DATA_PATH_WIFI_HUB);
   saveHubHost(HUB_BUS_HOST);
-  if (g_bleConnMode != BLE_MODE_DIRECT_123) {
-    saveBleConnMode(BLE_MODE_DIRECT_123);
-    disconnectBleForModeChange();
-  }
-  saveFeatures(true, true, g_featureBuzzer);
+  saveFeatures(true, false, g_featureBuzzer);   // WiFi an, BLE AUS, Buzzer wie gehabt
 #if ENABLE_ESP_NOW_CLIENT
   saveEspNowFeature(true);
-  g_espNowChannelPref = 0;
+  g_espNowChannelPref = 0;   // folgt dem Bus-AP-Kanal (6)
   Preferences p;
   p.begin("clock", false);
   p.putUChar("espnow_ch", g_espNowChannelPref);
   p.end();
   teardownEspNowClient();
 #endif
-  Serial.printf("Bus: Spartan3-Setup + hub %s + client %s + BLE 123 direkt\n",
+  Serial.printf("Bus: Spartan3-Setup + hub %s + client %s + ESP-NOW (BLE aus)\n",
                 HUB_BUS_HOST, HUB_BUS_CLIENT_IP);
-#if ENABLE_ESP_NOW_CLIENT
-  Serial.printf("Bus: ESP-NOW recv %s (HTTP nur Fallback/Status)\n", espNowChannelLabel());
-#endif
   if (reconnect) reconnectWifiProfile();
   g_redrawPage = true;
 }
