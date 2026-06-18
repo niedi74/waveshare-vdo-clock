@@ -339,11 +339,18 @@ inline int hal_tacho_dimmer_read_pct() { return -1; }
 
 uint16_t *hal_fb() {
   if (!hal_frame) {
-    if (!hal_bind_framebuffer()) {
-      hal_frame = (uint16_t *)heap_caps_malloc(480 * 480 * sizeof(uint16_t),
-                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-      hal_frame_owned = (hal_frame != nullptr);
-      Serial.printf("hal_fb: malloc fallback %p\n", hal_frame);
+    // OFF-SCREEN rendern: eigener PSRAM-Puffer, danach per draw_bitmap in den
+    // Panel-FB kopieren = sauberer Doppelpuffer-Swap auf VSYNC, KEIN Flackern
+    // auch bei hoher Bildrate. (Direkt an den Panel-Scan-Puffer gebunden würde
+    // jeder Vollbild-Lösch sofort sichtbar -> "wildes Blinken" beim schnellen
+    // Neuzeichnen des Tachos.)
+    hal_frame = (uint16_t *)heap_caps_malloc(480 * 480 * sizeof(uint16_t),
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    hal_frame_owned = (hal_frame != nullptr);
+    Serial.printf("hal_fb: off-screen buffer %p\n", hal_frame);
+    if (!hal_frame) {
+      // Notfall: doch an den Panel-FB binden (kein Speicher frei)
+      hal_bind_framebuffer();
     }
   }
   return hal_frame;

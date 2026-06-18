@@ -5841,8 +5841,8 @@ void loop() {
     static uint32_t lastTachDraw  = 0;
     const uint32_t nowMs = millis();
     const int rpmNow = (int)g_rpm;
-    const bool rpmMoved   = abs(rpmNow - lastRpmDraw) >= 15;
-    const bool minElapsed = (nowMs - lastTachDraw) >= 45;    // <= ~22 Hz Obergrenze
+    const bool rpmMoved   = abs(rpmNow - lastRpmDraw) >= 20;
+    const bool minElapsed = (nowMs - lastTachDraw) >= 70;    // <= ~14 Hz (Off-Screen-Kopie entlasten)
     const bool heartbeat  = (nowMs - lastTachDraw) >= 400;   // Volt/Temp/Lambda/Stale
     if ((rpmMoved && minElapsed) || heartbeat) {
       lastRpmDraw  = rpmNow;
