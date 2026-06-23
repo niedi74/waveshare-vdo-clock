@@ -16,6 +16,8 @@
 #include "hal_waveshare_28c.h"
 #include "qmi8658_imu.h"
 #include "vdo_dial_480_rgb565.h"
+#include "driver/twai.h"
+#include <HTTPClient.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -58,6 +60,25 @@ static NimBLEClient*      bleClient    = nullptr;
 static NimBLEAddress      bleTarget;
 static volatile bool      bleDoConnect = false;
 static uint32_t           bleNextScanAt = 0;
+
+// Letzte Datenquelle der Cockpit-Werte (fuer Anzeige/Diagnose)
+static const char* g_lastSrc = "---";
+
+// -------- CAN cockpit client (TWAI, hoert 0x510 vom Spartan-Test-Hub) --------
+#define COCKPIT_CAN_ID     0x510
+#define COCKPIT_CAN_RX_PIN GPIO_NUM_44
+#define COCKPIT_CAN_TX_PIN GPIO_NUM_43
+
+static bool     g_canReady      = false;
+static bool     g_canListenOnly = true;   // Display hoert nur mit (kein ACK/TX)
+static uint32_t g_canRx         = 0;
+static uint32_t g_canIgnored    = 0;
+static uint32_t g_canLastRxMs   = 0;
+
+// -------- HTTP-Poll-Client (zieht /api/status vom Spartan-Hub) --------
+static String   g_hubIp        = "192.168.0.91";
+static uint32_t g_httpRx       = 0;
+static uint32_t g_httpLastRxMs = 0;
 
 // ---- GT911 touch state ----
 static uint8_t  gt911Addr = GT911_ADDR_PRIMARY;
@@ -106,7 +127,13 @@ static uint8_t wifiProfileCount() {
   return (uint8_t)(sizeof(WIFI_PROFILES) / sizeof(WIFI_PROFILES[0]));
 }
 
+// Zur Laufzeit (per WebGUI) eingegebene STA-Zugangsdaten. Liegen sie vor,
+// haben sie Vorrang vor den einkompilierten WIFI_PROFILES. Persistent im NVS.
+static char g_staSsid[33] = "";
+static char g_staPass[65] = "";
+
 static const char* currentWifiSsid() {
+  if (g_staSsid[0]) return g_staSsid;
   uint8_t count = wifiProfileCount();
   if (count == 0) return "";
   if (g_wifiProfile >= count) g_wifiProfile = 0;
@@ -114,6 +141,7 @@ static const char* currentWifiSsid() {
 }
 
 static const char* currentWifiPassword() {
+  if (g_staSsid[0]) return g_staPass;
   uint8_t count = wifiProfileCount();
   if (count == 0) return "";
   if (g_wifiProfile >= count) g_wifiProfile = 0;
@@ -293,6 +321,7 @@ static void parseSpartanPayload(const String& p) {
       g_g123Valid = true;
     }
   }
+  g_lastSrc = "BLE";
   g_bleRxCnt++;
   g_bleLastRx = millis();
 }
@@ -378,6 +407,118 @@ static void bleTick() {
     bleNextScanAt = 0;
     bleStartScan();
   }
+}
+
+// -------- CAN cockpit client (TWAI) --------
+static bool canFresh() { return g_canLastRxMs != 0 && millis() - g_canLastRxMs < 3000; }
+
+static bool setupCockpitCan() {
+  g_canReady = false;
+  twai_driver_uninstall();   // idempotent: ignoriert "not installed"
+  twai_mode_t mode = g_canListenOnly ? TWAI_MODE_LISTEN_ONLY : TWAI_MODE_NORMAL;
+  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(COCKPIT_CAN_TX_PIN, COCKPIT_CAN_RX_PIN, mode);
+  twai_timing_config_t  t = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t  f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  esp_err_t err = twai_driver_install(&g, &t, &f);
+  if (err != ESP_OK) { Serial.printf("CAN: install failed %s\n", esp_err_to_name(err)); return false; }
+  err = twai_start();
+  if (err != ESP_OK) { Serial.printf("CAN: start failed %s\n", esp_err_to_name(err)); twai_driver_uninstall(); return false; }
+  g_canReady = true;
+  Serial.printf("CAN: cockpit RX ready id=0x%03X TX=%d RX=%d mode=%s 500k\n",
+                COCKPIT_CAN_ID, (int)COCKPIT_CAN_TX_PIN, (int)COCKPIT_CAN_RX_PIN,
+                g_canListenOnly ? "listen" : "normal");
+  return true;
+}
+
+// 0x510-Frame (8 Byte): [lambda_x1000 BE][rpm BE][adv_x10 BE int16][map u8][flags]
+static void applyCockpitCanFrame(const twai_message_t& msg) {
+  const uint16_t lambdaX1000 = ((uint16_t)msg.data[0] << 8) | msg.data[1];
+  const uint16_t rpm         = ((uint16_t)msg.data[2] << 8) | msg.data[3];
+  const int16_t  advX10      = (int16_t)(((uint16_t)msg.data[4] << 8) | msg.data[5]);
+  const uint8_t  flags       = msg.data[7];
+  g_lambda      = lambdaX1000 / 1000.0f;
+  g_lambdaValid = (flags & 0x01) && lambdaX1000 > 0;
+  if (flags & 0x02) {            // tune fresh -> rpm/adv/map gueltig
+    g_rpm = rpm;
+    g_adv = advX10 / 10.0f;
+    g_map = msg.data[6];
+  }
+  g_lastSrc     = "CAN";
+  g_canRx++;
+  g_canLastRxMs = millis();
+}
+
+static void cockpitCanTick() {
+  if (!g_canReady) return;
+  twai_message_t msg;
+  uint8_t drained = 0;
+  while (drained < 8 && twai_receive(&msg, 0) == ESP_OK) {
+    drained++;
+    if (msg.extd || msg.identifier != COCKPIT_CAN_ID || msg.data_length_code != 8) { g_canIgnored++; continue; }
+    applyCockpitCanFrame(msg);
+  }
+}
+
+static void runCanTest() {
+  Serial.printf("CAN TEST: SN65HVD230 GPIO43=TXD/D GPIO44=RXD/R mode=%s\n",
+                g_canListenOnly ? "listen" : "normal");
+  if (!g_canReady) setupCockpitCan();
+  twai_status_info_t s = {};
+  if (g_canReady && twai_get_status_info(&s) == ESP_OK) {
+    Serial.printf("CAN TEST: ready=1 state=%d rx=%lu ignored=%lu msgs_to_rx=%u rx_err=%u bus_err=%u arb_lost=%u\n",
+                  (int)s.state, (unsigned long)g_canRx, (unsigned long)g_canIgnored,
+                  (unsigned)s.msgs_to_rx, (unsigned)s.rx_error_counter,
+                  (unsigned)s.bus_error_count, (unsigned)s.arb_lost_count);
+  } else {
+    Serial.printf("CAN TEST: ready=%d (install/status fail)\n", g_canReady ? 1 : 0);
+  }
+  Serial.println("CAN TEST: done");
+}
+
+// -------- HTTP-Poll-Client --------
+static bool httpFresh() { return g_httpLastRxMs != 0 && millis() - g_httpLastRxMs < 3000; }
+
+// Minimaler JSON-Feldparser: sucht "key": und liest die folgende Zahl.
+static bool jsonNum(const String& s, const char* key, float& out) {
+  String k = String("\"") + key + "\":";
+  int i = s.indexOf(k);
+  if (i < 0) return false;
+  out = s.substring(i + k.length()).toFloat();
+  return true;
+}
+static bool jsonTrue(const String& s, const char* key) {
+  return s.indexOf(String("\"") + key + "\":true") >= 0;
+}
+
+static void httpPollTick() {
+  if (!g_featureWifi || WiFi.status() != WL_CONNECTED || g_hubIp.length() == 0) return;
+  static uint32_t last = 0;
+  if (millis() - last < 500) return;
+  last = millis();
+
+  HTTPClient http;
+  String url = "http://" + g_hubIp + "/api/status";
+  if (!http.begin(url)) return;
+  http.setConnectTimeout(600);
+  http.setTimeout(800);
+  int code = http.GET();
+  if (code == 200) {
+    String b = http.getString();
+    float v;
+    if (jsonNum(b, "rpm", v))       g_rpm = v;
+    if (jsonNum(b, "advance", v))   g_adv = v;
+    if (jsonNum(b, "map", v))       g_map = v;
+    if (jsonNum(b, "lambda", v))  { g_lambda = v; g_lambdaValid = jsonTrue(b, "valid") && v > 0; }
+    if (jsonNum(b, "tune_temp", v)) g_g123Temp = v;
+    if (jsonNum(b, "volt", v))      g_g123Volt = v;
+    if (jsonNum(b, "tune_amp", v))  g_g123Coil = v;
+    if (jsonNum(b, "speed_kmh", v)){ g_speedKmh = v; g_speedValid = true; }
+    g_g123Valid   = jsonTrue(b, "tune_connected");
+    g_lastSrc     = "HTTP";
+    g_httpRx++;
+    g_httpLastRxMs = millis();
+  }
+  http.end();
 }
 
 // ---- I2C helpers (GT911) ----
@@ -768,29 +909,122 @@ static void drawDataRow(int y, const char* label, const char* value, uint16_t co
   drawTextSmall(244, y, value, col, 2);
 }
 
+// -------- Graphical gauge primitives (cockpit dashboard) --------
+// Angle convention: degrees, 0 = east, 90 = south (screen y grows downward),
+// 270 = north (up). Matches drawHand's cos/sin usage.
+static void plotRadial(int cx, int cy, float angleDeg, int rInner, int rOuter,
+                       uint16_t color, int thickness) {
+  float a  = angleDeg * (float)PI / 180.0f;
+  float ca = cosf(a), sa = sinf(a);
+  drawLineFast(cx + (int)(ca * rInner), cy + (int)(sa * rInner),
+               cx + (int)(ca * rOuter), cy + (int)(sa * rOuter), color, thickness);
+}
+
+static void drawArcBand(int cx, int cy, int rInner, int rOuter,
+                        float startDeg, float endDeg, uint16_t color) {
+  if (endDeg < startDeg) { float t = startDeg; startDeg = endDeg; endDeg = t; }
+  for (float d = startDeg; d <= endDeg; d += 1.5f)
+    plotRadial(cx, cy, d, rInner, rOuter, color, 2);
+}
+
+static float gaugeAngle(float value, float vmin, float vmax, float startDeg, float endDeg) {
+  if (vmax <= vmin) return startDeg;
+  float f = (value - vmin) / (vmax - vmin);
+  if (f < 0) f = 0; else if (f > 1) f = 1;
+  return startDeg + f * (endDeg - startDeg);
+}
+
+// Small arc gauge: 180deg top semicircle, value low=left .. high=right.
+static void drawMiniGauge(int cx, int cy, int r, float value, float vmin, float vmax,
+                          const char* label, const char* valStr,
+                          uint16_t accent, bool valid) {
+  const float A0 = 180.0f, A1 = 360.0f;
+  drawArcBand(cx, cy, r - 5, r, A0, A1, RGB565(60, 60, 64));      // scale track
+  if (valid) {
+    float va = gaugeAngle(value, vmin, vmax, A0, A1);
+    drawArcBand(cx, cy, r - 5, r, A0, va, accent);                 // filled portion
+  }
+  plotRadial(cx, cy, A0,            r - 8, r, RGB565(120, 120, 120), 2);
+  plotRadial(cx, cy, (A0 + A1) / 2, r - 8, r, RGB565(120, 120, 120), 2);
+  plotRadial(cx, cy, A1,            r - 8, r, RGB565(120, 120, 120), 2);
+  float na = gaugeAngle(valid ? value : vmin, vmin, vmax, A0, A1);
+  plotRadial(cx, cy, na, 0, r - 9, valid ? RGB565(235, 235, 225) : RGB565(90, 50, 50), 3);
+  fillCircleFast(cx, cy, 4, RGB565(200, 200, 190));
+  drawTextCentered(cx, cy - r - 16, label, accent, 2);
+  drawTextCentered(cx, cy + 8, valStr, valid ? RGB565(235, 235, 225) : RGB565(110, 60, 60), 2);
+}
+
+// Main RPM tachometer: 240deg sweep with a gap at the bottom, rim pointer.
+static void drawTach(int cx, int cy, float rpm, bool valid) {
+  const float A0 = 150.0f, A1 = 390.0f;   // sweep up over the top, gap at bottom
+  const int   rOut = 212, rIn = 152;
+  drawArcBand(cx, cy, rIn, rOut, A0, A1, RGB565(45, 45, 50));
+  float ra0 = gaugeAngle(6000, 0, 8000, A0, A1);
+  drawArcBand(cx, cy, rIn, rOut, ra0, A1, RGB565(150, 30, 28));    // redline 6-8k
+  for (int k = 0; k <= 8; k++) {
+    float a   = gaugeAngle(k * 1000, 0, 8000, A0, A1);
+    uint16_t tc = (k >= 6) ? RGB565(235, 80, 70) : RGB565(190, 190, 190);
+    plotRadial(cx, cy, a, rIn, rOut, tc, (k % 2) ? 2 : 3);
+    float ar = a * (float)PI / 180.0f;
+    int lx = cx + (int)(cosf(ar) * (rIn - 18));
+    int ly = cy + (int)(sinf(ar) * (rIn - 18));
+    char n[3]; snprintf(n, sizeof(n), "%d", k);
+    drawTextCentered(lx, ly - 7, n, tc, 2);
+  }
+  float pa = gaugeAngle(valid ? rpm : 0, 0, 8000, A0, A1);
+  plotRadial(cx, cy, pa, rIn - 6, rOut + 2, RGB565(235, 235, 225), 6);
+  plotRadial(cx, cy, pa, rOut - 16, rOut + 2, RGB565(235, 40, 30), 6);  // red tip
+}
+
 static void drawMotorPage() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
-  drawCircleLine(240, 240, 216, 3, RGB565(40, 110, 160));
-  drawTextCentered(240, 52, "MOTOR", RGB565(60, 170, 230), 5);
-  bool fresh = bleFresh();
+  const bool fresh = bleFresh() || canFresh() || httpFresh();
   char buf[16];
-  uint16_t cv = fresh ? RGB565(235, 235, 225) : RGB565(110, 60, 60);
-  const char* na = "---";
-  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_rpm); drawDataRow(112, "RPM", buf, cv); }
-  else drawDataRow(112, "RPM", na, cv);
-  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_adv); drawDataRow(152, "ADV", buf, cv); }
-  else drawDataRow(152, "ADV", na, cv);
-  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_map); drawDataRow(192, "MAP", buf, cv); }
-  else drawDataRow(192, "MAP", na, cv);
-  if (fresh && g_g123Valid) { snprintf(buf, sizeof(buf), "%.1fV", g_g123Volt); drawDataRow(238, "123V", buf, cv); }
-  else drawDataRow(238, "123V", na, cv);
-  if (fresh && g_g123Valid) { snprintf(buf, sizeof(buf), "%dC", (int)g_g123Temp); drawDataRow(278, "123T", buf, cv); }
-  else drawDataRow(278, "123T", na, cv);
-  if (fresh && g_battValid) { snprintf(buf, sizeof(buf), "%.1fV", g_battVolt); drawDataRow(318, "BATT", buf, cv); }
-  else drawDataRow(318, "BATT", na, cv);
-  const char* st = g_bleConn ? (fresh ? "LIVE" : "WARTE") : "KEIN HUB";
-  drawTextCentered(240, 370, st, g_bleConn && fresh ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
+
+  drawTach(240, 240, g_rpm, fresh);
+
+  // RPM digital (top, inside the ring)
+  if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_rpm); else strcpy(buf, "----");
+  drawTextCentered(240, 92, buf, fresh ? RGB565(235, 235, 225) : RGB565(110, 60, 60), 5);
+  drawTextCentered(240, 134, "RPM", RGB565(120, 120, 120), 2);
+
+  // Four mini analog gauges
+  const bool g123 = fresh && g_g123Valid;
+  if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_adv); else strcpy(buf, "--");
+  drawMiniGauge(148, 196, 36, g_adv, 0, 50, "ADV", buf, RGB565(40, 150, 210), fresh);
+  if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_map); else strcpy(buf, "--");
+  drawMiniGauge(332, 196, 36, g_map, 0, 200, "KPA", buf, RGB565(60, 185, 90), fresh);
+  if (g123) snprintf(buf, sizeof(buf), "%d", (int)g_g123Temp); else strcpy(buf, "--");
+  drawMiniGauge(148, 324, 36, g_g123Temp, 0, 120, "TEMP", buf, RGB565(210, 120, 50), g123);
+  if (g123) snprintf(buf, sizeof(buf), "%.1f", g_g123Volt); else strcpy(buf, "--");
+  drawMiniGauge(332, 324, 36, g_g123Volt, 10, 15, "VOLT", buf, RGB565(210, 180, 60), g123);
+
+  // Lambda hero (center)
+  drawTextCentered(240, 196, "LAMBDA", RGB565(120, 120, 120), 2);
+  uint16_t lcol;
+  if (fresh && g_lambdaValid) {
+    snprintf(buf, sizeof(buf), "%.2f", g_lambda);
+    if      (g_lambda < 0.97f) lcol = RGB565(235, 120, 40);
+    else if (g_lambda > 1.03f) lcol = RGB565(80, 160, 240);
+    else                       lcol = RGB565(70, 210, 100);
+  } else { strcpy(buf, "----"); lcol = RGB565(110, 60, 60); }
+  drawTextCentered(240, 216, buf, lcol, 6);
+
+  // AMP (coil current) + speed line, then status, in the bottom gap of the ring
+  char line[24];
+  char amp[10], spd[10];
+  if (g123)        snprintf(amp, sizeof(amp), "%.1fA", g_g123Coil); else strcpy(amp, "--");
+  if (fresh && g_speedValid) snprintf(spd, sizeof(spd), "%dKMH", (int)g_speedKmh); else strcpy(spd, "--");
+  snprintf(line, sizeof(line), "AMP %s  %s", amp, spd);
+  drawTextCentered(240, 396, line, RGB565(170, 170, 170), 2);
+
+  char st[16];
+  if (fresh)            snprintf(st, sizeof(st), "LIVE %s", g_lastSrc);
+  else if (g_bleConn)   strcpy(st, "WARTE");
+  else if (g_canReady)  strcpy(st, "CAN WARTE");
+  else                  strcpy(st, "KEIN HUB");
+  drawTextCentered(240, 424, st, fresh ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
   presentFrame();
 }
 
@@ -799,7 +1033,8 @@ static void drawLambdaPage() {
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(45, 150, 70));
   drawTextCentered(240, 58, "LAMBDA", RGB565(70, 200, 100), 5);
-  bool fresh = bleFresh() && g_lambdaValid;
+  bool live  = bleFresh() || canFresh() || httpFresh();
+  bool fresh = live && g_lambdaValid;
   char buf[16];
   if (fresh) snprintf(buf, sizeof(buf), "%.2f", g_lambda);
   else strcpy(buf, "----");
@@ -814,8 +1049,12 @@ static void drawLambdaPage() {
     char sp[16]; snprintf(sp, sizeof(sp), "%d km/h", (int)g_speedKmh);
     drawTextCentered(240, 318, sp, RGB565(180, 180, 180), 3);
   }
-  const char* st = g_bleConn ? (bleFresh() ? "LIVE" : "WARTE") : "KEIN HUB";
-  drawTextCentered(240, 370, st, g_bleConn && bleFresh() ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
+  char st[16];
+  if (live)            snprintf(st, sizeof(st), "LIVE %s", g_lastSrc);
+  else if (g_bleConn)  strcpy(st, "WARTE");
+  else if (g_canReady) strcpy(st, "CAN WARTE");
+  else                 strcpy(st, "KEIN HUB");
+  drawTextCentered(240, 370, st, live ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
   presentFrame();
 }
 
@@ -837,7 +1076,12 @@ static void drawHubPage() {
   snprintf(buf, sizeof(buf), "%.0f KMH", g_speedKmh);
   drawDataRow(272, "SPEED", g_speedValid ? buf : "---", RGB565(235, 235, 225));
   drawDataRow(312, "IP",    g_ipStr, RGB565(150, 200, 150));
-  drawTextCentered(240, 370, "TIP MENU", RGB565(180, 180, 170), 2);
+  char canl[24];
+  snprintf(canl, sizeof(canl), "CAN %lu/%lu", (unsigned long)g_canRx, (unsigned long)g_canIgnored);
+  drawTextCentered(240, 348, canl,
+                   g_canReady ? (canFresh() ? RGB565(60, 210, 100) : RGB565(180, 180, 180))
+                              : RGB565(120, 120, 120), 2);
+  drawTextCentered(240, 372, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
 
@@ -918,6 +1162,9 @@ static void loadSettings() {
   g_dialScalePct  = p.getInt("scale",     100);
   g_brightnessPct = p.getInt("bright",    100);
   g_rotationDeg   = p.getInt("rot_deg",   0);
+  p.getString("sta_ssid", g_staSsid, sizeof(g_staSsid));
+  p.getString("sta_pass", g_staPass, sizeof(g_staPass));
+  g_hubIp = p.getString("hub_ip", g_hubIp);
   g_wifiProfile   = p.getUChar("wifi_prof", 0);
   if (g_wifiProfile >= wifiProfileCount()) g_wifiProfile = 0;
   g_featureWifi   = p.getBool("feat_wifi", strlen(currentWifiSsid()) > 0);
@@ -1030,10 +1277,23 @@ static void handleWebRoot() {
   html += F("<div class='card'><h3>WLAN</h3>");
   html += "<div>Aktiv: <b>" + String(currentWifiSsid()) + "</b> &middot; " +
           String(WiFi.status() == WL_CONNECTED ? "verbunden" : "nicht verbunden") + "</div>";
+  if (g_staSsid[0]) {
+    html += "<div>Eigenes WLAN: <b>" + String(g_staSsid) + "</b></div>";
+  }
   for (uint8_t i = 0; i < wifiProfileCount(); i++) {
+    if (strlen(WIFI_PROFILES[i].ssid) == 0) continue;
     html += "<a href='/wifi?prof=" + String(i) + "'><button" +
-            String(i == g_wifiProfile ? " style='background:#6c6'" : "") + ">" +
+            String((!g_staSsid[0] && i == g_wifiProfile) ? " style='background:#6c6'" : "") + ">" +
             String(WIFI_PROFILES[i].ssid) + "</button></a>";
+  }
+  html += F("<form action='/wifi' method='post' style='margin-top:10px'>"
+    "<input name='ssid' placeholder='WLAN-Name (SSID)' autocomplete='off' "
+      "style='width:88%;padding:10px;margin:4px;border-radius:8px;border:0;font-size:1em'><br>"
+    "<input name='pass' type='password' placeholder='Passwort' "
+      "style='width:88%;padding:10px;margin:4px;border-radius:8px;border:0;font-size:1em'><br>"
+    "<button type='submit'>WLAN verbinden</button></form>");
+  if (g_staSsid[0]) {
+    html += F("<a href='/wifi?clear=1'><button style='background:#c66'>Eigenes WLAN l&ouml;schen</button></a>");
   }
   html += F("</div>");
 
@@ -1059,17 +1319,21 @@ static void handleWebRoot() {
     "<button type='submit'>Speichern</button></form></div>");
 
   html += F("<div class='card'><h3>Spartan-Hub Live</h3>");
-  if (!g_featureBle) {
-    html += F("<div>BLE: <b>aus</b></div>");
-  } else if (g_bleConn) {
-    html += F("<div>BLE: <b>verbunden</b></div>");
-    html += "<div>Lambda: " + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) + "</div>";
-    html += "<div>RPM: " + String((int)g_rpm) + " &nbsp; ADV: " + String(g_adv, 1) + "</div>";
-    html += "<div>Batt: " + String(g_battValid ? String(g_battVolt, 1) + " V" : String("---")) + "</div>";
-  } else {
-    html += F("<div>BLE: scanning/wartet</div>");
-  }
-  html += "<div>RX: " + String((unsigned long)g_bleRxCnt) + "</div></div>";
+  bool anyFresh = bleFresh() || canFresh() || httpFresh();
+  html += "<div>Quelle: <b>" + String(anyFresh ? g_lastSrc : "---") + "</b> &middot; " +
+          String(anyFresh ? "LIVE" : "keine Daten") + "</div>";
+  html += "<div>Lambda: " + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) +
+          " &nbsp; RPM: " + String((int)g_rpm) + " &nbsp; ADV: " + String(g_adv, 1) + "</div>";
+  html += "<div>MAP: " + String((int)g_map) + " &nbsp; TEMP: " + String((int)g_g123Temp) +
+          " &nbsp; VOLT: " + String(g_g123Volt, 1) + " &nbsp; AMP: " + String(g_g123Coil, 1) + "</div>";
+  html += "<div style='color:#888'>HTTP rx " + String((unsigned long)g_httpRx) +
+          " &middot; CAN rx " + String((unsigned long)g_canRx) +
+          " &middot; BLE rx " + String((unsigned long)g_bleRxCnt) + "</div>";
+  html += F("<form action='/set' method='get' style='margin-top:8px'>"
+    "<input name='hubip' placeholder='Hub-IP' value='");
+  html += g_hubIp;
+  html += F("' style='width:60%;padding:8px;margin:4px;border-radius:8px;border:0'>"
+    "<button type='submit'>Hub-IP speichern</button></form></div>");
 
   html += F("<div class='card'><h3>Zifferblatt-Gr&ouml;&szlig;e</h3>"
     "<form action='/set' method='get'>"
@@ -1110,6 +1374,15 @@ static void handleWebSet() {
     g_redrawPage = true;
     Serial.printf("Web: Rotation = %d deg\n", g_rotationDeg);
   }
+  if (webServer.hasArg("hubip")) {
+    g_hubIp = webServer.arg("hubip");
+    g_hubIp.trim();
+    Preferences p;
+    p.begin("clock", false);
+    p.putString("hub_ip", g_hubIp);
+    p.end();
+    Serial.printf("Web: Hub-IP = %s\n", g_hubIp.c_str());
+  }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -1141,12 +1414,23 @@ static void handleWebPage() {
 
 static void reconnectWifiProfile();    // fwd
 static void saveWifiProfile(uint8_t);  // fwd
+static void saveStaCredentials(const char*, const char*);  // fwd
 
-// WLAN-Profil per Web umschalten: /wifi?prof=N
+// WLAN per Web: eigenes SSID/Passwort (/wifi POST ssid,pass), Profil umschalten
+// (/wifi?prof=N) oder eigene Daten loeschen (/wifi?clear=1).
 static void handleWebWifi() {
-  if (webServer.hasArg("prof")) {
+  if (webServer.hasArg("clear")) {
+    saveStaCredentials("", "");
+    reconnectWifiProfile();
+    Serial.println("Web: eigene WLAN-Daten geloescht -> zurueck auf Profil");
+  } else if (webServer.hasArg("ssid") && webServer.arg("ssid").length() > 0) {
+    saveStaCredentials(webServer.arg("ssid").c_str(), webServer.arg("pass").c_str());
+    reconnectWifiProfile();
+    Serial.printf("Web: WLAN-STA gesetzt -> '%s'\n", g_staSsid);
+  } else if (webServer.hasArg("prof")) {
     int idx = webServer.arg("prof").toInt();
     if (idx < 0) idx = 0;
+    saveStaCredentials("", "");   // Profilwahl deaktiviert eigene Daten
     saveWifiProfile((uint8_t)idx);
     reconnectWifiProfile();
     Serial.printf("Web: WLAN-Profil -> %d (%s)\n", idx, currentWifiSsid());
@@ -1243,6 +1527,18 @@ static void saveWifiProfile(uint8_t idx) {
   p.end();
 }
 
+// Eigene STA-Zugangsdaten setzen (leeres ssid = loeschen). Persistent im NVS.
+static void saveStaCredentials(const char* ssid, const char* pass) {
+  snprintf(g_staSsid, sizeof(g_staSsid), "%s", ssid ? ssid : "");
+  snprintf(g_staPass, sizeof(g_staPass), "%s", pass ? pass : "");
+  Preferences p;
+  p.begin("clock", false);
+  p.putString("sta_ssid", g_staSsid);
+  p.putString("sta_pass", g_staPass);
+  if (g_staSsid[0]) { g_featureWifi = true; p.putBool("feat_wifi", true); }
+  p.end();
+}
+
 static void reconnectWifiProfile() {
   if (strlen(currentWifiSsid()) == 0) return;
   g_featureWifi = true;
@@ -1308,6 +1604,9 @@ void setup() {
   } else {
     Serial.println("IMU: QMI8658 NOT found");
   }
+
+  // CAN-Cockpit-Empfaenger (TWAI, listen-only) starten: hoert 0x510 vom Test-Hub
+  setupCockpitCan();
 
   initTimeSource();
   hal_backlight(true);
@@ -1413,7 +1712,12 @@ void loop() {
         else if (cmd == "rot:-") { saveRotation(g_rotationDeg - 1); g_redrawPage = true; }
         else if (cmd.startsWith("rot:")) { saveRotation(cmd.substring(4).toInt()); g_redrawPage = true; }
         else if (cmd == "clock")   { currentPage = 0; drawVdoClock(); }
-        else { Serial.println("Commands: ble:on|off | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock"); }
+        else if (cmd == "can:test"){ runCanTest(); }
+        else if (cmd == "can:rx")  { Serial.printf("CAN: ready=%d rx=%lu ignored=%lu age=%lums src=%s\n",
+                                       g_canReady ? 1 : 0, (unsigned long)g_canRx, (unsigned long)g_canIgnored,
+                                       g_canLastRxMs ? (unsigned long)(millis() - g_canLastRxMs) : 0UL, g_lastSrc); }
+        else if (cmd == "motor")   { currentPage = 2; drawMotorPage(); }
+        else { Serial.println("Commands: ble:on|off | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock | motor | can:test | can:rx"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
@@ -1428,6 +1732,12 @@ void loop() {
 
   // BLE client tick
   if (g_featureBle) bleTick();
+
+  // CAN cockpit tick (0x510)
+  cockpitCanTick();
+
+  // HTTP-Poll vom Hub (/api/status)
+  httpPollTick();
 
   // Web server
   if (g_webStarted) webServer.handleClient();
