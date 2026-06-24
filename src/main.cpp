@@ -121,6 +121,7 @@ static bool      g_feature123    = false;  // 123-Direkt-Fallback: default AUS (
 static float     g_imuOffPitch   = 0.0f;   // IMU-Nullung (Einbaulage) - Pitch/Roll-Offset
 static float     g_imuOffRoll    = 0.0f;
 static bool      g_wifiAuto      = true;   // WLAN-Auto-Fallback: S24 > Heim > Hub-AP (verfuegbares Netz)
+static bool      g_apOn          = false;  // Setup-AP aktiv?
 static bool      g_webStarted   = false;
 static bool      g_redrawPage   = false;
 static uint8_t   g_wifiProfile  = 0;
@@ -313,41 +314,45 @@ static bool wifiNtpTick() {
   return false;
 }
 
-// WLAN-Auto-Fallback: scannt und verbindet zum hoechstprioren verfuegbaren Profil
-// (S24 > Heim > Hub-AP). Laeuft nur, wenn nicht verbunden. Setzt Hub-IP des Profils.
+// WLAN-Auto-Fallback: besitzt das WLAN, wenn aktiv. Scannt in reinem STA-Modus
+// (kein Setup-AP, der sonst den Funkkanal blockiert) und verbindet zum
+// hoechstprioren verfuegbaren Profil (S24 > Heim > Hub-AP) inkl. dessen Hub-IP.
 static void wifiAutoTick() {
   if (!g_featureWifi || !g_wifiAuto) return;
   if (WiFi.status() == WL_CONNECTED) return;
-  static uint32_t lastScan = 0;
-  static bool     scanning = false;
+  if (g_apOn) { WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); g_apOn = false; }  // AP wuerde Scan/Connect blockieren
+  static uint32_t nextScanAt = 0;
+  static bool     scanning   = false;
   if (!scanning) {
-    if (millis() - lastScan < 6000) return;
-    lastScan = millis();
-    WiFi.scanNetworks(true);                 // asynchron
-    scanning = true;
+    if (millis() < nextScanAt) return;
+    WiFi.mode(WIFI_STA);
+    WiFi.scanNetworks(true);                     // asynchron, reiner STA-Scan
+    scanning   = true;
+    nextScanAt = millis() + 9000;                // Sicherheitsnetz falls Scan haengt
     return;
   }
   int n = WiFi.scanComplete();
   if (n == WIFI_SCAN_RUNNING) return;
   scanning = false;
-  if (n <= 0) { WiFi.scanDelete(); return; }
-  const uint8_t order[WPROF_COUNT] = { 2, 0, 1 };   // Prioritaet: S24 > Heim > Hub-AP
   int pick = -1;
-  for (uint8_t o = 0; o < WPROF_COUNT && pick < 0; o++) {
-    uint8_t slot = order[o];
-    if (!g_wprof[slot].ssid[0]) continue;
-    for (int i = 0; i < n; i++)
-      if (WiFi.SSID(i) == g_wprof[slot].ssid) { pick = slot; break; }
+  if (n > 0) {
+    const uint8_t order[WPROF_COUNT] = { 2, 0, 1 };   // S24 > Heim > Hub-AP
+    for (uint8_t o = 0; o < WPROF_COUNT && pick < 0; o++) {
+      uint8_t slot = order[o];
+      if (!g_wprof[slot].ssid[0]) continue;
+      for (int i = 0; i < n; i++)
+        if (WiFi.SSID(i) == g_wprof[slot].ssid) { pick = slot; break; }
+    }
   }
-  WiFi.scanDelete();
-  if (pick < 0) return;                        // kein bekanntes Netz in Reichweite
+  if (n >= 0) WiFi.scanDelete();
+  if (pick < 0) { nextScanAt = millis() + 6000; return; }   // nichts bekanntes -> spaeter erneut
   g_wifiProfile = (uint8_t)pick;
   if (g_wprof[pick].hubip[0]) g_hubIp = g_wprof[pick].hubip;
   strcpy(g_ipStr, "...");
   WiFi.disconnect();
   WiFi.begin(g_wprof[pick].ssid, g_wprof[pick].pass);
-  lastScan = millis();                          // erst nach Verbindungsversuch wieder scannen
-  Serial.printf("WiFi-Auto: %s in Reichweite -> verbinde (%s)\n", WPROF_LABELS[pick], g_wprof[pick].ssid);
+  nextScanAt = millis() + 10000;                 // Verbindung Zeit geben, bevor neu gescannt wird
+  Serial.printf("WiFi-Auto: %s -> verbinde (%s)\n", WPROF_LABELS[pick], g_wprof[pick].ssid);
 }
 
 // -------- BLE Spartan3-Hub client --------
@@ -2005,9 +2010,9 @@ static void startWebServer() {
 
 // Fallback-Setup-AP: nur AN wenn keine STA-Verbindung besteht, damit das
 // Display im verbundenen Normalbetrieb stabil bleibt (kein AP-Dauerbeacon).
-static bool     g_apOn = false;
 static void manageWifiAp() {
   if (!g_featureWifi) return;
+  if (g_wifiAuto) return;            // bei Auto-Fallback besitzt wifiAutoTick das WLAN (kein stoerender AP)
   const bool conn = (WiFi.status() == WL_CONNECTED);
   if (conn && g_apOn) {
     WiFi.softAPdisconnect(true);
