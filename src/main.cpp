@@ -486,6 +486,7 @@ static bool canFresh() { return g_canLastRxMs != 0 && millis() - g_canLastRxMs <
 
 static bool setupCockpitCan() {
   g_canReady = false;
+  twai_stop();               // falls schon RUNNING (sonst schlaegt uninstall fehl)
   twai_driver_uninstall();   // idempotent: ignoriert "not installed"
   twai_mode_t mode = g_canListenOnly ? TWAI_MODE_LISTEN_ONLY : TWAI_MODE_NORMAL;
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(COCKPIT_CAN_TX_PIN, COCKPIT_CAN_RX_PIN, mode);
@@ -1592,6 +1593,7 @@ static void loadSettings() {
   g_imuOffPitch   = p.getFloat("imu_off_p", 0.0f);     // IMU-Nullung
   g_imuOffRoll    = p.getFloat("imu_off_r", 0.0f);
   g_wifiAuto      = p.getBool("wifi_auto", true);      // WLAN-Auto-Fallback default AN
+  g_canListenOnly = p.getBool("can_listen", true);     // CAN: listen-only default (NORMAL = ACK)
   g_motorStyle    = p.getUChar("mstyle", 2);          // 0=digital,1=vdo,2=123tune+
   if (g_motorStyle > 2) g_motorStyle = 2;
   p.end();
@@ -2320,6 +2322,12 @@ void loop() {
         else if (cmd == "rot:-") { saveRotation(g_rotationDeg - 1); g_redrawPage = true; }
         else if (cmd.startsWith("rot:")) { saveRotation(cmd.substring(4).toInt()); g_redrawPage = true; }
         else if (cmd == "clock")   { currentPage = 0; drawVdoClock(); }
+        else if (cmd == "can:normal" || cmd == "can:listen") {
+          g_canListenOnly = (cmd == "can:listen");
+          Preferences pc; pc.begin("clock", false); pc.putBool("can_listen", g_canListenOnly); pc.end();
+          setupCockpitCan();
+          Serial.printf("CAN-Mode = %s\n", g_canListenOnly ? "listen-only" : "NORMAL (ACK)");
+        }
         else if (cmd == "can:test"){ runCanTest(); }
         else if (cmd == "can:rx")  { Serial.printf("CAN: ready=%d rx=%lu ignored=%lu age=%lums src=%s\n",
                                        g_canReady ? 1 : 0, (unsigned long)g_canRx, (unsigned long)g_canIgnored,
@@ -2328,7 +2336,7 @@ void loop() {
         else if (cmd.startsWith("style:")) { saveMotorStyle(cmd.substring(6).toInt());
                                              Serial.printf("Motor-Stil = %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
                                              if (currentPage == 2) drawMotorPage(); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0|1|2 | imu:null | can:test | can:rx"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0|1|2 | imu:null | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
