@@ -19,6 +19,7 @@
 #include "driver/twai.h"
 #include <HTTPClient.h>
 #include <Update.h>
+#include <ESPmDNS.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -82,9 +83,13 @@ static uint32_t g_canIgnored    = 0;
 static uint32_t g_canLastRxMs   = 0;
 
 // -------- HTTP-Poll-Client (zieht /api/status vom Spartan-Hub) --------
-static String   g_hubIp        = "192.168.0.91";
-static uint32_t g_httpRx       = 0;
-static uint32_t g_httpLastRxMs = 0;
+// g_hubIp darf eine IP ODER ein mDNS-Hostname sein (z.B. "spartanhub.local") -
+// per Hostname findet das Display den Hub in jedem Subnetz (Handy-Hotspot!).
+static String   g_hubIp           = "192.168.0.91";
+static uint32_t g_httpRx          = 0;
+static uint32_t g_httpLastRxMs    = 0;
+static String   g_hubResolvedIp   = "";        // mDNS-Cache (bei Hostname-Ziel)
+static bool     g_mdnsStarted     = false;
 
 // -------- OTA (Firmware-Update per WLAN/Web) --------
 static volatile bool   g_otaBusy    = false;
@@ -277,6 +282,9 @@ static bool wifiNtpTick() {
   if (!g_webStarted) {
     startWebServer();
     g_webStarted = true;
+  }
+  if (!g_mdnsStarted) {                 // mDNS-Responder: noetig um Hub per Hostname zu finden
+    if (MDNS.begin("vdo-clock")) { g_mdnsStarted = true; Serial.println("mDNS: gestartet (vdo-clock.local)"); }
   }
   if (!sntpStarted) {
     configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov", "de.pool.ntp.org");
@@ -506,14 +514,45 @@ static bool jsonTrue(const String& s, const char* key) {
   return s.indexOf(String("\"") + key + "\":true") >= 0;
 }
 
+static bool hubIsDottedIp() {
+  if (g_hubIp.length() == 0) return false;
+  for (size_t i = 0; i < g_hubIp.length(); i++) {
+    char c = g_hubIp[i];
+    if (!((c >= '0' && c <= '9') || c == '.')) return false;
+  }
+  return true;
+}
+
+// Ziel-Adresse des Hubs: feste IP direkt, sonst per mDNS aufloesen (gecacht).
+static String hubTarget() {
+  if (hubIsDottedIp()) return g_hubIp;
+  if (!g_mdnsStarted) return g_hubResolvedIp;          // mDNS noch nicht bereit
+  // Cache nutzen solange Daten frisch sind; sonst gedrosselt neu aufloesen.
+  if (g_hubResolvedIp.length() && httpFresh()) return g_hubResolvedIp;
+  static uint32_t lastTry = 0;
+  if (g_hubResolvedIp.length() && millis() - lastTry < 5000) return g_hubResolvedIp;
+  lastTry = millis();
+  String name = g_hubIp;
+  int dot = name.indexOf(".local");
+  if (dot > 0) name = name.substring(0, dot);
+  IPAddress ip = MDNS.queryHost(name.c_str(), 1500);
+  if (ip != IPAddress(0, 0, 0, 0)) {
+    g_hubResolvedIp = ip.toString();
+    Serial.printf("mDNS: %s -> %s\n", g_hubIp.c_str(), g_hubResolvedIp.c_str());
+  }
+  return g_hubResolvedIp;
+}
+
 static void httpPollTick() {
   if (!g_featureWifi || WiFi.status() != WL_CONNECTED || g_hubIp.length() == 0) return;
   static uint32_t last = 0;
   if (millis() - last < 500) return;
   last = millis();
 
+  String tgt = hubTarget();
+  if (tgt.length() == 0) return;                       // Hostname (noch) nicht aufloesbar
   HTTPClient http;
-  String url = "http://" + g_hubIp + "/api/status";
+  String url = "http://" + tgt + "/api/status";
   if (!http.begin(url)) return;
   http.setConnectTimeout(600);
   http.setTimeout(800);
@@ -1485,6 +1524,7 @@ static void loadSettings() {
     strncpy(g_wprof[1].pass, "lambda123",        sizeof(g_wprof[1].pass) - 1);
   }
   if (!g_wprof[1].hubip[0]) strncpy(g_wprof[1].hubip, "192.168.4.1", sizeof(g_wprof[1].hubip) - 1);
+  if (!g_wprof[2].hubip[0]) strncpy(g_wprof[2].hubip, "spartanhub.local", sizeof(g_wprof[2].hubip) - 1);  // S24: Hub per mDNS
   g_wifiProfile   = p.getUChar("wifi_prof", 0);
   if (g_wifiProfile >= WPROF_COUNT) g_wifiProfile = 0;
   if (g_wprof[g_wifiProfile].hubip[0]) g_hubIp = g_wprof[g_wifiProfile].hubip;  // Hub-IP aus aktivem Profil
@@ -1670,6 +1710,9 @@ static void handleWebRoot() {
             String(WPROF_LABELS[i]) + " aktivieren</button></a>";
     html += F("</div>");
   }
+  html += F("<div style='color:#888;margin-top:8px'>Hub-IP darf ein Hostname sein "
+            "(z.B. <b>spartanhub.local</b>) &ndash; findet den Hub per mDNS in jedem Subnetz "
+            "(ideal f&uuml;r den S24-Hotspot mit wechselnden IP-Bereichen).</div>");
   html += F("</div>");
 
   html += F("<div class='card'><h3>Display-Seite</h3>"
