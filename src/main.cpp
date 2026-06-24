@@ -1307,26 +1307,23 @@ static void drawHubPage() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(150, 70, 180));
-  drawTextCentered(240, 54, "HUB", RGB565(205, 120, 230), 5);
-  drawTextCentered(240, 84, g_bleHubName.c_str(), RGB565(150, 150, 150), 2);
+  drawTextCentered(240, 52, "HUB", RGB565(205, 120, 230), 5);
   char buf[24];
-  drawDataRow(112, "BLE",   g_bleConn ? "OK" : "SCAN",
-              g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  snprintf(buf, sizeof(buf), "%lu", (unsigned long)g_bleRxCnt);
-  drawDataRow(152, "RX",    buf, RGB565(235, 235, 225));
-  snprintf(buf, sizeof(buf), "%lu MS", g_bleLastRx ? (unsigned long)(millis() - g_bleLastRx) : 0UL);
-  drawDataRow(192, "AGE",   buf, RGB565(235, 235, 225));
-  snprintf(buf, sizeof(buf), "%.1f V", g_battVolt);
-  drawDataRow(232, "BATT",  g_battValid  ? buf : "---", RGB565(235, 235, 225));
-  snprintf(buf, sizeof(buf), "%.0f KMH", g_speedKmh);
-  drawDataRow(272, "SPEED", g_speedValid ? buf : "---", RGB565(235, 235, 225));
-  drawDataRow(312, "IP",    g_ipStr, RGB565(150, 200, 150));
-  char canl[24];
-  snprintf(canl, sizeof(canl), "CAN %lu/%lu", (unsigned long)g_canRx, (unsigned long)g_canIgnored);
-  drawTextCentered(240, 348, canl,
-                   g_canReady ? (canFresh() ? RGB565(60, 210, 100) : RGB565(180, 180, 180))
-                              : RGB565(120, 120, 120), 2);
-  drawTextCentered(240, 372, "TIP MENU", RGB565(180, 180, 170), 2);
+  const uint16_t gr = RGB565(60, 210, 100), og = RGB565(220, 130, 50),
+                 cw = RGB565(235, 235, 225), dk = RGB565(120, 120, 120);
+  const bool anyFresh = httpFresh() || canFresh() || bleFresh() || tune123Fresh();
+  drawDataRow(96,  "QUELLE", anyFresh ? g_lastSrc : "---", anyFresh ? gr : og);
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)g_httpRx);
+  drawDataRow(130, "HTTP",   buf, httpFresh() ? gr : dk);
+  snprintf(buf, sizeof(buf), "%lu/%lu", (unsigned long)g_canRx, (unsigned long)g_canIgnored);
+  drawDataRow(164, "CAN",    buf, g_canReady ? (canFresh() ? gr : cw) : dk);
+  drawDataRow(198, "BLE",    g_bleConn ? "OK" : (g_bleInited ? "SCAN" : "AUS"),
+                             g_bleConn ? gr : (g_bleInited ? og : dk));
+  drawDataRow(232, "123",    g_tune123Conn ? "OK" : (g_feature123 ? "AN" : "AUS"),
+                             g_tune123Conn ? gr : (g_feature123 ? og : dk));
+  drawDataRow(266, "HUBIP",  g_hubIp.c_str(), RGB565(150, 200, 150));
+  drawDataRow(300, "IP",     g_ipStr, RGB565(150, 200, 150));
+  drawTextCentered(240, 360, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
 
