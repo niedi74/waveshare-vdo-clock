@@ -1730,16 +1730,50 @@ static void handleWebRoot() {
   String html = F("<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>VDO Uhr</title><style>"
-    "body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:20px;text-align:center}"
-    "h1{color:#e0c040;font-weight:600}.card{background:#1c1c1c;border-radius:12px;padding:18px;margin:14px auto;max-width:420px}"
+    "body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:16px;text-align:center}"
+    "h1{color:#e0c040;font-weight:600;margin:6px}.card{background:#1c1c1c;border-radius:12px;padding:18px;margin:14px auto;max-width:420px}"
     ".big{font-size:2.2em;letter-spacing:2px}input[type=range]{width:90%}"
     "button{background:#e0c040;border:0;border-radius:8px;padding:12px 20px;font-size:1em;margin:6px;cursor:pointer}"
-    "a{color:#8cf}.val{font-size:1.6em;color:#e0c040}</style></head><body>");
+    "a{color:#8cf}.val{font-size:1.6em;color:#e0c040}"
+    ".tabs{display:flex;flex-wrap:wrap;justify-content:center;gap:4px;max-width:440px;margin:10px auto}"
+    ".tabbtn{background:#333;color:#eee;padding:10px 16px}"
+    ".tab{display:none}.tab.on{display:block}</style></head><body>");
   html += F("<h1>VDO Quartz-Zeit</h1>");
   html += "<div class='card'><div class='big'>" + String(timeStr) + "</div>";
   html += "<div>IP " + String(g_ipStr) + "</div></div>";
 
-  // WLAN-Profile (Vorauswahl): Heim / Hub-AP / S24
+  html += F("<div class='tabs'>"
+    "<button class='tabbtn' id='b-live' onclick=\"sh('live',this)\">Live</button>"
+    "<button class='tabbtn' onclick=\"sh('wlan',this)\">WLAN</button>"
+    "<button class='tabbtn' onclick=\"sh('anz',this)\">Anzeige</button>"
+    "<button class='tabbtn' onclick=\"sh('imu',this)\">IMU</button>"
+    "<button class='tabbtn' onclick=\"sh('sys',this)\">System</button></div>");
+
+  // ===== Tab: Live =====
+  html += F("<div class='tab on' id='t-live'>");
+  html += F("<div class='card'><h3>Spartan-Hub Live</h3>");
+  bool anyFresh = bleFresh() || canFresh() || httpFresh();
+  html += "<div>Quelle: <b>" + String(anyFresh ? g_lastSrc : "---") + "</b> &middot; " +
+          String(anyFresh ? "LIVE" : "keine Daten") + "</div>";
+  html += "<div>Lambda: " + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) +
+          " &nbsp; RPM: " + String((int)g_rpm) + " &nbsp; ADV: " + String(g_adv, 1) + "</div>";
+  html += "<div>MAP: " + String((int)g_map) + " &nbsp; TEMP: " + String((int)g_g123Temp) +
+          " &nbsp; VOLT: " + String(g_g123Volt, 1) + " &nbsp; AMP: " + String(g_g123Coil, 1) + "</div>";
+  html += "<div style='color:#888'>HTTP rx " + String((unsigned long)g_httpRx) +
+          " &middot; CAN rx " + String((unsigned long)g_canRx) +
+          " &middot; BLE rx " + String((unsigned long)g_bleRxCnt) + "</div></div>";
+  html += F("<div class='card'><h3>Display-Seite</h3>"
+    "<a href='/page?p=0'><button>Uhr</button></a>"
+    "<a href='/page?p=1'><button>Menu</button></a>"
+    "<a href='/page?p=2'><button>Motor</button></a>"
+    "<a href='/page?p=3'><button>Lambda</button></a>"
+    "<a href='/page?p=4'><button>Hub</button></a>"
+    "<a href='/page?p=6'><button>IMU</button></a>"
+    "<a href='/page?p=5'><button>Setup</button></a></div>");
+  html += F("</div>");
+
+  // ===== Tab: WLAN =====
+  html += F("<div class='tab' id='t-wlan'>");
   html += F("<div class='card'><h3>WLAN-Profile (Vorauswahl)</h3>");
   html += "<div>Aktiv: <b>" + String(currentWifiSsid()) + "</b> &middot; " +
           String(WiFi.status() == WL_CONNECTED ? "verbunden" : "nicht verbunden") +
@@ -1764,17 +1798,10 @@ static void handleWebRoot() {
   html += F("<div style='color:#888;margin-top:8px'>Hub-IP darf ein Hostname sein "
             "(z.B. <b>spartanhub.local</b>) &ndash; findet den Hub per mDNS in jedem Subnetz "
             "(ideal f&uuml;r den S24-Hotspot mit wechselnden IP-Bereichen).</div>");
-  html += F("</div>");
+  html += F("</div></div>");
 
-  html += F("<div class='card'><h3>Display-Seite</h3>"
-    "<a href='/page?p=0'><button>Uhr</button></a>"
-    "<a href='/page?p=1'><button>Menu</button></a>"
-    "<a href='/page?p=2'><button>Motor</button></a>"
-    "<a href='/page?p=3'><button>Lambda</button></a>"
-    "<a href='/page?p=4'><button>Hub</button></a>"
-    "<a href='/page?p=6'><button>IMU</button></a>"
-    "<a href='/page?p=5'><button>Setup</button></a></div>");
-
+  // ===== Tab: Anzeige =====
+  html += F("<div class='tab' id='t-anz'>");
   html += F("<div class='card'><h3>Motor-Anzeige Stil</h3>");
   for (uint8_t i = 0; i < 3; i++) {
     html += "<a href='/set?style=" + String(i) + "'><button" +
@@ -1782,43 +1809,6 @@ static void handleWebRoot() {
             String(MOTOR_STYLE_NAMES[i]) + "</button></a>";
   }
   html += F("</div>");
-
-  html += F("<div class='card'><h3>Funktionen</h3><form action='/features' method='get'>");
-  html += "<p><label><input type='checkbox' name='wifi' value='1' ";
-  html += g_featureWifi ? "checked" : "";
-  html += F("> WLAN/Web aktiv</label></p><p><label>"
-    "<input type='checkbox' name='ble' value='1' ");
-  html += g_featureBle ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> BLE-Hub Daten aktiv</label></p><p><label>"
-    "<input type='checkbox' name='buzzer' value='1' ");
-  html += g_featureBuzzer ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> Buzzer (Shake-Alarm) aktiv</label></p><p><label>"
-    "<input type='checkbox' name='f123' value='1' ");
-  html += g_feature123 ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> 123TUNE+ direkt (Fallback bei Hub-Ausfall)</label></p><p><label>"
-    "<input type='checkbox' name='wauto' value='1' ");
-  html += g_wifiAuto ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label></p>"
-    "<div style='color:#888'>WLAN-Auto verbindet automatisch das verf&uuml;gbare Netz nach Priorit&auml;t.</div>"
-    "<button type='submit'>Speichern</button></form></div>");
-
-  html += F("<div class='card'><h3>Spartan-Hub Live</h3>");
-  bool anyFresh = bleFresh() || canFresh() || httpFresh();
-  html += "<div>Quelle: <b>" + String(anyFresh ? g_lastSrc : "---") + "</b> &middot; " +
-          String(anyFresh ? "LIVE" : "keine Daten") + "</div>";
-  html += "<div>Lambda: " + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) +
-          " &nbsp; RPM: " + String((int)g_rpm) + " &nbsp; ADV: " + String(g_adv, 1) + "</div>";
-  html += "<div>MAP: " + String((int)g_map) + " &nbsp; TEMP: " + String((int)g_g123Temp) +
-          " &nbsp; VOLT: " + String(g_g123Volt, 1) + " &nbsp; AMP: " + String(g_g123Coil, 1) + "</div>";
-  html += "<div style='color:#888'>HTTP rx " + String((unsigned long)g_httpRx) +
-          " &middot; CAN rx " + String((unsigned long)g_canRx) +
-          " &middot; BLE rx " + String((unsigned long)g_bleRxCnt) + "</div>";
-  html += F("<form action='/set' method='get' style='margin-top:8px'>"
-    "<input name='hubip' placeholder='Hub-IP' value='");
-  html += g_hubIp;
-  html += F("' style='width:60%;padding:8px;margin:4px;border-radius:8px;border:0'>"
-    "<button type='submit'>Hub-IP speichern</button></form></div>");
-
   html += F("<div class='card'><h3>Zifferblatt-Gr&ouml;&szlig;e</h3>"
     "<form action='/set' method='get'>"
     "<div class='val'><span id='v'>");
@@ -1838,6 +1828,10 @@ static void handleWebRoot() {
             "<a href='/set?rot_delta=5'><button>+ 5&deg;</button></a>"
             "<div><a href='/set?rot=0'>0&deg;</a> &middot; <a href='/set?rot=90'>90&deg;</a> &middot; "
             "<a href='/set?rot=180'>180&deg;</a> &middot; <a href='/set?rot=270'>270&deg;</a></div></div>");
+  html += F("</div>");
+
+  // ===== Tab: IMU =====
+  html += F("<div class='tab' id='t-imu'>");
   html += F("<div class='card'><h3>IMU Steigung</h3>");
   if (g_imuPresent) {
     html += "<div class='val'>" + String(g_imuPitch - g_imuOffPitch, 1) + "&deg;</div>";
@@ -1846,13 +1840,43 @@ static void handleWebRoot() {
   } else {
     html += F("<div>kein IMU</div>");
   }
-  html += F("</div>");
+  html += F("</div></div>");
+
+  // ===== Tab: System =====
+  html += F("<div class='tab' id='t-sys'>");
+  html += F("<div class='card'><h3>Funktionen</h3><form action='/features' method='get'>");
+  html += "<p><label><input type='checkbox' name='wifi' value='1' ";
+  html += g_featureWifi ? "checked" : "";
+  html += F("> WLAN/Web aktiv</label></p><p><label>"
+    "<input type='checkbox' name='ble' value='1' ");
+  html += g_featureBle ? "checked" : "";
+  html += F(" onchange='this.form.submit()'> BLE-Hub Daten aktiv</label></p><p><label>"
+    "<input type='checkbox' name='buzzer' value='1' ");
+  html += g_featureBuzzer ? "checked" : "";
+  html += F(" onchange='this.form.submit()'> Buzzer (Shake-Alarm) aktiv</label></p><p><label>"
+    "<input type='checkbox' name='f123' value='1' ");
+  html += g_feature123 ? "checked" : "";
+  html += F(" onchange='this.form.submit()'> 123TUNE+ direkt (Fallback bei Hub-Ausfall)</label></p><p><label>"
+    "<input type='checkbox' name='wauto' value='1' ");
+  html += g_wifiAuto ? "checked" : "";
+  html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label></p>"
+    "<div style='color:#888'>WLAN-Auto verbindet automatisch das verf&uuml;gbare Netz nach Priorit&auml;t.</div>"
+    "<button type='submit'>Speichern</button></form></div>");
   html += F("<div class='card'><h3>Firmware-Update (OTA)</h3>"
     "<form method='POST' action='/update' enctype='multipart/form-data'>"
     "<input type='file' name='firmware' accept='.bin' style='width:88%;margin:6px'><br>"
     "<button type='submit'>Firmware flashen</button></form>"
     "<div style='color:#888'>.bin aus .pio/build/waveshare_s3_28c/firmware.bin</div></div>");
-  html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p></body></html>");
+  html += F("</div>");
+
+  html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p>"
+    "<script>function sh(t,b){var x=document.querySelectorAll('.tab');"
+    "for(var i=0;i<x.length;i++)x[i].className='tab';"
+    "document.getElementById('t-'+t).className='tab on';"
+    "var y=document.querySelectorAll('.tabbtn');"
+    "for(var i=0;i<y.length;i++)y[i].style.background='';b.style.background='#6c6';}"
+    "window.addEventListener('load',function(){var b=document.getElementById('b-live');if(b)b.style.background='#6c6';});"
+    "</script></body></html>");
   webServer.send(200, "text/html", html);
 }
 
