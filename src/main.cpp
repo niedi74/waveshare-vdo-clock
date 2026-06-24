@@ -573,6 +573,12 @@ static bool hubIsDottedIp() {
 
 // Ziel-Adresse des Hubs: feste IP direkt, sonst per mDNS aufloesen (gecacht).
 static String hubTarget() {
+  // Hub-AP-Profil: der Hub ist immer das Gateway des AP -> nutzen, egal welches
+  // (zufaellige) Subnetz der Hub-AP gerade vergibt.
+  if (g_wifiProfile == 1 && WiFi.status() == WL_CONNECTED) {
+    IPAddress gw = WiFi.gatewayIP();
+    if ((uint32_t)gw != 0) return gw.toString();
+  }
   if (hubIsDottedIp()) return g_hubIp;
   if (!g_mdnsStarted) return g_hubResolvedIp;          // mDNS noch nicht bereit
   // Cache nutzen solange Daten frisch sind; sonst gedrosselt neu aufloesen.
@@ -619,6 +625,7 @@ static void httpPollTick() {
     g_g123Valid   = jsonTrue(b, "tune_connected");
     g_lastSrc     = "HTTP";
     g_httpRx++;
+    if (g_httpRx == 1) Serial.printf("HTTP: erste Daten von %s\n", tgt.c_str());
     g_httpLastRxMs = millis();
   }
   http.end();
@@ -1571,7 +1578,7 @@ static void loadSettings() {
     strncpy(g_wprof[1].ssid, "Spartan3-TestHub", sizeof(g_wprof[1].ssid) - 1);
     strncpy(g_wprof[1].pass, "lambda123",        sizeof(g_wprof[1].pass) - 1);
   }
-  if (!g_wprof[1].hubip[0]) strncpy(g_wprof[1].hubip, "192.168.4.1", sizeof(g_wprof[1].hubip) - 1);
+  if (!g_wprof[1].hubip[0]) strncpy(g_wprof[1].hubip, "spartanhub.local", sizeof(g_wprof[1].hubip) - 1);  // Hub-AP: Gateway/mDNS (Subnetz egal)
   if (!g_wprof[2].ssid[0])  strncpy(g_wprof[2].ssid,  "Android-AP1",      sizeof(g_wprof[2].ssid)  - 1);  // S24: Hotspot-SSID
   if (!g_wprof[2].pass[0])  strncpy(g_wprof[2].pass,  S24_AP_PASS,        sizeof(g_wprof[2].pass)  - 1);  // S24: Passwort (Seed aus wifi_secret.h)
   if (!g_wprof[2].hubip[0]) strncpy(g_wprof[2].hubip, "spartanhub.local", sizeof(g_wprof[2].hubip) - 1);  // S24: Hub per mDNS
