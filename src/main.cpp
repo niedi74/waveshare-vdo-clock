@@ -48,6 +48,11 @@
 #define SPARTAN_SVC    "7f510001-5a6b-4d2a-9f20-14a7f3e20000"
 #define SPARTAN_STATUS "7f510002-5a6b-4d2a-9f20-14a7f3e20000"
 
+// -------- 123TUNE+ direkt (NUS) --------
+#define NUS_SVC "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define NUS_RX  "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+#define NUS_TX  "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
 static float g_lambda = 0, g_rpm = 0, g_adv = 0, g_map = 0;
 static float g_battVolt = 0, g_speedKmh = 0;
 static float g_g123Volt = 0, g_g123Temp = 0, g_g123Coil = 0;
@@ -524,6 +529,140 @@ static void httpPollTick() {
     g_httpLastRxMs = millis();
   }
   http.end();
+}
+
+// ===================== 123TUNE+ direkter BLE-Fallback =====================
+// Verbindet sich direkt zur 123TUNE+ (NUS), wenn HTTP/CAN keine Daten liefern
+// und der BLE-Hub-Client nicht aktiv ist. Single-Central: sobald HTTP/CAN wieder
+// Daten bringen, wird das 123 wieder freigegeben (sonst Konflikt mit dem Hub).
+static NimBLEClient*               tune123Client = nullptr;
+static NimBLERemoteCharacteristic* tune123Rx     = nullptr;   // NUS RX (Display->123)
+static NimBLEAddress               tune123Target;
+static volatile bool g_tune123DoConnect = false;
+static bool     g_tune123Conn       = false;
+static uint32_t g_tune123LastRxMs   = 0;
+static uint32_t g_tune123NextScanAt = 0;
+static uint32_t g_tune123KeepAt     = 0;
+static bool     g_bleInited         = false;
+
+static bool tune123Fresh() { return g_tune123LastRxMs != 0 && millis() - g_tune123LastRxMs < 3000; }
+
+static void bleEnsureInit() {                 // NimBLE einmal initialisieren (vor RGB-Panel!)
+  if (g_bleInited) return;
+  NimBLEDevice::init("VDO-Clock");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  g_bleInited = true;
+}
+
+static int hexNibble(uint8_t c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return 0;
+}
+
+// Datenpaket: [opcode][hi_ascii_hex][lo_ascii_hex]
+static void onTune123Notify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
+  if (n < 3) return;
+  int hi = hexNibble(d[1]), lo = hexNibble(d[2]);
+  int raw = (hi << 4) | lo;
+  switch (d[0]) {
+    case 0x30: g_rpm = hi * 800.0f + lo * 50.0f; break;
+    case 0x31: g_adv = hi * 3.2f + lo * 0.2f;    break;
+    case 0x32: g_map = (float)raw;               break;
+    case 0x33: g_g123Temp = (float)(raw - 30); g_g123Valid = true; break;
+    case 0x35: g_g123Coil = raw / 8.65f;       g_g123Valid = true; break;
+    case 0x41: g_g123Volt = raw / 4.54f;       g_g123Valid = true; break;
+    default: break;                              // u.a. 0x42 ignorieren
+  }
+  g_lambdaValid = false;                         // 123 liefert kein Lambda
+  g_tune123LastRxMs = millis();
+  g_lastSrc = "123";
+}
+
+class Tune123ClientCB : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient*) override { Serial.println("123: verbunden"); }
+  void onDisconnect(NimBLEClient*, int reason) override {
+    g_tune123Conn = false; tune123Rx = nullptr;
+    Serial.printf("123: getrennt (reason=%d)\n", reason);
+    g_tune123NextScanAt = millis() + 3000;
+  }
+  bool onConnParamsUpdateRequest(NimBLEClient*, const ble_gap_upd_params*) override { return true; }
+};
+
+class Tune123ScanCB : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* dev) override {
+    String name = dev->getName().c_str(); name.toLowerCase();
+    bool match = name.indexOf("123") >= 0 || name.indexOf("tune") >= 0 ||
+                 name.indexOf("raytac") >= 0 || dev->isAdvertisingService(NimBLEUUID(NUS_SVC));
+    if (match) {
+      tune123Target = dev->getAddress();
+      g_tune123DoConnect = true;
+      NimBLEDevice::getScan()->stop();
+      Serial.printf("123: gefunden %s (%s)\n", tune123Target.toString().c_str(), name.c_str());
+    }
+  }
+  void onScanEnd(const NimBLEScanResults&, int) override {
+    if (!g_tune123Conn && !g_tune123DoConnect) g_tune123NextScanAt = millis() + 5000;
+  }
+};
+
+static Tune123ClientCB tune123ClientCB;
+static Tune123ScanCB   tune123ScanCB;
+
+static void tune123Connect() {
+  g_tune123DoConnect = false;
+  if (!tune123Client) {
+    tune123Client = NimBLEDevice::createClient();
+    tune123Client->setClientCallbacks(&tune123ClientCB, false);
+  }
+  if (!tune123Client->connect(tune123Target, true, false, false)) {
+    Serial.println("123: Connect fehlgeschlagen");
+    g_tune123NextScanAt = millis() + 4000;
+    return;
+  }
+  auto* svc = tune123Client->getService(NUS_SVC);
+  if (!svc) { Serial.println("123: kein NUS"); tune123Client->disconnect(); return; }
+  auto* tx = svc->getCharacteristic(NUS_TX);
+  tune123Rx = svc->getCharacteristic(NUS_RX);
+  if (!tx || !tune123Rx) { Serial.println("123: NUS-Char fehlt"); tune123Client->disconnect(); return; }
+  if (!tx->subscribe(true, onTune123Notify, true)) {
+    Serial.println("123: subscribe FAIL"); tune123Client->disconnect(); return;
+  }
+  // Auth (write ohne Response): I@\r , dann PW1234!\r (Antwort wird ignoriert)
+  tune123Rx->writeValue((const uint8_t*)"I@\r", 3, false);
+  delay(50);
+  tune123Rx->writeValue((const uint8_t*)"PW1234!\r", 8, false);
+  g_tune123Conn   = true;
+  g_tune123KeepAt = millis() + 1000;
+  Serial.println("123: subscribe OK + Auth gesendet");
+}
+
+static void tune123ScanTick() {
+  if (g_featureBle) return;                      // wenn Hub-BLE aktiv: Radio gehoert dem Hub-Client
+  if (httpFresh() || canFresh()) {               // Hub-Quelle da -> 123 freigeben
+    if (g_tune123Conn && tune123Client) { tune123Client->disconnect(); g_tune123Conn = false; }
+    return;
+  }
+  if (g_tune123Conn) return;
+  if (g_tune123DoConnect) { tune123Connect(); return; }
+  if (g_tune123NextScanAt != 0 && millis() < g_tune123NextScanAt) return;
+  bleEnsureInit();
+  auto* s = NimBLEDevice::getScan();
+  if (s->isScanning()) return;
+  s->setScanCallbacks(&tune123ScanCB);
+  s->setActiveScan(true);                        // Name lesen -> active scan
+  s->setInterval(160); s->setWindow(60);
+  g_tune123NextScanAt = millis() + 8000;
+  s->start(5000, false);
+  Serial.println("123: Scan...");
+}
+
+static void tune123KeepaliveTick() {             // alle 1000ms "$\r"
+  if (!g_tune123Conn || !tune123Rx) return;
+  if (millis() < g_tune123KeepAt) return;
+  g_tune123KeepAt = millis() + 1000;
+  tune123Rx->writeValue((const uint8_t*)"$\r", 2, false);
 }
 
 // ---- I2C helpers (GT911) ----
@@ -1079,7 +1218,7 @@ static void drawMotorPage() {
     drawCircleLine(240, 240, 236, 7, t.bezel);           // heller Chrom-Ring
     drawCircleLine(240, 240, 229, 2, t.bezelDk);          // dunkle Innenkante
   }
-  const bool fresh = bleFresh() || canFresh() || httpFresh();
+  const bool fresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
   char buf[16];
 
   drawTach(240, 240, g_rpm, fresh, t);
@@ -1137,7 +1276,7 @@ static void drawLambdaPage() {
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(45, 150, 70));
   drawTextCentered(240, 58, "LAMBDA", RGB565(70, 200, 100), 5);
-  bool live  = bleFresh() || canFresh() || httpFresh();
+  bool live  = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
   bool fresh = live && g_lambdaValid;
   char buf[16];
   if (fresh) snprintf(buf, sizeof(buf), "%.2f", g_lambda);
@@ -1816,11 +1955,10 @@ void setup() {
     Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", currentWifiSsid());
   }
 
+  bleEnsureInit();                 // immer vor dem RGB-Panel (PHY/Cache) - fuer Hub + 123-Fallback
   if (g_featureBle) {
-    NimBLEDevice::init("VDO-Clock");
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     bleNextScanAt = millis() + 20000;
-    Serial.println("BLE: Client initialisiert");
+    Serial.println("BLE: Hub-Client aktiv");
   }
 
   Serial.println("Display: HAL init...");
@@ -1972,6 +2110,10 @@ void loop() {
 
   // HTTP-Poll vom Hub (/api/status)
   httpPollTick();
+
+  // 123TUNE+ direkter Fallback (nur wenn HTTP/CAN tot + Hub-BLE aus)
+  tune123ScanTick();
+  tune123KeepaliveTick();
 
   // Web server
   if (g_webStarted) webServer.handleClient();
