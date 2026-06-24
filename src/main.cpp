@@ -140,25 +140,28 @@ static uint8_t wifiProfileCount() {
   return (uint8_t)(sizeof(WIFI_PROFILES) / sizeof(WIFI_PROFILES[0]));
 }
 
-// Zur Laufzeit (per WebGUI) eingegebene STA-Zugangsdaten. Liegen sie vor,
-// haben sie Vorrang vor den einkompilierten WIFI_PROFILES. Persistent im NVS.
-static char g_staSsid[33] = "";
-static char g_staPass[65] = "";
+// Drei zur Laufzeit (per WebGUI/Setup) vorwaehlbare WLAN-Profile: Heim / Hub-AP / S24.
+// Jedes mit SSID, Passwort und zugehoeriger Hub-IP. Persistent im NVS. Haben Vorrang
+// vor den einkompilierten WIFI_PROFILES. g_wifiProfile = aktiver Slot (0..2).
+#define WPROF_COUNT 3
+struct StaProfile { char ssid[33]; char pass[65]; char hubip[20]; };
+static StaProfile g_wprof[WPROF_COUNT];
+static const char* const WPROF_LABELS[WPROF_COUNT] = { "Heim", "Hub-AP", "S24" };
 
 static const char* currentWifiSsid() {
-  if (g_staSsid[0]) return g_staSsid;
+  if (g_wifiProfile >= WPROF_COUNT) g_wifiProfile = 0;
+  if (g_wprof[g_wifiProfile].ssid[0]) return g_wprof[g_wifiProfile].ssid;
   uint8_t count = wifiProfileCount();
   if (count == 0) return "";
-  if (g_wifiProfile >= count) g_wifiProfile = 0;
-  return WIFI_PROFILES[g_wifiProfile].ssid;
+  return WIFI_PROFILES[g_wifiProfile < count ? g_wifiProfile : 0].ssid;
 }
 
 static const char* currentWifiPassword() {
-  if (g_staSsid[0]) return g_staPass;
+  if (g_wifiProfile >= WPROF_COUNT) g_wifiProfile = 0;
+  if (g_wprof[g_wifiProfile].ssid[0]) return g_wprof[g_wifiProfile].pass;
   uint8_t count = wifiProfileCount();
   if (count == 0) return "";
-  if (g_wifiProfile >= count) g_wifiProfile = 0;
-  return WIFI_PROFILES[g_wifiProfile].pass;
+  return WIFI_PROFILES[g_wifiProfile < count ? g_wifiProfile : 0].pass;
 }
 
 // Build-time fallbacks (inject_time.py provides these)
@@ -1342,7 +1345,7 @@ static void drawSetupPage() {
   snprintf(buf, sizeof(buf), "%d DEG", g_rotationDeg);
   drawDataRow(182, "ROT",   buf, RGB565(235, 235, 225));
   if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
-    snprintf(buf, sizeof(buf), "%s", currentWifiSsid());
+    snprintf(buf, sizeof(buf), "%s", WPROF_LABELS[g_wifiProfile]);
     drawDataRow(218, "WIFI", buf,
                 WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   } else {
@@ -1466,11 +1469,25 @@ static void loadSettings() {
   g_dialScalePct  = p.getInt("scale",     100);
   g_brightnessPct = p.getInt("bright",    100);
   g_rotationDeg   = p.getInt("rot_deg",   0);
-  p.getString("sta_ssid", g_staSsid, sizeof(g_staSsid));
-  p.getString("sta_pass", g_staPass, sizeof(g_staPass));
-  g_hubIp = p.getString("hub_ip", g_hubIp);
+  for (uint8_t i = 0; i < WPROF_COUNT; i++) {     // 3 WLAN-Profile laden
+    char k[8];
+    snprintf(k, sizeof(k), "wp%u_s", i); p.getString(k, g_wprof[i].ssid,  sizeof(g_wprof[i].ssid));
+    snprintf(k, sizeof(k), "wp%u_p", i); p.getString(k, g_wprof[i].pass,  sizeof(g_wprof[i].pass));
+    snprintf(k, sizeof(k), "wp%u_h", i); p.getString(k, g_wprof[i].hubip, sizeof(g_wprof[i].hubip));
+  }
+  if (!g_wprof[0].ssid[0]) {                       // Migration alte Einzel-STA -> Slot 0 (Heim)
+    p.getString("sta_ssid", g_wprof[0].ssid, sizeof(g_wprof[0].ssid));
+    p.getString("sta_pass", g_wprof[0].pass, sizeof(g_wprof[0].pass));
+  }
+  if (!g_wprof[0].hubip[0]) p.getString("hub_ip", g_wprof[0].hubip, sizeof(g_wprof[0].hubip));
+  if (!g_wprof[1].ssid[0]) {                        // Default Hub-AP in Slot 1
+    strncpy(g_wprof[1].ssid, "Spartan3-TestHub", sizeof(g_wprof[1].ssid) - 1);
+    strncpy(g_wprof[1].pass, "lambda123",        sizeof(g_wprof[1].pass) - 1);
+  }
+  if (!g_wprof[1].hubip[0]) strncpy(g_wprof[1].hubip, "192.168.4.1", sizeof(g_wprof[1].hubip) - 1);
   g_wifiProfile   = p.getUChar("wifi_prof", 0);
-  if (g_wifiProfile >= wifiProfileCount()) g_wifiProfile = 0;
+  if (g_wifiProfile >= WPROF_COUNT) g_wifiProfile = 0;
+  if (g_wprof[g_wifiProfile].hubip[0]) g_hubIp = g_wprof[g_wifiProfile].hubip;  // Hub-IP aus aktivem Profil
   g_featureWifi   = p.getBool("feat_wifi", strlen(currentWifiSsid()) > 0);
   g_featureBle    = p.getBool("feat_ble",  false);
   g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
@@ -1631,27 +1648,27 @@ static void handleWebRoot() {
   html += "<div class='card'><div class='big'>" + String(timeStr) + "</div>";
   html += "<div>IP " + String(g_ipStr) + "</div></div>";
 
-  // WLAN-Profil umschalten
-  html += F("<div class='card'><h3>WLAN</h3>");
+  // WLAN-Profile (Vorauswahl): Heim / Hub-AP / S24
+  html += F("<div class='card'><h3>WLAN-Profile (Vorauswahl)</h3>");
   html += "<div>Aktiv: <b>" + String(currentWifiSsid()) + "</b> &middot; " +
-          String(WiFi.status() == WL_CONNECTED ? "verbunden" : "nicht verbunden") + "</div>";
-  if (g_staSsid[0]) {
-    html += "<div>Eigenes WLAN: <b>" + String(g_staSsid) + "</b></div>";
-  }
-  for (uint8_t i = 0; i < wifiProfileCount(); i++) {
-    if (strlen(WIFI_PROFILES[i].ssid) == 0) continue;
-    html += "<a href='/wifi?prof=" + String(i) + "'><button" +
-            String((!g_staSsid[0] && i == g_wifiProfile) ? " style='background:#6c6'" : "") + ">" +
-            String(WIFI_PROFILES[i].ssid) + "</button></a>";
-  }
-  html += F("<form action='/wifi' method='post' style='margin-top:10px'>"
-    "<input name='ssid' placeholder='WLAN-Name (SSID)' autocomplete='off' "
-      "style='width:88%;padding:10px;margin:4px;border-radius:8px;border:0;font-size:1em'><br>"
-    "<input name='pass' type='password' placeholder='Passwort' "
-      "style='width:88%;padding:10px;margin:4px;border-radius:8px;border:0;font-size:1em'><br>"
-    "<button type='submit'>WLAN verbinden</button></form>");
-  if (g_staSsid[0]) {
-    html += F("<a href='/wifi?clear=1'><button style='background:#c66'>Eigenes WLAN l&ouml;schen</button></a>");
+          String(WiFi.status() == WL_CONNECTED ? "verbunden" : "nicht verbunden") +
+          " &middot; Hub " + String(g_hubIp) + "</div>";
+  for (uint8_t i = 0; i < WPROF_COUNT; i++) {
+    html += F("<div style='border-top:1px solid #333;margin-top:10px;padding-top:8px;text-align:left'>");
+    html += "<b style='color:#e0c040'>" + String(WPROF_LABELS[i]) +
+            (i == g_wifiProfile ? " &mdash; aktiv" : "") + "</b>";
+    html += "<form action='/wifi' method='post'><input type='hidden' name='slot' value='" + String(i) + "'>";
+    html += "<input name='ssid' placeholder='SSID' value='" + String(g_wprof[i].ssid) +
+            "' autocomplete='off' style='width:88%;padding:8px;margin:3px;border:0;border-radius:6px'><br>";
+    html += F("<input name='pass' type='password' placeholder='Passwort (leer = unver&auml;ndert)' "
+              "autocomplete='off' style='width:88%;padding:8px;margin:3px;border:0;border-radius:6px'><br>");
+    html += "<input name='hubip' placeholder='Hub-IP' value='" + String(g_wprof[i].hubip) +
+            "' style='width:50%;padding:8px;margin:3px;border:0;border-radius:6px'>";
+    html += F("<button type='submit'>Speichern+Verbinden</button></form>");
+    html += "<a href='/wifi?sel=" + String(i) + "'><button" +
+            String(i == g_wifiProfile ? " style='background:#6c6'" : "") + ">" +
+            String(WPROF_LABELS[i]) + " aktivieren</button></a>";
+    html += F("</div>");
   }
   html += F("</div>");
 
@@ -1761,11 +1778,14 @@ static void handleWebSet() {
   if (webServer.hasArg("hubip")) {
     g_hubIp = webServer.arg("hubip");
     g_hubIp.trim();
+    if (g_wifiProfile < WPROF_COUNT)               // Hub-IP ans aktive Profil binden
+      snprintf(g_wprof[g_wifiProfile].hubip, sizeof(g_wprof[g_wifiProfile].hubip), "%s", g_hubIp.c_str());
     Preferences p;
     p.begin("clock", false);
     p.putString("hub_ip", g_hubIp);
+    char k[8]; snprintf(k, sizeof(k), "wp%u_h", g_wifiProfile); p.putString(k, g_hubIp);
     p.end();
-    Serial.printf("Web: Hub-IP = %s\n", g_hubIp.c_str());
+    Serial.printf("Web: Hub-IP = %s (Profil %u)\n", g_hubIp.c_str(), g_wifiProfile);
   }
   if (webServer.hasArg("style")) {
     saveMotorStyle(webServer.arg("style").toInt());
@@ -1807,28 +1827,27 @@ static void handleWebPage() {
   webServer.send(303);
 }
 
-static void reconnectWifiProfile();    // fwd
-static void saveWifiProfile(uint8_t);  // fwd
-static void saveStaCredentials(const char*, const char*);  // fwd
+static void reconnectWifiProfile();                         // fwd
+static void selectWprof(uint8_t idx);                       // fwd
+static void saveWprof(uint8_t, const char*, const char*, const char*);  // fwd
 
-// WLAN per Web: eigenes SSID/Passwort (/wifi POST ssid,pass), Profil umschalten
-// (/wifi?prof=N) oder eigene Daten loeschen (/wifi?clear=1).
+// WLAN per Web: Profil auswaehlen (/wifi?sel=N) oder Profil bearbeiten
+// (/wifi POST slot,ssid,pass,hubip -> speichert + verbindet).
 static void handleWebWifi() {
-  if (webServer.hasArg("clear")) {
-    saveStaCredentials("", "");
-    reconnectWifiProfile();
-    Serial.println("Web: eigene WLAN-Daten geloescht -> zurueck auf Profil");
-  } else if (webServer.hasArg("ssid") && webServer.arg("ssid").length() > 0) {
-    saveStaCredentials(webServer.arg("ssid").c_str(), webServer.arg("pass").c_str());
-    reconnectWifiProfile();
-    Serial.printf("Web: WLAN-STA gesetzt -> '%s'\n", g_staSsid);
-  } else if (webServer.hasArg("prof")) {
-    int idx = webServer.arg("prof").toInt();
-    if (idx < 0) idx = 0;
-    saveStaCredentials("", "");   // Profilwahl deaktiviert eigene Daten
-    saveWifiProfile((uint8_t)idx);
-    reconnectWifiProfile();
-    Serial.printf("Web: WLAN-Profil -> %d (%s)\n", idx, currentWifiSsid());
+  if (webServer.hasArg("sel")) {
+    selectWprof((uint8_t)webServer.arg("sel").toInt());
+    Serial.printf("Web: WLAN-Profil aktiv -> %u (%s)\n", g_wifiProfile, currentWifiSsid());
+  } else if (webServer.hasArg("slot")) {
+    uint8_t idx = (uint8_t)webServer.arg("slot").toInt();
+    if (idx < WPROF_COUNT) {
+      // leeres Passwort = bestehendes behalten (wird im Formular nie zurueckgegeben)
+      const char* pw = webServer.arg("pass").length() ? webServer.arg("pass").c_str()
+                                                       : g_wprof[idx].pass;
+      saveWprof(idx, webServer.arg("ssid").c_str(), pw,
+                webServer.hasArg("hubip") ? webServer.arg("hubip").c_str() : g_wprof[idx].hubip);
+      selectWprof(idx);
+      Serial.printf("Web: WLAN-Profil %u gesetzt -> '%s'\n", idx, g_wprof[idx].ssid);
+    }
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -1956,28 +1975,18 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
   }
 }
 
-static void saveWifiProfile(uint8_t idx) {
-  uint8_t count = wifiProfileCount();
-  if (count == 0) return;
-  if (idx >= count) idx = 0;
-  g_wifiProfile = idx;
-  g_featureWifi = true;
+// Ein WLAN-Profil (Slot) speichern. Persistent im NVS.
+static void saveWprof(uint8_t idx, const char* ssid, const char* pass, const char* hubip) {
+  if (idx >= WPROF_COUNT) return;
+  snprintf(g_wprof[idx].ssid,  sizeof(g_wprof[idx].ssid),  "%s", ssid  ? ssid  : "");
+  snprintf(g_wprof[idx].pass,  sizeof(g_wprof[idx].pass),  "%s", pass  ? pass  : "");
+  snprintf(g_wprof[idx].hubip, sizeof(g_wprof[idx].hubip), "%s", hubip ? hubip : "");
   Preferences p;
   p.begin("clock", false);
-  p.putUChar("wifi_prof", g_wifiProfile);
-  p.putBool("feat_wifi", true);
-  p.end();
-}
-
-// Eigene STA-Zugangsdaten setzen (leeres ssid = loeschen). Persistent im NVS.
-static void saveStaCredentials(const char* ssid, const char* pass) {
-  snprintf(g_staSsid, sizeof(g_staSsid), "%s", ssid ? ssid : "");
-  snprintf(g_staPass, sizeof(g_staPass), "%s", pass ? pass : "");
-  Preferences p;
-  p.begin("clock", false);
-  p.putString("sta_ssid", g_staSsid);
-  p.putString("sta_pass", g_staPass);
-  if (g_staSsid[0]) { g_featureWifi = true; p.putBool("feat_wifi", true); }
+  char k[8];
+  snprintf(k, sizeof(k), "wp%u_s", idx); p.putString(k, g_wprof[idx].ssid);
+  snprintf(k, sizeof(k), "wp%u_p", idx); p.putString(k, g_wprof[idx].pass);
+  snprintf(k, sizeof(k), "wp%u_h", idx); p.putString(k, g_wprof[idx].hubip);
   p.end();
 }
 
@@ -1988,14 +1997,28 @@ static void reconnectWifiProfile() {
   WiFi.disconnect();
   WiFi.mode(WIFI_STA);
   WiFi.begin(currentWifiSsid(), currentWifiPassword());
-  Serial.printf("WiFi: Profil %u -> '%s'\n", g_wifiProfile, currentWifiSsid());
+  Serial.printf("WiFi: Profil %u (%s) -> '%s'\n", g_wifiProfile, WPROF_LABELS[g_wifiProfile], currentWifiSsid());
 }
 
-static void cycleWifiProfile() {
-  uint8_t count = wifiProfileCount();
-  if (count == 0) return;
-  saveWifiProfile((uint8_t)((g_wifiProfile + 1) % count));
+// Profil aktiv schalten: Index + zugehoerige Hub-IP setzen, dann verbinden.
+static void selectWprof(uint8_t idx) {
+  if (idx >= WPROF_COUNT) idx = 0;
+  g_wifiProfile = idx;
+  g_featureWifi = true;
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("wifi_prof", g_wifiProfile);
+  p.putBool("feat_wifi", true);
+  if (g_wprof[idx].hubip[0]) { g_hubIp = g_wprof[idx].hubip; p.putString("hub_ip", g_hubIp); }
+  p.end();
   reconnectWifiProfile();
+}
+
+static void cycleWifiProfile() {                 // zum naechsten belegten Profil
+  for (uint8_t step = 1; step <= WPROF_COUNT; step++) {
+    uint8_t i = (g_wifiProfile + step) % WPROF_COUNT;
+    if (g_wprof[i].ssid[0]) { selectWprof(i); return; }
+  }
 }
 
 void setup() {
