@@ -13,6 +13,9 @@
   #define WIFI_SSID     ""
   #define WIFI_PASSWORD ""
 #endif
+#ifndef S24_AP_PASS            // S24-Hotspot-Passwort: nur lokal in wifi_secret.h, NIE committen
+  #define S24_AP_PASS ""
+#endif
 #include "hal_waveshare_28c.h"
 #include "qmi8658_imu.h"
 #include "vdo_dial_480_rgb565.h"
@@ -1525,6 +1528,7 @@ static void loadSettings() {
   }
   if (!g_wprof[1].hubip[0]) strncpy(g_wprof[1].hubip, "192.168.4.1", sizeof(g_wprof[1].hubip) - 1);
   if (!g_wprof[2].ssid[0])  strncpy(g_wprof[2].ssid,  "Android-AP1",      sizeof(g_wprof[2].ssid)  - 1);  // S24: Hotspot-SSID
+  if (!g_wprof[2].pass[0])  strncpy(g_wprof[2].pass,  S24_AP_PASS,        sizeof(g_wprof[2].pass)  - 1);  // S24: Passwort (Seed aus wifi_secret.h)
   if (!g_wprof[2].hubip[0]) strncpy(g_wprof[2].hubip, "spartanhub.local", sizeof(g_wprof[2].hubip) - 1);  // S24: Hub per mDNS
   g_wifiProfile   = p.getUChar("wifi_prof", 0);
   if (g_wifiProfile >= WPROF_COUNT) g_wifiProfile = 0;
