@@ -1524,6 +1524,7 @@ static void loadSettings() {
     strncpy(g_wprof[1].pass, "lambda123",        sizeof(g_wprof[1].pass) - 1);
   }
   if (!g_wprof[1].hubip[0]) strncpy(g_wprof[1].hubip, "192.168.4.1", sizeof(g_wprof[1].hubip) - 1);
+  if (!g_wprof[2].ssid[0])  strncpy(g_wprof[2].ssid,  "Android-AP1",      sizeof(g_wprof[2].ssid)  - 1);  // S24: Hotspot-SSID
   if (!g_wprof[2].hubip[0]) strncpy(g_wprof[2].hubip, "spartanhub.local", sizeof(g_wprof[2].hubip) - 1);  // S24: Hub per mDNS
   g_wifiProfile   = p.getUChar("wifi_prof", 0);
   if (g_wifiProfile >= WPROF_COUNT) g_wifiProfile = 0;
