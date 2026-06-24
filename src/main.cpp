@@ -109,6 +109,7 @@ static float     g_rotCos       = 1.0f;
 static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
+static bool      g_feature123    = false;  // 123-Direkt-Fallback: default AUS (sonst Dauer-BLE -> Ruckeln)
 static bool      g_webStarted   = false;
 static bool      g_redrawPage   = false;
 static uint8_t   g_wifiProfile  = 0;
@@ -639,6 +640,7 @@ static void tune123Connect() {
 }
 
 static void tune123ScanTick() {
+  if (!g_feature123) return;                     // Fallback nur wenn bewusst aktiviert (sonst kein BLE -> fluessig)
   if (g_featureBle) return;                      // wenn Hub-BLE aktiv: Radio gehoert dem Hub-Client
   if (httpFresh() || canFresh()) {               // Hub-Quelle da -> 123 freigeben
     if (g_tune123Conn && tune123Client) { tune123Client->disconnect(); g_tune123Conn = false; }
@@ -1467,6 +1469,7 @@ static void loadSettings() {
   g_featureWifi   = p.getBool("feat_wifi", strlen(currentWifiSsid()) > 0);
   g_featureBle    = p.getBool("feat_ble",  false);
   g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
+  g_feature123    = p.getBool("feat_123", false);     // 123-Fallback default OFF
   g_motorStyle    = p.getUChar("mstyle", 2);          // 0=digital,1=vdo,2=123tune+
   if (g_motorStyle > 2) g_motorStyle = 2;
   p.end();
@@ -1554,12 +1557,37 @@ static void saveFeatures(bool wifi, bool ble, bool buzzer) {
     bleNextScanAt = 0;
     Serial.println("BLE: AUS");
   } else if (!wasBle) {
-    NimBLEDevice::init("VDO-Clock");
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    bleEnsureInit();
     bleNextScanAt = millis() + 5000;
     Serial.println("BLE: AN, Scan startet...");
   } else if (!g_bleConn && !bleDoConnect && bleNextScanAt == 0) {
     bleNextScanAt = millis() + 5000;
+  }
+}
+
+// 123-Direkt-Fallback an/aus. AUS gibt das BLE-Radio frei (wieder fluessig).
+static void saveFeature123(bool on) {
+  g_feature123 = on;
+  Preferences p;
+  p.begin("clock", false);
+  p.putBool("feat_123", on);
+  p.end();
+  if (on) {
+    Serial.println("123: Fallback AN (BLE startet nur bei Hub-Ausfall)");
+    return;
+  }
+  if (tune123Client && tune123Client->isConnected()) tune123Client->disconnect();
+  g_tune123Conn = false;
+  g_tune123DoConnect = false;
+  g_tune123NextScanAt = 0;
+  if (!g_featureBle && g_bleInited) {     // Radio nur freigeben, wenn Hub-BLE es nicht braucht
+    NimBLEDevice::deinit(true);
+    g_bleInited   = false;
+    tune123Client = nullptr;
+    tune123Rx     = nullptr;
+    Serial.println("123: AUS - BLE deinitialisiert (fluessig)");
+  } else {
+    Serial.println("123: Fallback AUS");
   }
 }
 
@@ -1632,7 +1660,11 @@ static void handleWebRoot() {
   html += F(" onchange='this.form.submit()'> BLE-Hub Daten aktiv</label></p><p><label>"
     "<input type='checkbox' name='buzzer' value='1' ");
   html += g_featureBuzzer ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> Buzzer (Shake-Alarm) aktiv</label></p>"
+  html += F(" onchange='this.form.submit()'> Buzzer (Shake-Alarm) aktiv</label></p><p><label>"
+    "<input type='checkbox' name='f123' value='1' ");
+  html += g_feature123 ? "checked" : "";
+  html += F(" onchange='this.form.submit()'> 123TUNE+ direkt (Fallback bei Hub-Ausfall)</label></p>"
+    "<div style='color:#888'>Aus = kein BLE = fl&uuml;ssig. An = BLE nur wenn Hub weg.</div>"
     "<button type='submit'>Speichern</button></form></div>");
 
   html += F("<div class='card'><h3>Spartan-Hub Live</h3>");
@@ -1718,10 +1750,12 @@ static void handleWebFeatures() {
   const bool wifi   = webServer.hasArg("wifi");
   const bool ble    = webServer.hasArg("ble");
   const bool buzzer = webServer.hasArg("buzzer");
+  const bool f123   = webServer.hasArg("f123");
   saveFeatures(wifi, ble, buzzer);
-  Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s\n",
+  if (f123 != g_feature123) saveFeature123(f123);
+  Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s 123=%s\n",
                 g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off",
-                g_featureBuzzer ? "on" : "off");
+                g_featureBuzzer ? "on" : "off", g_feature123 ? "on" : "off");
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -1955,8 +1989,11 @@ void setup() {
     Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", currentWifiSsid());
   }
 
-  bleEnsureInit();                 // immer vor dem RGB-Panel (PHY/Cache) - fuer Hub + 123-Fallback
+  // NimBLE NICHT pauschal starten - Dauer-BLE neben WiFi/RGB-Panel ruckelt.
+  // Nur initialisieren, wenn der Hub-BLE-Client aktiv ist. Der 123-Fallback
+  // initialisiert BLE bei Bedarf selbst (g_feature123).
   if (g_featureBle) {
+    bleEnsureInit();
     bleNextScanAt = millis() + 20000;
     Serial.println("BLE: Hub-Client aktiv");
   }
@@ -2075,6 +2112,8 @@ void loop() {
         else if (cmd == "ble:off") { saveFeatures(g_featureWifi, false, g_featureBuzzer); }
         else if (cmd == "buzzer:on")  { saveFeatures(g_featureWifi, g_featureBle, true); }
         else if (cmd == "buzzer:off") { saveFeatures(g_featureWifi, g_featureBle, false); }
+        else if (cmd == "123:on")     { saveFeature123(true); }
+        else if (cmd == "123:off")    { saveFeature123(false); }
         else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
         else if (cmd == "wifi:off")  { saveFeatures(false, g_featureBle, g_featureBuzzer); g_redrawPage = true; }
         else if (cmd == "rot:+") { saveRotation(g_rotationDeg + 1); g_redrawPage = true; }
@@ -2089,7 +2128,7 @@ void loop() {
         else if (cmd.startsWith("style:")) { saveMotorStyle(cmd.substring(6).toInt());
                                              Serial.printf("Motor-Stil = %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
                                              if (currentPage == 2) drawMotorPage(); }
-        else { Serial.println("Commands: ble:on|off | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock | motor | style:0|1|2 | can:test | can:rx"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock | motor | style:0|1|2 | can:test | can:rx"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
