@@ -120,6 +120,7 @@ static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltb
 static bool      g_feature123    = false;  // 123-Direkt-Fallback: default AUS (sonst Dauer-BLE -> Ruckeln)
 static float     g_imuOffPitch   = 0.0f;   // IMU-Nullung (Einbaulage) - Pitch/Roll-Offset
 static float     g_imuOffRoll    = 0.0f;
+static bool      g_wifiAuto      = true;   // WLAN-Auto-Fallback: S24 > Heim > Hub-AP (verfuegbares Netz)
 static bool      g_webStarted   = false;
 static bool      g_redrawPage   = false;
 static uint8_t   g_wifiProfile  = 0;
@@ -267,7 +268,8 @@ static bool wifiNtpTick() {
   if (!g_featureWifi || strlen(currentWifiSsid()) == 0) return false;
 
   if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastTry > 30000) {
+    // Bei aktivem Auto-Fallback uebernimmt wifiAutoTick() das Verbinden.
+    if (!g_wifiAuto && millis() - lastTry > 30000) {
       lastTry = millis();
       WiFi.begin(currentWifiSsid(), currentWifiPassword());  // kein disconnect() davor
       Serial.printf("WiFi: Reconnect-Versuch zu '%s'\n", currentWifiSsid());
@@ -280,7 +282,8 @@ static bool wifiNtpTick() {
   snprintf(g_ipStr, sizeof(g_ipStr), "%s", WiFi.localIP().toString().c_str());
   if (strcmp(lastIp, g_ipStr) != 0) {
     strcpy(lastIp, g_ipStr);
-    Serial.printf("WiFi verbunden, IP: %s\n", g_ipStr);
+    Serial.printf("WiFi verbunden, IP: %s (Profil %s)\n", g_ipStr, WPROF_LABELS[g_wifiProfile]);
+    Preferences pp; pp.begin("clock", false); pp.putUChar("wifi_prof", g_wifiProfile); pp.end();  // verbundenes Profil merken
   }
   if (!g_webStarted) {
     startWebServer();
@@ -308,6 +311,43 @@ static bool wifiNtpTick() {
     }
   }
   return false;
+}
+
+// WLAN-Auto-Fallback: scannt und verbindet zum hoechstprioren verfuegbaren Profil
+// (S24 > Heim > Hub-AP). Laeuft nur, wenn nicht verbunden. Setzt Hub-IP des Profils.
+static void wifiAutoTick() {
+  if (!g_featureWifi || !g_wifiAuto) return;
+  if (WiFi.status() == WL_CONNECTED) return;
+  static uint32_t lastScan = 0;
+  static bool     scanning = false;
+  if (!scanning) {
+    if (millis() - lastScan < 6000) return;
+    lastScan = millis();
+    WiFi.scanNetworks(true);                 // asynchron
+    scanning = true;
+    return;
+  }
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return;
+  scanning = false;
+  if (n <= 0) { WiFi.scanDelete(); return; }
+  const uint8_t order[WPROF_COUNT] = { 2, 0, 1 };   // Prioritaet: S24 > Heim > Hub-AP
+  int pick = -1;
+  for (uint8_t o = 0; o < WPROF_COUNT && pick < 0; o++) {
+    uint8_t slot = order[o];
+    if (!g_wprof[slot].ssid[0]) continue;
+    for (int i = 0; i < n; i++)
+      if (WiFi.SSID(i) == g_wprof[slot].ssid) { pick = slot; break; }
+  }
+  WiFi.scanDelete();
+  if (pick < 0) return;                        // kein bekanntes Netz in Reichweite
+  g_wifiProfile = (uint8_t)pick;
+  if (g_wprof[pick].hubip[0]) g_hubIp = g_wprof[pick].hubip;
+  strcpy(g_ipStr, "...");
+  WiFi.disconnect();
+  WiFi.begin(g_wprof[pick].ssid, g_wprof[pick].pass);
+  lastScan = millis();                          // erst nach Verbindungsversuch wieder scannen
+  Serial.printf("WiFi-Auto: %s in Reichweite -> verbinde (%s)\n", WPROF_LABELS[pick], g_wprof[pick].ssid);
 }
 
 // -------- BLE Spartan3-Hub client --------
@@ -1539,6 +1579,7 @@ static void loadSettings() {
   g_feature123    = p.getBool("feat_123", false);     // 123-Fallback default OFF
   g_imuOffPitch   = p.getFloat("imu_off_p", 0.0f);     // IMU-Nullung
   g_imuOffRoll    = p.getFloat("imu_off_r", 0.0f);
+  g_wifiAuto      = p.getBool("wifi_auto", true);      // WLAN-Auto-Fallback default AN
   g_motorStyle    = p.getUChar("mstyle", 2);          // 0=digital,1=vdo,2=123tune+
   if (g_motorStyle > 2) g_motorStyle = 2;
   p.end();
@@ -1749,8 +1790,11 @@ static void handleWebRoot() {
   html += F(" onchange='this.form.submit()'> Buzzer (Shake-Alarm) aktiv</label></p><p><label>"
     "<input type='checkbox' name='f123' value='1' ");
   html += g_feature123 ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> 123TUNE+ direkt (Fallback bei Hub-Ausfall)</label></p>"
-    "<div style='color:#888'>Aus = kein BLE = fl&uuml;ssig. An = BLE nur wenn Hub weg.</div>"
+  html += F(" onchange='this.form.submit()'> 123TUNE+ direkt (Fallback bei Hub-Ausfall)</label></p><p><label>"
+    "<input type='checkbox' name='wauto' value='1' ");
+  html += g_wifiAuto ? "checked" : "";
+  html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label></p>"
+    "<div style='color:#888'>WLAN-Auto verbindet automatisch das verf&uuml;gbare Netz nach Priorit&auml;t.</div>"
     "<button type='submit'>Speichern</button></form></div>");
 
   html += F("<div class='card'><h3>Spartan-Hub Live</h3>");
@@ -1853,8 +1897,13 @@ static void handleWebFeatures() {
   const bool ble    = webServer.hasArg("ble");
   const bool buzzer = webServer.hasArg("buzzer");
   const bool f123   = webServer.hasArg("f123");
+  const bool wauto  = webServer.hasArg("wauto");
   saveFeatures(wifi, ble, buzzer);
   if (f123 != g_feature123) saveFeature123(f123);
+  if (wauto != g_wifiAuto) {
+    g_wifiAuto = wauto;
+    Preferences p; p.begin("clock", false); p.putBool("wifi_auto", g_wifiAuto); p.end();
+  }
   Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s 123=%s\n",
                 g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off",
                 g_featureBuzzer ? "on" : "off", g_feature123 ? "on" : "off");
@@ -2224,6 +2273,11 @@ void loop() {
         else if (cmd == "123:on")     { saveFeature123(true); }
         else if (cmd == "123:off")    { saveFeature123(false); }
         else if (cmd == "imu:null")   { saveImuNull(); if (currentPage == 5 || currentPage == 6) drawCurrentPage(); }
+        else if (cmd == "wauto:on" || cmd == "wauto:off") {
+          g_wifiAuto = (cmd == "wauto:on");
+          Preferences pw; pw.begin("clock", false); pw.putBool("wifi_auto", g_wifiAuto); pw.end();
+          Serial.printf("WLAN-Auto = %s\n", g_wifiAuto ? "AN (S24>Heim>Hub)" : "AUS");
+        }
         else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
         else if (cmd == "wifi:off")  { saveFeatures(false, g_featureBle, g_featureBuzzer); g_redrawPage = true; }
         else if (cmd == "rot:+") { saveRotation(g_rotationDeg + 1); g_redrawPage = true; }
@@ -2238,12 +2292,15 @@ void loop() {
         else if (cmd.startsWith("style:")) { saveMotorStyle(cmd.substring(6).toInt());
                                              Serial.printf("Motor-Stil = %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
                                              if (currentPage == 2) drawMotorPage(); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock | motor | style:0|1|2 | imu:null | can:test | can:rx"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0|1|2 | imu:null | can:test | can:rx"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
     }
   }
+
+  // WLAN-Auto-Fallback (S24 > Heim > Hub-AP) - verbindet zum verfuegbaren Netz
+  wifiAutoTick();
 
   // Fallback-Setup-AP verwalten (nur AN wenn keine STA-Verbindung)
   manageWifiAp();
