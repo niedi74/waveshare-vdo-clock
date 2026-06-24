@@ -46,6 +46,7 @@ static spi_device_handle_t hal_spi = nullptr;
 static esp_lcd_panel_handle_t hal_panel = nullptr;
 static uint16_t *hal_frame = nullptr;
 static bool hal_ready = false;
+static bool hal_otaPaused = false;
 
 static uint8_t hal_pca_write_once(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(HAL_PCA9554_ADDR);
@@ -287,6 +288,28 @@ void hal_present() {
 // verschobenes/schwarzes Bild beim naechsten VSYNC, ohne Neu-Init).
 void hal_restart() {
   if (hal_panel) esp_lcd_rgb_panel_restart(hal_panel);
+}
+
+// RGB-Panel waehrend OTA anhalten: der RGB-DMA/VSYNC-Pfad darf nicht laufen,
+// waehrend der Flash-Cache beim Schreiben kurz deaktiviert wird -> sonst Crash.
+void hal_pause_for_ota(bool pause) {
+  if (pause) {
+    if (!hal_panel || hal_otaPaused) return;
+    esp_lcd_panel_del(hal_panel);
+    hal_panel = nullptr;
+    hal_ready = false;
+    hal_backlight(false);
+    hal_otaPaused = true;
+    Serial.println("HAL: RGB pausiert fuer OTA");
+  } else if (hal_otaPaused) {
+    hal_otaPaused = false;
+    if (hal_panel_init()) {
+      hal_backlight(true);
+      Serial.println("HAL: RGB nach OTA wieder aktiv");
+    } else {
+      Serial.println("HAL: RGB resume FAIL");
+    }
+  }
 }
 
 void hal_fill(uint16_t color) {

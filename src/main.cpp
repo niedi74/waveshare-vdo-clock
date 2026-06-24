@@ -18,6 +18,7 @@
 #include "vdo_dial_480_rgb565.h"
 #include "driver/twai.h"
 #include <HTTPClient.h>
+#include <Update.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -79,6 +80,10 @@ static uint32_t g_canLastRxMs   = 0;
 static String   g_hubIp        = "192.168.0.91";
 static uint32_t g_httpRx       = 0;
 static uint32_t g_httpLastRxMs = 0;
+
+// -------- OTA (Firmware-Update per WLAN/Web) --------
+static volatile bool   g_otaBusy    = false;
+static volatile size_t g_otaRxBytes = 0;
 
 // ---- GT911 touch state ----
 static uint8_t  gt911Addr = GT911_ADDR_PRIMARY;
@@ -802,7 +807,7 @@ static void copyVdoDialToFrame() {
   if (!fb) return;
   int pct = g_dialScalePct;
   if (pct < 30) pct = 30;
-  if (pct > 100) pct = 100;
+  if (pct > 150) pct = 150;
   if (pct == 100 && g_rotationDeg == 0) {
     for (int i = 0; i < 480 * 480; i++) fb[i] = pgm_read_word(&VDO_DIAL_480_RGB565[i]);
     return;
@@ -909,6 +914,61 @@ static void drawDataRow(int y, const char* label, const char* value, uint16_t co
   drawTextSmall(244, y, value, col, 2);
 }
 
+// -------- Palette im 123TUNE+-Cockpit-Stil --------
+// Schwarzes Zifferblatt, heller Chrom-Ring, weisse Striche/Ziffern, orange Zeiger.
+#define VDO_FACE    RGB565(12, 12, 14)     // schwarzes Zifferblatt
+#define VDO_CREAM   RGB565(238, 238, 236)  // weiss (Striche/Ziffern/Text)
+#define VDO_CREAMD  RGB565(122, 122, 126)  // gedimmtes weiss (Nebenstriche/Label)
+#define VDO_RED     RGB565(220, 44, 32)    // rote Warnung
+#define VDO_BEZEL   RGB565(206, 210, 214)  // heller Chrom-Ring
+#define VDO_BEZELD  RGB565(90, 94, 100)    // dunkle Bezel-Innenkante
+#define VDO_NEEDLE  RGB565(224, 122, 36)   // orange Zeiger (123TUNE+)
+#define VDO_BRASS   RGB565(224, 122, 36)   // orange Nabe
+#define VDO_HUBDK   RGB565(70, 32, 6)      // Nabenkern (dunkel-orange)
+
+// -------- Umschaltbare Anzeige-Stile (Themes) --------
+struct GaugeTheme {
+  uint16_t face, bezel, bezelDk;
+  bool     chrome;       // Chrom-Ring (true) vs keiner (digital)
+  bool     bandTach;     // digital: gestreiftes Tacho-Band + roter Bereich
+  bool     redlineMark;  // rote Striche/Ziffern >=6000 (diskrete Stile)
+  bool     redTip;       // rote Zeigerspitze am Tacho
+  uint16_t tickMaj, tickMin, numCol;
+  uint16_t needle, hub, hubDk;
+  bool     miniAccent;   // digital: bunte Mini-Gauges (Akzent + Fuellung)
+  uint16_t txt, txtDim;
+  uint16_t liveCol, statusBad;
+  bool     lambda3;      // 3-farbiges Lambda (digital) vs creme/weiss + rote Warnung
+  uint16_t ground;       // Horizont-/Boden-Ton (IMU-Seite)
+};
+
+static const GaugeTheme THEME_DIGITAL = {
+  RGB565(0,0,0), 0, 0, false, true, false, true,
+  RGB565(190,190,190), RGB565(190,190,190), RGB565(235,235,225),
+  RGB565(235,235,225), RGB565(200,200,190), RGB565(40,40,40),
+  true, RGB565(235,235,225), RGB565(120,120,120),
+  RGB565(60,200,90), RGB565(200,120,50), true, RGB565(28,24,20) };
+
+static const GaugeTheme THEME_VDO = {
+  RGB565(40,42,46), RGB565(214,218,222), RGB565(110,114,120), true, false, true, true,
+  RGB565(234,230,208), RGB565(150,148,130), RGB565(234,230,208),
+  RGB565(234,230,208), RGB565(166,122,42), RGB565(40,30,16),
+  false, RGB565(234,230,208), RGB565(150,148,130),
+  RGB565(234,230,208), RGB565(220,44,32), false, RGB565(30,32,36) };
+
+static const GaugeTheme THEME_123 = {
+  RGB565(12,12,14), RGB565(206,210,214), RGB565(90,94,100), true, false, false, false,
+  RGB565(238,238,236), RGB565(122,122,126), RGB565(238,238,236),
+  RGB565(224,122,36), RGB565(224,122,36), RGB565(70,32,6),
+  false, RGB565(238,238,236), RGB565(122,122,126),
+  RGB565(238,238,236), RGB565(220,44,32), false, RGB565(22,22,26) };
+
+static uint8_t g_motorStyle = 2;   // 0=digital, 1=vdo, 2=123tune+
+static const char* const MOTOR_STYLE_NAMES[] = { "DIGITAL", "VDO", "123TUNE+" };
+static const GaugeTheme& gTheme() {
+  return g_motorStyle == 0 ? THEME_DIGITAL : g_motorStyle == 1 ? THEME_VDO : THEME_123;
+}
+
 // -------- Graphical gauge primitives (cockpit dashboard) --------
 // Angle convention: degrees, 0 = east, 90 = south (screen y grows downward),
 // 270 = north (up). Matches drawHand's cos/sin usage.
@@ -935,96 +995,140 @@ static float gaugeAngle(float value, float vmin, float vmax, float startDeg, flo
 }
 
 // Small arc gauge: 180deg top semicircle, value low=left .. high=right.
+// Stil je nach Theme: digital (bunt + Fuellung) oder monochrom (creme/weiss).
 static void drawMiniGauge(int cx, int cy, int r, float value, float vmin, float vmax,
                           const char* label, const char* valStr,
-                          uint16_t accent, bool valid) {
+                          uint16_t accent, bool valid, const GaugeTheme& t) {
   const float A0 = 180.0f, A1 = 360.0f;
-  drawArcBand(cx, cy, r - 5, r, A0, A1, RGB565(60, 60, 64));      // scale track
-  if (valid) {
-    float va = gaugeAngle(value, vmin, vmax, A0, A1);
-    drawArcBand(cx, cy, r - 5, r, A0, va, accent);                 // filled portion
+  if (t.miniAccent) {                              // digital: bunt + gefuellt
+    drawArcBand(cx, cy, r - 5, r, A0, A1, RGB565(60, 60, 64));
+    if (valid) { float va = gaugeAngle(value, vmin, vmax, A0, A1);
+                 drawArcBand(cx, cy, r - 5, r, A0, va, accent); }
+    plotRadial(cx, cy, A0,            r - 8, r, RGB565(120, 120, 120), 2);
+    plotRadial(cx, cy, (A0 + A1) / 2, r - 8, r, RGB565(120, 120, 120), 2);
+    plotRadial(cx, cy, A1,            r - 8, r, RGB565(120, 120, 120), 2);
+    float na = gaugeAngle(valid ? value : vmin, vmin, vmax, A0, A1);
+    plotRadial(cx, cy, na, 0, r - 9, valid ? RGB565(235, 235, 225) : RGB565(90, 50, 50), 3);
+    fillCircleFast(cx, cy, 4, RGB565(200, 200, 190));
+    drawTextCentered(cx, cy - r - 16, label, accent, 2);
+    drawTextCentered(cx, cy + 8, valStr, valid ? RGB565(235, 235, 225) : RGB565(110, 60, 60), 2);
+    return;
   }
-  plotRadial(cx, cy, A0,            r - 8, r, RGB565(120, 120, 120), 2);
-  plotRadial(cx, cy, (A0 + A1) / 2, r - 8, r, RGB565(120, 120, 120), 2);
-  plotRadial(cx, cy, A1,            r - 8, r, RGB565(120, 120, 120), 2);
+  for (int i = 0; i <= 8; i++) {                   // diskrete Striche
+    float a = A0 + (A1 - A0) * (i / 8.0f);
+    bool major = (i % 4) == 0;
+    plotRadial(cx, cy, a, r - (major ? 9 : 5), r, major ? t.tickMaj : t.tickMin, 2);
+  }
   float na = gaugeAngle(valid ? value : vmin, vmin, vmax, A0, A1);
-  plotRadial(cx, cy, na, 0, r - 9, valid ? RGB565(235, 235, 225) : RGB565(90, 50, 50), 3);
-  fillCircleFast(cx, cy, 4, RGB565(200, 200, 190));
-  drawTextCentered(cx, cy - r - 16, label, accent, 2);
-  drawTextCentered(cx, cy + 8, valStr, valid ? RGB565(235, 235, 225) : RGB565(110, 60, 60), 2);
+  plotRadial(cx, cy, na, 0, r - 8, valid ? t.needle : t.tickMin, 3);
+  fillCircleFast(cx, cy, 4, t.hub);
+  fillCircleFast(cx, cy, 2, t.hubDk);
+  drawTextCentered(cx, cy - r - 16, label, t.txtDim, 2);
+  drawTextCentered(cx, cy + 8, valStr, valid ? t.txt : t.txtDim, 2);
 }
 
-// Main RPM tachometer: 240deg sweep with a gap at the bottom, rim pointer.
-static void drawTach(int cx, int cy, float rpm, bool valid) {
-  const float A0 = 150.0f, A1 = 390.0f;   // sweep up over the top, gap at bottom
-  const int   rOut = 212, rIn = 152;
-  drawArcBand(cx, cy, rIn, rOut, A0, A1, RGB565(45, 45, 50));
-  float ra0 = gaugeAngle(6000, 0, 8000, A0, A1);
-  drawArcBand(cx, cy, rIn, rOut, ra0, A1, RGB565(150, 30, 28));    // redline 6-8k
+// Main RPM tachometer: 240deg sweep, Gap unten, Rand-Zeiger (Mitte frei).
+// Stil je nach Theme: digital (gestreiftes Band + roter Bereich) oder diskrete Striche.
+static const uint16_t TACH_RED = RGB565(220, 44, 32);
+static void drawTach(int cx, int cy, float rpm, bool valid, const GaugeTheme& t) {
+  const float A0 = 150.0f, A1 = 390.0f;
+  if (t.bandTach) {                                 // digital: Streifenband
+    const int rIn = 152, rOut = 212;
+    drawArcBand(cx, cy, rIn, rOut, A0, A1, RGB565(45, 45, 50));
+    drawArcBand(cx, cy, rIn, rOut, gaugeAngle(6000, 0, 8000, A0, A1), A1, RGB565(150, 30, 28));
+    for (int k = 0; k <= 8; k++) {
+      float a  = gaugeAngle(k * 1000, 0, 8000, A0, A1);
+      uint16_t tc = (k >= 6) ? RGB565(235, 80, 70) : RGB565(190, 190, 190);
+      plotRadial(cx, cy, a, rIn, rOut, tc, (k % 2) ? 2 : 3);
+      float ar = a * (float)PI / 180.0f;
+      int lx = cx + (int)(cosf(ar) * (rIn - 18));
+      int ly = cy + (int)(sinf(ar) * (rIn - 18));
+      char n[3]; snprintf(n, sizeof(n), "%d", k);
+      drawTextCentered(lx, ly - 7, n, tc, 2);
+    }
+    float pa = gaugeAngle(valid ? rpm : 0, 0, 8000, A0, A1);
+    plotRadial(cx, cy, pa, rIn - 6, rOut + 2, t.needle, 6);
+    plotRadial(cx, cy, pa, rOut - 16, rOut + 2, TACH_RED, 6);
+    return;
+  }
+  const int rOut = 208;                             // diskrete Striche
+  for (int v = 0; v <= 8000; v += 200) {
+    float a = gaugeAngle(v, 0, 8000, A0, A1);
+    bool major = (v % 1000) == 0;
+    uint16_t tc = (t.redlineMark && v >= 6000) ? TACH_RED : (major ? t.tickMaj : t.tickMin);
+    plotRadial(cx, cy, a, rOut - (major ? 24 : 12), rOut, tc, major ? 3 : 2);
+  }
   for (int k = 0; k <= 8; k++) {
-    float a   = gaugeAngle(k * 1000, 0, 8000, A0, A1);
-    uint16_t tc = (k >= 6) ? RGB565(235, 80, 70) : RGB565(190, 190, 190);
-    plotRadial(cx, cy, a, rIn, rOut, tc, (k % 2) ? 2 : 3);
+    float a  = gaugeAngle(k * 1000, 0, 8000, A0, A1);
     float ar = a * (float)PI / 180.0f;
-    int lx = cx + (int)(cosf(ar) * (rIn - 18));
-    int ly = cy + (int)(sinf(ar) * (rIn - 18));
+    int lx = cx + (int)(cosf(ar) * (rOut - 42));
+    int ly = cy + (int)(sinf(ar) * (rOut - 42));
     char n[3]; snprintf(n, sizeof(n), "%d", k);
-    drawTextCentered(lx, ly - 7, n, tc, 2);
+    drawTextCentered(lx, ly - 10, n, (t.redlineMark && k >= 6) ? TACH_RED : t.numCol, 3);
   }
   float pa = gaugeAngle(valid ? rpm : 0, 0, 8000, A0, A1);
-  plotRadial(cx, cy, pa, rIn - 6, rOut + 2, RGB565(235, 235, 225), 6);
-  plotRadial(cx, cy, pa, rOut - 16, rOut + 2, RGB565(235, 40, 30), 6);  // red tip
+  plotRadial(cx, cy, pa, 150, rOut + 2, t.needle, 6);
+  if (t.redTip) plotRadial(cx, cy, pa, rOut - 16, rOut + 2, TACH_RED, 6);
 }
 
 static void drawMotorPage() {
   if (!ensureFrame()) return;
-  fillFrame(RGB565_BLACK);
+  const GaugeTheme& t = gTheme();
+  fillFrame(t.face);
+  if (t.chrome) {
+    drawCircleLine(240, 240, 236, 7, t.bezel);           // heller Chrom-Ring
+    drawCircleLine(240, 240, 229, 2, t.bezelDk);          // dunkle Innenkante
+  }
   const bool fresh = bleFresh() || canFresh() || httpFresh();
   char buf[16];
 
-  drawTach(240, 240, g_rpm, fresh);
+  drawTach(240, 240, g_rpm, fresh, t);
 
-  // RPM digital (top, inside the ring)
+  // RPM digital (oben, innerhalb des Rings)
   if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_rpm); else strcpy(buf, "----");
-  drawTextCentered(240, 92, buf, fresh ? RGB565(235, 235, 225) : RGB565(110, 60, 60), 5);
-  drawTextCentered(240, 134, "RPM", RGB565(120, 120, 120), 2);
+  drawTextCentered(240, 92, buf, fresh ? t.txt : t.txtDim, 5);
+  drawTextCentered(240, 134, "RPM", t.txtDim, 2);
 
-  // Four mini analog gauges
+  // Vier Mini-Gauges (Akzentfarben nur im Digital-Stil genutzt)
   const bool g123 = fresh && g_g123Valid;
   if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_adv); else strcpy(buf, "--");
-  drawMiniGauge(148, 196, 36, g_adv, 0, 50, "ADV", buf, RGB565(40, 150, 210), fresh);
+  drawMiniGauge(148, 196, 36, g_adv, 0, 50, "ADV", buf, RGB565(40, 150, 210), fresh, t);
   if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_map); else strcpy(buf, "--");
-  drawMiniGauge(332, 196, 36, g_map, 0, 200, "KPA", buf, RGB565(60, 185, 90), fresh);
+  drawMiniGauge(332, 196, 36, g_map, 0, 200, "KPA", buf, RGB565(60, 185, 90), fresh, t);
   if (g123) snprintf(buf, sizeof(buf), "%d", (int)g_g123Temp); else strcpy(buf, "--");
-  drawMiniGauge(148, 324, 36, g_g123Temp, 0, 120, "TEMP", buf, RGB565(210, 120, 50), g123);
+  drawMiniGauge(148, 324, 36, g_g123Temp, 0, 120, "TEMP", buf, RGB565(210, 120, 50), g123, t);
   if (g123) snprintf(buf, sizeof(buf), "%.1f", g_g123Volt); else strcpy(buf, "--");
-  drawMiniGauge(332, 324, 36, g_g123Volt, 10, 15, "VOLT", buf, RGB565(210, 180, 60), g123);
+  drawMiniGauge(332, 324, 36, g_g123Volt, 10, 15, "VOLT", buf, RGB565(210, 180, 60), g123, t);
 
-  // Lambda hero (center)
-  drawTextCentered(240, 196, "LAMBDA", RGB565(120, 120, 120), 2);
+  // Lambda zentral
+  drawTextCentered(240, 196, "LAMBDA", t.txtDim, 2);
   uint16_t lcol;
   if (fresh && g_lambdaValid) {
     snprintf(buf, sizeof(buf), "%.2f", g_lambda);
-    if      (g_lambda < 0.97f) lcol = RGB565(235, 120, 40);
-    else if (g_lambda > 1.03f) lcol = RGB565(80, 160, 240);
-    else                       lcol = RGB565(70, 210, 100);
-  } else { strcpy(buf, "----"); lcol = RGB565(110, 60, 60); }
+    if (t.lambda3) {
+      if      (g_lambda < 0.97f) lcol = RGB565(235, 120, 40);
+      else if (g_lambda > 1.03f) lcol = RGB565(80, 160, 240);
+      else                       lcol = RGB565(70, 210, 100);
+    } else {
+      lcol = (g_lambda < 0.95f || g_lambda > 1.05f) ? TACH_RED : t.txt;
+    }
+  } else { strcpy(buf, "----"); lcol = t.txtDim; }
   drawTextCentered(240, 216, buf, lcol, 6);
 
-  // AMP (coil current) + speed line, then status, in the bottom gap of the ring
+  // AMP (Zuendspulenstrom) + Tempo, dann Status, im unteren Ring-Gap
   char line[24];
   char amp[10], spd[10];
   if (g123)        snprintf(amp, sizeof(amp), "%.1fA", g_g123Coil); else strcpy(amp, "--");
   if (fresh && g_speedValid) snprintf(spd, sizeof(spd), "%dKMH", (int)g_speedKmh); else strcpy(spd, "--");
   snprintf(line, sizeof(line), "AMP %s  %s", amp, spd);
-  drawTextCentered(240, 396, line, RGB565(170, 170, 170), 2);
+  drawTextCentered(240, 396, line, t.txtDim, 2);
 
   char st[16];
   if (fresh)            snprintf(st, sizeof(st), "LIVE %s", g_lastSrc);
   else if (g_bleConn)   strcpy(st, "WARTE");
   else if (g_canReady)  strcpy(st, "CAN WARTE");
   else                  strcpy(st, "KEIN HUB");
-  drawTextCentered(240, 424, st, fresh ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
+  drawTextCentered(240, 424, st, fresh ? t.liveCol : t.statusBad, 2);
   presentFrame();
 }
 
@@ -1113,35 +1217,89 @@ static void drawSetupPage() {
   presentFrame();
 }
 
+// IMU-Seite: Seitenansicht/Neigungsmesser mit Steigung (Pitch) + Roll.
 static void drawImuPage() {
   if (!ensureFrame()) return;
-  fillFrame(RGB565_BLACK);
-  drawCircleLine(240, 240, 216, 3, RGB565(200, 100, 50));
-  drawTextCentered(240, 52, "IMU", RGB565(220, 130, 60), 5);
+  const GaugeTheme& t = gTheme();
+  const int cx = 240, cy = 240;
+  const uint16_t cream = t.tickMaj;                   // Hauptfarbe (creme/weiss)
+  const uint16_t dim   = t.tickMin;                   // gedimmt
+  const uint16_t mark  = t.needle;                    // Fahrzeug/Roll-Zeiger
+  const uint16_t lower = t.ground;                    // Boden (untere Haelfte)
 
-  char buf[16];
-  if (g_imuPresent) {
-    snprintf(buf, sizeof(buf), "%.1f", g_imuPitch);
-    drawDataRow(112, "PITCH", buf, RGB565(235, 235, 225));
-    snprintf(buf, sizeof(buf), "%.1f", g_imuRoll);
-    drawDataRow(152, "ROLL", buf, RGB565(235, 235, 225));
-    snprintf(buf, sizeof(buf), "%.2fg", g_imuGForce);
-    drawDataRow(192, "G-FORCE", buf, RGB565(235, 235, 225));
-
-    static bool buzzerOn = false;
-    const bool wantBuzz = g_featureBuzzer && qmi8658ShakeDetected(1.5f);
-    if (qmi8658ShakeDetected(1.5f)) {
-      drawTextCentered(240, 250, "SHAKE!", RGB565(255, 50, 50), 4);
-    } else {
-      drawTextCentered(240, 250, "OK", RGB565(60, 200, 90), 4);
+  fillFrame(t.face);
+  fillCircleFast(cx, cy, 216, t.face);                // Zifferblatt
+  for (int y = cy; y <= cy + 204; y++)                // untere Haelfte abgesetzt
+    for (int x = cx - 204; x <= cx + 204; x++) {
+      int dx = x - cx, dy = y - cy;
+      if (dx * dx + dy * dy <= 204 * 204) setPixel(x, y, lower);
     }
-    if (wantBuzz != buzzerOn) {   // nur bei Zustandswechsel schalten
-      buzzerOn = wantBuzz;
-      hal_buzzer(buzzerOn);
-    }
+  if (t.chrome) {
+    drawCircleLine(cx, cy, 236, 7, t.bezel);          // heller Chrom-Ring
+    drawCircleLine(cx, cy, 229, 2, t.bezelDk);
   } else {
-    drawTextCentered(240, 200, "KEIN IMU", RGB565(200, 60, 60), 4);
+    drawCircleLine(cx, cy, 223, 8, RGB565(84, 80, 72));
   }
+  drawLineFast(cx - 190, cy, cx + 190, cy, dim, 3);   // Horizont-Referenz
+
+  for (int a = -40; a <= 40; a += 10) {               // obere Neigungsskala
+    float ar = (float)a * PI / 180.0f - PI / 2.0f;
+    int ro = 190, ri = (a % 20 == 0) ? 164 : 176;
+    drawLineFast(cx + (int)lroundf(cosf(ar) * ri), cy + (int)lroundf(sinf(ar) * ri),
+                 cx + (int)lroundf(cosf(ar) * ro), cy + (int)lroundf(sinf(ar) * ro),
+                 cream, (a % 20 == 0) ? 3 : 2);
+    if (a != 0 && a % 20 == 0) {
+      char lab[8]; snprintf(lab, sizeof(lab), "%d", abs(a));
+      drawTextCentered(cx + (int)lroundf(cosf(ar) * 136.0f),
+                       cy + (int)lroundf(sinf(ar) * 136.0f) - 7, lab, cream, 2);
+    }
+  }
+  drawLineFast(cx - 17, cy - 176, cx, cy - 144, cream, 3);   // Marker oben
+  drawLineFast(cx + 17, cy - 176, cx, cy - 144, cream, 3);
+  drawLineFast(cx - 17, cy - 176, cx + 17, cy - 176, cream, 3);
+
+  if (!g_imuPresent) {
+    drawTextCentered(240, 240, "KEIN IMU", RGB565(200, 60, 60), 4);
+    presentFrame();
+    return;
+  }
+
+  const float pitch = constrain(g_imuPitch, -45.0f, 45.0f);
+  const float roll  = constrain(g_imuRoll,  -45.0f, 45.0f);
+  const int pitchOffset = (int)lroundf(pitch * 1.8f);
+  for (int p = -40; p <= 40; p += 10) {               // Pitch-Leiter (wandert)
+    if (p == 0) continue;
+    int y = cy - pitchOffset + p * 3;
+    int half = (p % 20 == 0) ? 74 : 48;
+    drawLineFast(cx - half, y, cx + half, y, dim, 2);
+    if (p % 20 == 0) {
+      char lab[8]; snprintf(lab, sizeof(lab), "%d", abs(p));
+      drawTextCentered(cx - half - 30, y - 7, lab, dim, 1);
+      drawTextCentered(cx + half + 30, y - 7, lab, dim, 1);
+    }
+  }
+
+  float rr = -roll * PI / 180.0f;                      // Roll-Linie
+  int rx = (int)lroundf(cosf(rr) * 66.0f), ry = (int)lroundf(sinf(rr) * 66.0f);
+  drawLineFast(cx - rx, cy - ry, cx + rx, cy + ry, mark, 4);
+  fillCircleFast(cx, cy, 5, mark);
+  drawLineFast(cx, cy - 24, cx, cy + 92, mark, 3);    // Fahrzeug-Seitenkontur
+  drawLineFast(cx - 45, cy + 92, cx + 45, cy + 92, mark, 3);
+  drawLineFast(cx - 45, cy + 92, cx - 66, cy + 66, mark, 3);
+  drawLineFast(cx + 45, cy + 92, cx + 66, cy + 66, mark, 3);
+
+  const float gradePct = constrain(tanf(pitch * PI / 180.0f) * 100.0f, -99.0f, 99.0f);
+  char gradeLine[18], degLine[18];
+  snprintf(gradeLine, sizeof(gradeLine), "%+.0f%%", gradePct);
+  snprintf(degLine,   sizeof(degLine),   "%+.1f DEG", pitch);
+  drawTextCentered(240, 348, "STEIGUNG", dim, 2);
+  drawTextCentered(240, 372, gradeLine, cream, 4);
+  drawTextCentered(240, 412, degLine, dim, 2);
+
+  static bool buzzerOn = false;                        // Shake-Buzzer beibehalten
+  const bool wantBuzz = g_featureBuzzer && qmi8658ShakeDetected(1.5f);
+  if (wantBuzz != buzzerOn) { buzzerOn = wantBuzz; hal_buzzer(buzzerOn); }
+
   presentFrame();
 }
 
@@ -1170,9 +1328,11 @@ static void loadSettings() {
   g_featureWifi   = p.getBool("feat_wifi", strlen(currentWifiSsid()) > 0);
   g_featureBle    = p.getBool("feat_ble",  false);
   g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
+  g_motorStyle    = p.getUChar("mstyle", 2);          // 0=digital,1=vdo,2=123tune+
+  if (g_motorStyle > 2) g_motorStyle = 2;
   p.end();
   if (g_dialScalePct  < 30)  g_dialScalePct  = 30;
-  if (g_dialScalePct  > 100) g_dialScalePct  = 100;
+  if (g_dialScalePct  > 150) g_dialScalePct  = 150;
   if (g_brightnessPct < 5)   g_brightnessPct = 5;
   if (g_brightnessPct > 100) g_brightnessPct = 100;
   g_rotationDeg %= 360;
@@ -1182,7 +1342,7 @@ static void loadSettings() {
 
 static void saveDialScale(int pct) {
   if (pct < 30)  pct = 30;
-  if (pct > 100) pct = 100;
+  if (pct > 150) pct = 150;
   g_dialScalePct = pct;
   Preferences p;
   p.begin("clock", false);
@@ -1214,6 +1374,16 @@ static void saveRotation(int deg) {
   Preferences p;
   p.begin("clock", false);
   p.putInt("rot_deg", g_rotationDeg);
+  p.end();
+}
+
+static void saveMotorStyle(int style) {
+  if (style < 0) style = 0;
+  if (style > 2) style = 2;
+  g_motorStyle = (uint8_t)style;
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("mstyle", g_motorStyle);
   p.end();
 }
 
@@ -1306,6 +1476,14 @@ static void handleWebRoot() {
     "<a href='/page?p=6'><button>IMU</button></a>"
     "<a href='/page?p=5'><button>Setup</button></a></div>");
 
+  html += F("<div class='card'><h3>Motor-Anzeige Stil</h3>");
+  for (uint8_t i = 0; i < 3; i++) {
+    html += "<a href='/set?style=" + String(i) + "'><button" +
+            String(i == g_motorStyle ? " style='background:#6c6'" : "") + ">" +
+            String(MOTOR_STYLE_NAMES[i]) + "</button></a>";
+  }
+  html += F("</div>");
+
   html += F("<div class='card'><h3>Funktionen</h3><form action='/features' method='get'>");
   html += "<p><label><input type='checkbox' name='wifi' value='1' ";
   html += g_featureWifi ? "checked" : "";
@@ -1340,7 +1518,7 @@ static void handleWebRoot() {
     "<div class='val'><span id='v'>");
   html += String(g_dialScalePct);
   html += F("</span>%</div>"
-    "<input type='range' name='scale' min='30' max='100' step='1' value='");
+    "<input type='range' name='scale' min='30' max='150' step='1' value='");
   html += String(g_dialScalePct);
   html += F("' oninput=\"document.getElementById('v').innerText=this.value\">"
     "<br><button type='submit'>&Uuml;bernehmen</button></form>"
@@ -1354,6 +1532,11 @@ static void handleWebRoot() {
             "<a href='/set?rot_delta=5'><button>+ 5&deg;</button></a>"
             "<div><a href='/set?rot=0'>0&deg;</a> &middot; <a href='/set?rot=90'>90&deg;</a> &middot; "
             "<a href='/set?rot=180'>180&deg;</a> &middot; <a href='/set?rot=270'>270&deg;</a></div></div>");
+  html += F("<div class='card'><h3>Firmware-Update (OTA)</h3>"
+    "<form method='POST' action='/update' enctype='multipart/form-data'>"
+    "<input type='file' name='firmware' accept='.bin' style='width:88%;margin:6px'><br>"
+    "<button type='submit'>Firmware flashen</button></form>"
+    "<div style='color:#888'>.bin aus .pio/build/waveshare_s3_28c/firmware.bin</div></div>");
   html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p></body></html>");
   webServer.send(200, "text/html", html);
 }
@@ -1382,6 +1565,11 @@ static void handleWebSet() {
     p.putString("hub_ip", g_hubIp);
     p.end();
     Serial.printf("Web: Hub-IP = %s\n", g_hubIp.c_str());
+  }
+  if (webServer.hasArg("style")) {
+    saveMotorStyle(webServer.arg("style").toInt());
+    g_redrawPage = true;
+    Serial.printf("Web: Motor-Stil = %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -1439,12 +1627,55 @@ static void handleWebWifi() {
   webServer.send(303);
 }
 
+// OTA: Multipart-Upload der .bin, schreibt in die freie App-Partition.
+// Panel wird pausiert (Flash-Cache-Disable + RGB-ISR vertragen sich nicht).
+static void handleOtaUpload() {
+  HTTPUpload& up = webServer.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    g_otaBusy = true; g_otaRxBytes = 0;
+    hal_pause_for_ota(true);
+    Serial.printf("OTA: Start %s (heap %u, frei %u)\n",
+                  up.filename.c_str(), ESP.getFreeHeap(), ESP.getFreeSketchSpace());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial); g_otaBusy = false; hal_pause_for_ota(false);
+    }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (g_otaBusy) {
+      if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
+      else g_otaRxBytes += up.currentSize;
+      yield();
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (g_otaBusy) {
+      if (Update.end(true)) Serial.printf("OTA: Erfolg, %u Bytes\n", (unsigned)g_otaRxBytes);
+      else                  Update.printError(Serial);
+    }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    Update.abort(); g_otaBusy = false; hal_pause_for_ota(false);
+    Serial.println("OTA: abgebrochen");
+  }
+}
+
+static void handleOtaDone() {
+  const bool ok = !Update.hasError() && g_otaRxBytes > 0;
+  webServer.sendHeader("Connection", "close");
+  webServer.send(200, "text/html",
+    ok ? F("<meta charset='utf-8'><body style='font-family:sans-serif;background:#111;color:#eee;text-align:center;padding:40px'>"
+           "<h1>OTA OK &ndash; Neustart&hellip;</h1></body>")
+       : F("<meta charset='utf-8'><body style='font-family:sans-serif;background:#111;color:#eee;text-align:center;padding:40px'>"
+           "<h1>OTA FEHLER</h1></body>"));
+  delay(400);
+  if (ok) { Serial.println("OTA: Neustart"); ESP.restart(); }
+  else    { g_otaBusy = false; hal_pause_for_ota(false); }
+}
+
 static void startWebServer() {
   webServer.on("/",        handleWebRoot);
   webServer.on("/set",     handleWebSet);
   webServer.on("/features",handleWebFeatures);
   webServer.on("/page",    handleWebPage);
   webServer.on("/wifi",    handleWebWifi);
+  webServer.on("/update",  HTTP_POST, handleOtaDone, handleOtaUpload);
   webServer.begin();
   Serial.println("WebGUI: gestartet auf Port 80");
 }
@@ -1717,7 +1948,10 @@ void loop() {
                                        g_canReady ? 1 : 0, (unsigned long)g_canRx, (unsigned long)g_canIgnored,
                                        g_canLastRxMs ? (unsigned long)(millis() - g_canLastRxMs) : 0UL, g_lastSrc); }
         else if (cmd == "motor")   { currentPage = 2; drawMotorPage(); }
-        else { Serial.println("Commands: ble:on|off | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock | motor | can:test | can:rx"); }
+        else if (cmd.startsWith("style:")) { saveMotorStyle(cmd.substring(6).toInt());
+                                             Serial.printf("Motor-Stil = %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
+                                             if (currentPage == 2) drawMotorPage(); }
+        else { Serial.println("Commands: ble:on|off | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock | motor | style:0|1|2 | can:test | can:rx"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
