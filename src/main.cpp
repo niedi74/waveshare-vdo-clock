@@ -110,6 +110,8 @@ static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
 static bool      g_feature123    = false;  // 123-Direkt-Fallback: default AUS (sonst Dauer-BLE -> Ruckeln)
+static float     g_imuOffPitch   = 0.0f;   // IMU-Nullung (Einbaulage) - Pitch/Roll-Offset
+static float     g_imuOffRoll    = 0.0f;
 static bool      g_webStarted   = false;
 static bool      g_redrawPage   = false;
 static uint8_t   g_wifiProfile  = 0;
@@ -1350,7 +1352,13 @@ static void drawSetupPage() {
               g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   drawDataRow(290, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
               g_featureBuzzer ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
-  drawDataRow(326, "HUB",    g_bleHubName.c_str(), RGB565(150, 150, 150));
+  if (g_imuPresent) {
+    qmi8658Read();
+    snprintf(buf, sizeof(buf), "%+.1f DEG", g_imuPitch - g_imuOffPitch);
+    drawDataRow(326, "IMU 0", buf, RGB565(235, 235, 225));   // TIP = aktuelle Lage nullen
+  } else {
+    drawDataRow(326, "IMU 0", "---", RGB565(150, 150, 150));
+  }
   drawTextCentered(240, 372, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
@@ -1402,8 +1410,8 @@ static void drawImuPage() {
     return;
   }
 
-  const float pitch = constrain(g_imuPitch, -45.0f, 45.0f);
-  const float roll  = constrain(g_imuRoll,  -45.0f, 45.0f);
+  const float pitch = constrain(g_imuPitch - g_imuOffPitch, -45.0f, 45.0f);
+  const float roll  = constrain(g_imuRoll  - g_imuOffRoll,  -45.0f, 45.0f);
   const int pitchOffset = (int)lroundf(pitch * 1.8f);
   for (int p = -40; p <= 40; p += 10) {               // Pitch-Leiter (wandert)
     if (p == 0) continue;
@@ -1467,6 +1475,8 @@ static void loadSettings() {
   g_featureBle    = p.getBool("feat_ble",  false);
   g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
   g_feature123    = p.getBool("feat_123", false);     // 123-Fallback default OFF
+  g_imuOffPitch   = p.getFloat("imu_off_p", 0.0f);     // IMU-Nullung
+  g_imuOffRoll    = p.getFloat("imu_off_r", 0.0f);
   g_motorStyle    = p.getUChar("mstyle", 2);          // 0=digital,1=vdo,2=123tune+
   if (g_motorStyle > 2) g_motorStyle = 2;
   p.end();
@@ -1524,6 +1534,20 @@ static void saveMotorStyle(int style) {
   p.begin("clock", false);
   p.putUChar("mstyle", g_motorStyle);
   p.end();
+}
+
+// IMU nullen: aktuelle Lage als Referenz speichern (Einbaulage ausgleichen).
+static void saveImuNull() {
+  if (!g_imuPresent) { Serial.println("IMU: NULL - kein IMU"); return; }
+  qmi8658Read();
+  g_imuOffPitch = g_imuPitch;
+  g_imuOffRoll  = g_imuRoll;
+  Preferences p;
+  p.begin("clock", false);
+  p.putFloat("imu_off_p", g_imuOffPitch);
+  p.putFloat("imu_off_r", g_imuOffRoll);
+  p.end();
+  Serial.printf("IMU: NULL gesetzt P=%.1f R=%.1f\n", g_imuOffPitch, g_imuOffRoll);
 }
 
 static void saveFeatures(bool wifi, bool ble, bool buzzer) {
@@ -1700,6 +1724,15 @@ static void handleWebRoot() {
             "<a href='/set?rot_delta=5'><button>+ 5&deg;</button></a>"
             "<div><a href='/set?rot=0'>0&deg;</a> &middot; <a href='/set?rot=90'>90&deg;</a> &middot; "
             "<a href='/set?rot=180'>180&deg;</a> &middot; <a href='/set?rot=270'>270&deg;</a></div></div>");
+  html += F("<div class='card'><h3>IMU Steigung</h3>");
+  if (g_imuPresent) {
+    html += "<div class='val'>" + String(g_imuPitch - g_imuOffPitch, 1) + "&deg;</div>";
+    html += F("<a href='/set?imunull=1'><button>IMU 0 setzen (Einbaulage)</button></a>"
+              "<div style='color:#888'>Display waagerecht/eingebaut, dann nullen.</div>");
+  } else {
+    html += F("<div>kein IMU</div>");
+  }
+  html += F("</div>");
   html += F("<div class='card'><h3>Firmware-Update (OTA)</h3>"
     "<form method='POST' action='/update' enctype='multipart/form-data'>"
     "<input type='file' name='firmware' accept='.bin' style='width:88%;margin:6px'><br>"
@@ -1738,6 +1771,10 @@ static void handleWebSet() {
     saveMotorStyle(webServer.arg("style").toInt());
     g_redrawPage = true;
     Serial.printf("Web: Motor-Stil = %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
+  }
+  if (webServer.hasArg("imunull")) {
+    saveImuNull();
+    g_redrawPage = true;
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -1909,6 +1946,10 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
     drawSetupPage();
     Serial.printf("setup tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
+  } else if (y >= 308 && y < 345) {     // IMU 0 (Zeile 326) -> Einbaulage nullen
+    saveImuNull();
+    drawSetupPage();
+    Serial.println("setup tap: IMU NULL");
   } else {
     drawSetupPage();
     Serial.println("setup tap: no action");
@@ -2111,6 +2152,7 @@ void loop() {
         else if (cmd == "buzzer:off") { saveFeatures(g_featureWifi, g_featureBle, false); }
         else if (cmd == "123:on")     { saveFeature123(true); }
         else if (cmd == "123:off")    { saveFeature123(false); }
+        else if (cmd == "imu:null")   { saveImuNull(); if (currentPage == 5 || currentPage == 6) drawCurrentPage(); }
         else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
         else if (cmd == "wifi:off")  { saveFeatures(false, g_featureBle, g_featureBuzzer); g_redrawPage = true; }
         else if (cmd == "rot:+") { saveRotation(g_rotationDeg + 1); g_redrawPage = true; }
@@ -2125,7 +2167,7 @@ void loop() {
         else if (cmd.startsWith("style:")) { saveMotorStyle(cmd.substring(6).toInt());
                                              Serial.printf("Motor-Stil = %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
                                              if (currentPage == 2) drawMotorPage(); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock | motor | style:0|1|2 | can:test | can:rx"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock | motor | style:0|1|2 | imu:null | can:test | can:rx"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
