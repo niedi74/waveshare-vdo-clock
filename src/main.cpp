@@ -548,6 +548,35 @@ static void runCanTest() {
   Serial.println("CAN TEST: done");
 }
 
+// TX-Selbsttest: kurz NORMAL, EIN Single-Shot-Frame senden, auf ACK pruefen.
+// ACK => ein anderer aktiver Knoten haengt am Bus (Bus lebt). Kein ACK => allein.
+static void runCanPing() {
+  const bool wasListen = g_canListenOnly;
+  if (g_canListenOnly) { g_canListenOnly = false; setupCockpitCan(); }
+  if (!g_canReady) {
+    Serial.println("CAN PING: CAN nicht bereit");
+    if (wasListen) { g_canListenOnly = true; setupCockpitCan(); }
+    return;
+  }
+  twai_status_info_t s0 = {}; twai_get_status_info(&s0);
+  twai_message_t m = {};
+  m.identifier = 0x7FE;
+  m.ss = 1;                       // Single-Shot: kein Retransmit-Sturm auf den Bus
+  m.data_length_code = 2; m.data[0] = 0xAA; m.data[1] = 0x55;
+  esp_err_t err = twai_transmit(&m, pdMS_TO_TICKS(200));
+  delay(200);
+  twai_status_info_t s1 = {}; twai_get_status_info(&s1);
+  const bool acked = (err == ESP_OK) && (s1.tx_error_counter <= s0.tx_error_counter) &&
+                     (s1.msgs_to_tx == 0) && (s1.state == TWAI_STATE_RUNNING);
+  Serial.printf("CAN PING: queued=%s state=%d tx_err %u->%u msgs_to_tx=%u bus_err=%u\n",
+                esp_err_to_name(err), (int)s1.state,
+                (unsigned)s0.tx_error_counter, (unsigned)s1.tx_error_counter,
+                (unsigned)s1.msgs_to_tx, (unsigned)s1.bus_error_count);
+  if (acked) Serial.println("CAN PING: ACK -> anderer aktiver Knoten am Bus (Bus lebt) -> RX-Ader R->GPIO44 pruefen.");
+  else       Serial.println("CAN PING: KEIN ACK -> Touch allein / Bus still / Tap isoliert (TX-Ader/GND/Versorgung/Bus).");
+  if (wasListen) { g_canListenOnly = true; setupCockpitCan(); }
+}
+
 // -------- HTTP-Poll-Client --------
 static bool httpFresh() { return g_httpLastRxMs != 0 && millis() - g_httpLastRxMs < 3000; }
 
@@ -2329,6 +2358,7 @@ void loop() {
           Serial.printf("CAN-Mode = %s\n", g_canListenOnly ? "listen-only" : "NORMAL (ACK)");
         }
         else if (cmd == "can:test"){ runCanTest(); }
+        else if (cmd == "can:ping"){ runCanPing(); }
         else if (cmd == "can:rx")  { Serial.printf("CAN: ready=%d rx=%lu ignored=%lu age=%lums src=%s\n",
                                        g_canReady ? 1 : 0, (unsigned long)g_canRx, (unsigned long)g_canIgnored,
                                        g_canLastRxMs ? (unsigned long)(millis() - g_canLastRxMs) : 0UL, g_lastSrc); }
