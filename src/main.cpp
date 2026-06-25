@@ -508,6 +508,11 @@ static void applyCockpitCanFrame(const twai_message_t& msg) {
 
 static void cockpitCanTick() {
   if (!g_canReady) return;
+  twai_status_info_t st;                          // Treiber wirklich installiert?
+  if (twai_get_status_info(&st) != ESP_OK) {      // sonst assertet twai_receive auf NULL-Queue
+    g_canReady = false;
+    return;
+  }
   twai_message_t msg;
   uint8_t drained = 0;
   while (drained < 8 && twai_receive(&msg, 0) == ESP_OK) {
@@ -2405,6 +2410,15 @@ void loop() {
     lastDraw = millis();
     qmi8658Read();
     drawCurrentPage();
+  }
+
+  // RGB-DMA periodisch resyncen - auf ALLEN Seiten (WiFi/BLE koennen das Bild
+  // schwarz/verschoben machen; bisher resynct nur die Uhr-Seite -> Setup/Daten
+  // blieben bei WLAN-Aktivitaet schwarz).
+  static uint32_t lastResync = 0;
+  if (currentPage != 0 && millis() - lastResync >= 1000) {
+    lastResync = millis();
+    hal_restart();
   }
 
   delay(10);
