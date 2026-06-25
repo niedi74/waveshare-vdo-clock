@@ -1566,6 +1566,48 @@ static void drawImuPage() {
   presentFrame();
 }
 
+static void saveDialScale(int pct);   // fwd (Definition weiter unten)
+static void saveRotation(int deg);    // fwd
+
+// Touch-Button mit zentriertem Label (dunkler Text auf farbiger Flaeche).
+static void drawAdjBtn(int x, int y, int w, int h, const char* lbl, uint16_t col) {
+  fillRectFast(x, y, w, h, col);
+  drawTextCentered(x + w / 2, y + h / 2 - 11, lbl, RGB565(20, 20, 20), 3);
+}
+
+// Justage-Seite: Zifferblatt-Groesse (+/-5%) und Rotation (+/-1, +/-5) per Touch.
+static void drawAdjustPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
+  drawTextCentered(240, 44, "JUSTAGE", RGB565(230, 190, 70), 5);
+  char buf[16];
+  const uint16_t minus = RGB565(210, 120, 60), plus = RGB565(90, 195, 110);
+  drawTextCentered(240, 92, "GROESSE", RGB565(150, 150, 150), 2);
+  snprintf(buf, sizeof(buf), "%d %%", g_dialScalePct);
+  drawTextCentered(240, 114, buf, RGB565(235, 235, 225), 4);
+  drawAdjBtn(120, 150, 90, 46, "-", minus);
+  drawAdjBtn(270, 150, 90, 46, "+", plus);
+  drawTextCentered(240, 222, "ROTATION", RGB565(150, 150, 150), 2);
+  snprintf(buf, sizeof(buf), "%d DEG", g_rotationDeg);
+  drawTextCentered(240, 244, buf, RGB565(235, 235, 225), 4);
+  drawAdjBtn(120, 280, 90, 40, "-1", minus);
+  drawAdjBtn(270, 280, 90, 40, "+1", plus);
+  drawAdjBtn(120, 328, 90, 40, "-5", minus);
+  drawAdjBtn(270, 328, 90, 40, "+5", plus);
+  drawTextCentered(240, 392, "TIP UNTEN = MENU", RGB565(180, 180, 170), 2);
+  presentFrame();
+}
+
+static void handleAdjustTap(uint16_t x, uint16_t y) {
+  const bool right = (x >= 240);
+  if (y >= 150 && y < 196)        saveDialScale(g_dialScalePct + (right ? 5 : -5));   // GROESSE +/-5%
+  else if (y >= 280 && y < 320)   saveRotation(g_rotationDeg + (right ? 1 : -1));     // ROT +/-1
+  else if (y >= 328 && y < 368)   saveRotation(g_rotationDeg + (right ? 5 : -5));     // ROT +/-5
+  else if (y >= 376)            { currentPage = 1; drawMenuOverview(); return; }      // unten -> Menue
+  drawAdjustPage();
+}
+
 static void drawCurrentPage() {
   if      (currentPage == 0) drawVdoClock();
   else if (currentPage == 1) drawMenuOverview();
@@ -1574,6 +1616,7 @@ static void drawCurrentPage() {
   else if (currentPage == 4) drawHubPage();
   else if (currentPage == 5) drawSetupPage();
   else if (currentPage == 6) drawImuPage();
+  else if (currentPage == 7) drawAdjustPage();
 }
 
 // -------- Preferences --------
@@ -1972,7 +2015,7 @@ static void handleWebPage() {
   if (webServer.hasArg("p")) {
     int page = webServer.arg("p").toInt();
     if (page < 0) page = 0;
-    if (page > 6) page = 6;
+    if (page > 7) page = 7;
     currentPage  = static_cast<uint8_t>(page);
     g_redrawPage = true;
     Serial.printf("Web: page=%u\n", currentPage);
@@ -2092,21 +2135,19 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     return;
   }
 
-  if (y >= 92 && y < 128) {             // UHR (Zeile 110)
-    int next = (g_dialScalePct < 85) ? 90 : (g_dialScalePct < 95 ? 100 : 80);
-    saveDialScale(next);
-    drawSetupPage();
-    Serial.printf("setup tap: dial=%d%%\n", g_dialScalePct);
+  if (y >= 92 && y < 128) {             // UHR (Zeile 110) -> Justage-Seite (Groesse/Rotation fein)
+    currentPage = 7;
+    drawAdjustPage();
+    Serial.println("setup tap: -> Justage");
   } else if (y >= 128 && y < 164) {     // HELL (Zeile 146)
     int next = (g_brightnessPct < 63) ? 75 : (g_brightnessPct < 88 ? 100 : 50);
     saveBrightness(next);
     drawSetupPage();
     Serial.printf("setup tap: brightness=%d%%\n", g_brightnessPct);
-  } else if (y >= 164 && y < 200) {     // ROT (Zeile 182)
-    int next = (g_rotationDeg < 90) ? 90 : (g_rotationDeg < 180 ? 180 : (g_rotationDeg < 270 ? 270 : 0));
-    saveRotation(next);
-    drawSetupPage();
-    Serial.printf("setup tap: rotation=%d deg\n", g_rotationDeg);
+  } else if (y >= 164 && y < 200) {     // ROT (Zeile 182) -> Justage-Seite
+    currentPage = 7;
+    drawAdjustPage();
+    Serial.println("setup tap: -> Justage");
   } else if (y >= 200 && y < 236) {     // WIFI (Zeile 218)
     cycleWifiProfile();
     drawSetupPage();
@@ -2304,6 +2345,8 @@ void loop() {
         // SETUP: kurzer Tap auf eine Zeile aendert die jeweilige Einstellung
         // (Zifferblatt/Helligkeit/Rotation/WLAN/BLE/Buzzer). Tap unten = Menue.
         handleSetupLongPress(tapY, durMs);
+      } else if (currentPage == 7) {
+        handleAdjustTap(tapX, tapY);    // Justage: Groesse/Rotation +/-
       } else {
         // Data pages (Motor/Lambda/Hub/IMU): Tap -> naechste, dann zurueck zur Uhr.
         if      (currentPage == 4) currentPage = 6;  // Hub -> IMU
