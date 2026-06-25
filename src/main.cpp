@@ -314,45 +314,30 @@ static bool wifiNtpTick() {
   return false;
 }
 
-// WLAN-Auto-Fallback: besitzt das WLAN, wenn aktiv. Scannt in reinem STA-Modus
-// (kein Setup-AP, der sonst den Funkkanal blockiert) und verbindet zum
-// hoechstprioren verfuegbaren Profil (S24 > Heim > Hub-AP) inkl. dessen Hub-IP.
+// WLAN-Auto-Fallback: probiert (ohne Scan!) die belegten Profile der Reihe nach
+// in Prioritaet S24 > Heim > Hub-AP durch, je ~6 s. KEIN WiFi.scanNetworks() -
+// das crasht auf diesem Arduino-Stand, wenn kein Netz in Reichweite ist
+// (esp_wifi_scan_start StoreProhibited -> Boot-Loop). WiFi.begin im AP_STA ist ok.
 static void wifiAutoTick() {
   if (!g_featureWifi || !g_wifiAuto) return;
   if (WiFi.status() == WL_CONNECTED) return;
-  if (g_apOn) { WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); g_apOn = false; }  // AP wuerde Scan/Connect blockieren
-  static uint32_t nextScanAt = 0;
-  static bool     scanning   = false;
-  if (!scanning) {
-    if (millis() < nextScanAt) return;
-    WiFi.mode(WIFI_STA);
-    WiFi.scanNetworks(true);                     // asynchron, reiner STA-Scan
-    scanning   = true;
-    nextScanAt = millis() + 9000;                // Sicherheitsnetz falls Scan haengt
+  static const uint8_t order[WPROF_COUNT] = { 2, 0, 1 };   // S24 > Heim > Hub-AP
+  static uint8_t  oi    = 0;
+  static uint32_t tryAt = 0;
+  if (millis() < tryAt) return;
+  for (uint8_t k = 0; k < WPROF_COUNT; k++) {
+    uint8_t slot = order[(oi + k) % WPROF_COUNT];
+    if (!g_wprof[slot].ssid[0]) continue;          // leeres Profil ueberspringen
+    oi = (uint8_t)((oi + k + 1) % WPROF_COUNT);
+    g_wifiProfile = slot;
+    if (g_wprof[slot].hubip[0]) g_hubIp = g_wprof[slot].hubip;
+    strcpy(g_ipStr, "...");
+    WiFi.begin(g_wprof[slot].ssid, g_wprof[slot].pass);
+    tryAt = millis() + 6000;                       // diesem Profil 6 s geben
+    Serial.printf("WiFi-Auto: versuche %s (%s)\n", WPROF_LABELS[slot], g_wprof[slot].ssid);
     return;
   }
-  int n = WiFi.scanComplete();
-  if (n == WIFI_SCAN_RUNNING) return;
-  scanning = false;
-  int pick = -1;
-  if (n > 0) {
-    const uint8_t order[WPROF_COUNT] = { 2, 0, 1 };   // S24 > Heim > Hub-AP
-    for (uint8_t o = 0; o < WPROF_COUNT && pick < 0; o++) {
-      uint8_t slot = order[o];
-      if (!g_wprof[slot].ssid[0]) continue;
-      for (int i = 0; i < n; i++)
-        if (WiFi.SSID(i) == g_wprof[slot].ssid) { pick = slot; break; }
-    }
-  }
-  if (n >= 0) WiFi.scanDelete();
-  if (pick < 0) { nextScanAt = millis() + 6000; return; }   // nichts bekanntes -> spaeter erneut
-  g_wifiProfile = (uint8_t)pick;
-  if (g_wprof[pick].hubip[0]) g_hubIp = g_wprof[pick].hubip;
-  strcpy(g_ipStr, "...");
-  WiFi.disconnect();
-  WiFi.begin(g_wprof[pick].ssid, g_wprof[pick].pass);
-  nextScanAt = millis() + 10000;                 // Verbindung Zeit geben, bevor neu gescannt wird
-  Serial.printf("WiFi-Auto: %s -> verbinde (%s)\n", WPROF_LABELS[pick], g_wprof[pick].ssid);
+  tryAt = millis() + 5000;                         // kein belegtes Profil
 }
 
 // -------- BLE Spartan3-Hub client --------
