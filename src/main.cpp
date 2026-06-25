@@ -2373,6 +2373,11 @@ void loop() {
         else if (cmd == "123:on")     { saveFeature123(true); }
         else if (cmd == "123:off")    { saveFeature123(false); }
         else if (cmd == "imu:null")   { saveImuNull(); if (currentPage == 5 || currentPage == 6) drawCurrentPage(); }
+        else if (cmd == "ap:on") {     // Setup-AP sicher hochfahren: WLAN an, Auto AUS (kein STA-Connect bei leerem Profil)
+          g_featureWifi = true; g_wifiAuto = false;
+          Preferences pa; pa.begin("clock", false); pa.putBool("feat_wifi", true); pa.putBool("wifi_auto", false); pa.end();
+          Serial.println("Setup-AP an (Auto aus) - VDO-Clock-Setup / vdoclock -> http://192.168.4.1");
+        }
         else if (cmd == "wauto:on" || cmd == "wauto:off") {
           g_wifiAuto = (cmd == "wauto:on");
           Preferences pw; pw.begin("clock", false); pw.putBool("wifi_auto", g_wifiAuto); pw.end();
