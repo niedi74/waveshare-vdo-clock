@@ -2313,10 +2313,22 @@ void loop() {
       touchLastX = x;
       touchLastY = y;
     }
-    if (currentPage == 5 && !touchLongHandled && nowMs - touchStartMs >= 600) {
-      touchLongHandled = true;
-      lastTouch = nowMs;
-      handleSetupLongPress(touchLastY, nowMs - touchStartMs);
+    if (!touchLongHandled && nowMs - touchStartMs >= 600) {
+      if (currentPage == 5) {
+        touchLongHandled = true;
+        lastTouch = nowMs;
+        handleSetupLongPress(touchLastY, nowMs - touchStartMs);
+      } else if (currentPage == 2) {
+        // MOTOR: langer Druck in die Mitte -> Anzeige-Stil wechseln (DIGITAL/VDO/123TUNE+)
+        const int dx = (int)touchLastX - 240, dy = (int)touchLastY - 240;
+        if (dx * dx + dy * dy <= 95 * 95) {
+          touchLongHandled = true;
+          lastTouch = nowMs;
+          saveMotorStyle((g_motorStyle + 1) % 3);
+          drawMotorPage();
+          Serial.printf("motor long-press -> Stil %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
+        }
+      }
     }
   } else if (touchActive && nowMs - touchLastSeenMs > (currentPage == 5 ? 700UL : 180UL)) {
     const uint32_t durMs = touchLastSeenMs - touchStartMs;
