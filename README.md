@@ -74,6 +74,14 @@ pio device monitor --port COM13 --baud 115200
 Bring-up: Display-Treiber, Touch, WebGUI, WiFi-Profile und ESP-NOW Client sind vorhanden.
 Pin-Belegung siehe `docs/PINOUT.md`.
 
+## Dokumentation
+
+- [docs/123TUNE-BLE-Protokoll.md](docs/123TUNE-BLE-Protokoll.md) - 123TUNE+ BLE (NUS), Frame & Skalierung (verifiziert) + iafilius-Referenz
+- [docs/123TUNE-HUB-HANDSHAKE.md](docs/123TUNE-HUB-HANDSHAKE.md) - Connect/Start/Keepalive-Sequenz fuer den 123-BLE-Stream
+- [docs/COCKPIT-ECOSYSTEM.md](docs/COCKPIT-ECOSYSTEM.md) - Reuse-Matrix & Datenfluss ueber alle niedi74-Cockpit-Repos
+- [docs/RECHERCHE-Gauge-Projekte.md](docs/RECHERCHE-Gauge-Projekte.md) - externe Vorbilder, Libraries & Foren
+- [docs/WLAN-MATRIX.md](docs/WLAN-MATRIX.md) - WLAN-Profile · `docs/PINOUT.md` - Pin-Belegung
+
 ## Verwandte Projekte
 
 - [spartan3v2-can-adapter](https://github.com/niedi74/spartan3v2-can-adapter) - Motorraum-Hub

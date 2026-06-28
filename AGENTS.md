@@ -27,6 +27,9 @@ pio device monitor --port COM13 --baud 115200
 - `include/spartan_cockpit_frame.h` - shared ESP-NOW binary frame copied from the hub repo.
 - `platformio.ini` - COM13, ESP32-S3 2.8C, ESP-NOW channel 6.
 - `docs/WLAN-MATRIX.md` - operational profiles for Home, Phone, and Bus.
+- `docs/123TUNE-BLE-Protokoll.md` - verified 123TUNE+ BLE (NUS) UUIDs, frame & scaling.
+- `docs/123TUNE-HUB-HANDSHAKE.md` - 123 BLE connect/start/keepalive sequence.
+- `docs/COCKPIT-ECOSYSTEM.md` - cross-repo reuse matrix & data flow (niedi74 cockpit repos).
 
 ## Git
 
