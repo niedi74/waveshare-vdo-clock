@@ -941,10 +941,11 @@ static void applyEspNowFrame(const SpartanCockpitFrame& frame) {
     g_rpm = frame.rpm;
     g_adv = frame.advance_x10 / 10.0f;
     g_map = frame.map;
-    // v2: 123 Volt/Temp aus dem Frame uebernehmen (ESP-NOW Anzeige)
+    // v2: 123 Volt/Temp/Coil aus dem Frame uebernehmen (ESP-NOW Anzeige)
     const float volt = spartanCockpitVolt(frame);
     if (volt > 0.5f) { g_battVolt = volt; g_battValid = true; }
     g_g123Temp = (float)frame.tune_temp_c;
+    g_g123Coil = spartanCockpitCoil(frame);
     g_g123Valid = true;
   }
   g_espNowLastRxMs = millis();
@@ -1449,6 +1450,10 @@ static void decode123Frame(const uint8_t* d, size_t n) {
     case 0x32: g_map = (float)raw;               break;
     case 0x33:
       g_g123Temp = (float)(raw - 30);
+      g_g123Valid = true;
+      break;
+    case 0x35:
+      g_g123Coil = raw / 8.65f;  // Zuendspulen-Strom, identisch zum Hub
       g_g123Valid = true;
       break;
     case 0x41:
@@ -3279,6 +3284,10 @@ static void drawMotorPage() {
     snprintf(buf, sizeof(buf), "%.1f V", g_battVolt);
     drawDataRow(304, "BAT", buf, cv);
   } else drawDataRow(304, "BAT", na, cv);
+  if (fresh && g_g123Valid && g_g123Coil > 0.05f) {
+    snprintf(buf, sizeof(buf), "%.1f A", g_g123Coil);
+    drawDataRow(332, "COIL", buf, cv);
+  } else drawDataRow(332, "COIL", na, cv);
   drawMotorStatusFooter(360, 400);
   presentFrame();
 }
@@ -4333,6 +4342,7 @@ static void handleWebRoot() {
   html += "<div class='metric'><span>ADV</span><b id='dashAdv'>" + String(g_adv, 1) + "&deg;</b></div>";
   html += "<div class='metric'><span>Lambda</span><b id='dashLambda'>" + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) + "</b></div>";
   html += "<div class='metric'><span>Volt</span><b id='dashVolt'>" + String(g_battValid ? String(g_battVolt, 1) : String("---")) + "</b></div>";
+  html += "<div class='metric'><span>Coil</span><b id='dashCoil'>" + String(g_g123Valid ? String(g_g123Coil, 1) + " A" : String("---")) + "</b></div>";
   html += F("</div></div><div class='card row'><div><b>Hub Link</b><br><span id='dashBle' class='");
   html += hubLinkOk() ? "ok" : "warn";
   html += "'>" + String(g_dataPath == DATA_PATH_WIFI_HUB ?
@@ -4528,6 +4538,7 @@ static void handleWebRoot() {
             "function syncDashboard(d){if(!d)return;const set=(id,v)=>{const e=document.getElementById(id);if(e)e.textContent=v;};"
             "set('dashRpm',Math.round(num(d.rpm)));set('dashAdv',num(d.adv).toFixed(1)+'°');"
             "set('dashLambda',d.lambda_valid?num(d.lambda).toFixed(2):'---');set('dashVolt',d.volt_valid?num(d.volt).toFixed(1):'---');"
+            "set('dashCoil',d.coil_valid?num(d.coil).toFixed(1)+' A':'---');"
             "const ht=document.getElementById('headerTime');if(ht&&d.hour!=null)ht.textContent=String(d.hour).padStart(2,'0')+':'+String(d.min).padStart(2,'0')+':'+String(d.sec).padStart(2,'0');"
             "set('dashPage',String(d.page));set('dashPageLabel',pageNames[d.page]||'?');set('dashRx',String(d.live_rx||0));"
             "set('setupEspnowOn',d.esp_now_enabled?(d.esp_now_ready?'AN':'AN / wartet'):'AUS');"
@@ -4790,6 +4801,10 @@ static void handleWebStatus() {
   json += g_lambdaValid ? F("true") : F("false");
   json += F(",\"volt\":");
   jsonAppendFloat(json, g_battVolt, 2);
+  json += F(",\"coil\":");
+  jsonAppendFloat(json, g_g123Coil, 1);
+  json += F(",\"coil_valid\":");
+  json += g_g123Valid ? F("true") : F("false");
   json += F(",\"volt_valid\":");
   json += g_battValid ? F("true") : F("false");
   json += F(",\"aux_volt\":");

@@ -44,15 +44,16 @@ WiFi-HTTP** (NVS-gesteuert; `feat_espnow`, `data_path`, `ble_mode` etc., siehe
 
 ### ⚠️ Dupliziert (Dedup-Kandidat)
 - **123-Frame-Decoder** (`decode123Frame` + NUS-Handshake) liegt **inline und
-  mehrfach**: waveshare (`src/main.cpp:1441`), Hub, m5stack-123 — mit **leichten
-  Abweichungen**:
-  - Hub decodiert `0x35` (Coil `raw/8.65`); **Waveshare-Display fehlt `0x35`**.
+  mehrfach**: waveshare (`src/main.cpp`, `decode123Frame`), Hub, m5stack-123 —
+  weitgehend gleich:
+  - `0x35` (Coil `raw/8.65`) jetzt in **Hub UND Waveshare** decodiert
+    (Lücke geschlossen); Display zeigt Coil auf der Motor-Seite + Web.
   - Hub/M5 enthalten die `$`/`\r`-Wake- und `$`-Keepalive-Logik; im Display ist
     der Direct-Modus entsprechend abzugleichen.
 - **Empfehlung (nicht beauftragt):** analog zu `spartan_cockpit_frame.h` einen
   gemeinsamen **`tune123_decode.h`** (NUS-UUIDs + ASCII-Hex-Parse + Skalierungen
-  + `0x35`) herausziehen und in alle drei Firmwares kopieren — beseitigt die
-  Divergenz und die `0x35`-Lücke an einer Stelle.
+  inkl. `0x35`) herausziehen und in alle drei Firmwares kopieren — hält die
+  Decoder künftig automatisch synchron.
 
 ## Konsistenz-Checkliste bei 123-/ESP-NOW-Änderungen
 1. Opcode-Tabelle (inkl. `0x35`) in allen drei Firmwares gleich? → Protokoll-Doku.

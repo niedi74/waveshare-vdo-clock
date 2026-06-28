@@ -47,15 +47,15 @@ gewandelt werden. **Kein** rohes Binär-MSB/LSB.
 | `0x31` | **Advance** (°) | `hi*3.2 + lo*0.2` | `main.cpp:1448` / Hub |
 | `0x32` | **MAP** (kPa) | `raw` | `main.cpp:1449` / Hub |
 | `0x33` | **Temperatur** (°C) | `raw − 30` | `main.cpp:1450` / Hub |
-| `0x35` | **Zündspulen-Strom** (A) | `raw / 8.65` | **nur Hub** (s.u.) |
+| `0x35` | **Zündspulen-Strom** (A) | `raw / 8.65` | `main.cpp` (`decode123Frame`) / Hub |
 | `0x41` | **Bordspannung** (V) | `raw / 4.54` | `main.cpp:1454` / Hub |
 
-> ⚠️ **Lücke im Display:** `decode123Frame()` in diesem Repo (`src/main.cpp:1441`)
-> kennt `0x35` (Coil-Strom) **nicht** — bei **direkter** 123-BLE-Verbindung zeigt
-> das Waveshare-Display also keinen Coil-Strom. Über ESP-NOW/Hub-ASCII kommt der
-> Wert hingegen an (`g_g123Coil`). Wer Direct-123 vollständig will, muss
-> `case 0x35: g_g123Coil = raw / 8.65f;` ergänzen (vom Nutzer aktuell nicht
-> beauftragt — hier nur dokumentiert).
+> ✅ **Lücke geschlossen:** `decode123Frame()` (`src/main.cpp`) decodiert `0x35`
+> jetzt ebenfalls (`g_g123Coil = raw / 8.65f`); `applyEspNowFrame()` übernimmt den
+> Coil-Strom aus dem ESP-NOW-Frame (`spartanCockpitCoil()`). Damit ist der
+> Zündspulen-Strom auf **allen** Pfaden (Direct-123, ESP-NOW, Hub-ASCII) erfasst
+> und wird auf der Motor-Seite (`COIL`) sowie im Web-Dashboard/`/api/status`
+> (`coil`/`coil_valid`) angezeigt.
 
 ---
 
