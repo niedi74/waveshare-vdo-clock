@@ -25,6 +25,7 @@ pio device monitor --port COM13 --baud 115200
 
 - `src/main.cpp` - app, touch menu, WiFi/HTTP, ESP-NOW, BLE fallback, WebGUI.
 - `include/spartan_cockpit_frame.h` - shared ESP-NOW binary frame copied from the hub repo.
+- `include/tune123_decode.h` - shared 123TUNE+ NUS decoder (UUIDs, opcodes, scaling); copy into hub/M5.
 - `platformio.ini` - COM13, ESP32-S3 2.8C, ESP-NOW channel 6.
 - `docs/WLAN-MATRIX.md` - operational profiles for Home, Phone, and Bus.
 - `docs/123TUNE-BLE-Protokoll.md` - verified 123TUNE+ BLE (NUS) UUIDs, frame & scaling.

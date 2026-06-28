@@ -32,6 +32,11 @@ Verbindung erfolgt per MAC (Default `ef:a8:b2:de:e0:9e`, `DEFAULT_123_MAC` in
 `src/main.cpp:71`). Start-/Keepalive-Sequenz → siehe
 [`123TUNE-HUB-HANDSHAKE.md`](123TUNE-HUB-HANDSHAKE.md).
 
+> 📦 **Zentral im Code:** UUIDs, Opcodes, Skalierungen und Handshake-Konstanten
+> liegen kanonisch in **`include/tune123_decode.h`** (`tune123DecodeFrame()`),
+> zum Kopieren in Hub/M5. `src/main.cpp` (`NUS_*`-Defines, `decode123Frame`)
+> nutzt diesen Header.
+
 ---
 
 ## 2) Live-Daten-Frame — verifiziert (eigener Code)

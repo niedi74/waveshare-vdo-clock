@@ -22,6 +22,7 @@
 #include "hal_waveshare_28c.h"
 #include "qmi8658_imu.h"
 #include "vdo_dial_480_rgb565.h"
+#include "tune123_decode.h"
 #include <sys/time.h>
 #include <time.h>
 #include <cstring>
@@ -73,9 +74,9 @@
 #define SPARTAN_NAME    "Spartan3-Hub"
 #define SPARTAN_SVC     "7f510001-5a6b-4d2a-9f20-14a7f3e20000"
 #define SPARTAN_STATUS  "7f510002-5a6b-4d2a-9f20-14a7f3e20000"
-#define NUS_SVC         "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-#define NUS_RX          "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
-#define NUS_TX          "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+#define NUS_SVC         TUNE123_NUS_SERVICE_UUID
+#define NUS_RX          TUNE123_NUS_RX_UUID
+#define NUS_TX          TUNE123_NUS_TX_UUID
 #define DEFAULT_123_MAC "ef:a8:b2:de:e0:9e"
 #define DEFAULT_HUB_MAC SPARTAN_MAC
 #define BLE_SCAN_MAX    32
@@ -1432,34 +1433,18 @@ static void cycleSourceMode() {
   DLOG("Source -> %s\n", sourceModeLabel());
 }
 
-static int bleHexNib(uint8_t c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  return 0;
-}
+static Tune123Values g_tune123{};
 
 static void decode123Frame(const uint8_t* d, size_t n) {
-  if (n < 3) return;
-  int hi  = bleHexNib(d[1]);
-  int lo  = bleHexNib(d[2]);
-  int raw = (hi << 4) | lo;
-  switch (d[0]) {
-    case 0x30: g_rpm = hi * 800.0f + lo * 50.0f; break;
-    case 0x31: g_adv = hi * 3.2f   + lo * 0.2f;  break;
-    case 0x32: g_map = (float)raw;               break;
-    case 0x33:
-      g_g123Temp = (float)(raw - 30);
-      g_g123Valid = true;
-      break;
-    case 0x35:
-      g_g123Coil = raw / 8.65f;  // Zuendspulen-Strom, identisch zum Hub
-      g_g123Valid = true;
-      break;
-    case 0x41:
-      g_battVolt = raw / 4.54f;
-      g_battValid = g_battVolt > 0.5f;
-      break;
+  const int op = tune123DecodeFrame(d, n, g_tune123);
+  if (op < 0) return;
+  switch (op) {
+    case kTune123OpRpm:     g_rpm = g_tune123.rpm; break;
+    case kTune123OpAdvance: g_adv = g_tune123.advance; break;
+    case kTune123OpMap:     g_map = g_tune123.map; break;
+    case kTune123OpTemp:    g_g123Temp = g_tune123.temp; g_g123Valid = true; break;
+    case kTune123OpCoil:    g_g123Coil = g_tune123.coil; g_g123Valid = true; break;
+    case kTune123OpVolt:    g_battVolt = g_tune123.voltage; g_battValid = g_tune123.voltValid; break;
     default: break;
   }
   g_bleRxCnt++;

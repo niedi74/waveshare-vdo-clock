@@ -42,22 +42,24 @@ WiFi-HTTP** (NVS-gesteuert; `feat_espnow`, `data_path`, `ble_mode` etc., siehe
   M5/Waveshare firmware"* → **single source of truth**; bei Änderungen in **alle**
   Display-Repos kopieren und `kSpartanCockpitVersion` hochziehen.
 
-### ⚠️ Dupliziert (Dedup-Kandidat)
-- **123-Frame-Decoder** (`decode123Frame` + NUS-Handshake) liegt **inline und
-  mehrfach**: waveshare (`src/main.cpp`, `decode123Frame`), Hub, m5stack-123 —
-  weitgehend gleich:
-  - `0x35` (Coil `raw/8.65`) jetzt in **Hub UND Waveshare** decodiert
-    (Lücke geschlossen); Display zeigt Coil auf der Motor-Seite + Web.
-  - Hub/M5 enthalten die `$`/`\r`-Wake- und `$`-Keepalive-Logik; im Display ist
-    der Direct-Modus entsprechend abzugleichen.
-- **Empfehlung (nicht beauftragt):** analog zu `spartan_cockpit_frame.h` einen
-  gemeinsamen **`tune123_decode.h`** (NUS-UUIDs + ASCII-Hex-Parse + Skalierungen
-  inkl. `0x35`) herausziehen und in alle drei Firmwares kopieren — hält die
-  Decoder künftig automatisch synchron.
+### ✅ Neu kanonisch geteilt: `include/tune123_decode.h`
+- **123-Frame-Decoder** (NUS-UUIDs + Opcode-/Handshake-Konstanten +
+  ASCII-Hex-Parse + Skalierungen inkl. `0x35`) ist jetzt aus dem Inline-Code
+  in **`include/tune123_decode.h`** extrahiert — gleiches „Copy this header into
+  M5/Hub firmware"-Muster wie `spartan_cockpit_frame.h`.
+  - Waveshare (`src/main.cpp` `decode123Frame`) nutzt den Header bereits; die
+    `NUS_SVC/RX/TX`-Defines verweisen auf `TUNE123_NUS_*_UUID`.
+  - **TODO (separate Repos):** Header nach `m5stack-123` und
+    `spartan3v2-can-adapter` kopieren und deren Inline-Decoder darauf umstellen,
+    damit alle drei garantiert synchron bleiben.
+  - Handshake-Konstanten (`kTune123Wake 0x24`, `kTune123Enter 0x0D`,
+    `kTune123PingIntervalMs 1650`) liegen ebenfalls im Header; die Schreib-/
+    Keepalive-Logik bleibt pro Firmware.
 
 ## Konsistenz-Checkliste bei 123-/ESP-NOW-Änderungen
-1. Opcode-Tabelle (inkl. `0x35`) in allen drei Firmwares gleich? → Protokoll-Doku.
-2. NUS-UUIDs + `$`/`\r`-Handshake identisch? → Handshake-Doku.
+1. Opcode-Tabelle (inkl. `0x35`) in allen drei Firmwares gleich? → am besten
+   `include/tune123_decode.h` 1:1 kopieren statt nachpflegen.
+2. NUS-UUIDs + `$`/`\r`-Handshake identisch? → `tune123_decode.h` / Handshake-Doku.
 3. `SpartanCockpitFrame`-Version & Felder synchron kopiert?
 4. Datenpfad-Priorität/NVS-Keys dokumentiert? → `CODEX-HANDOFF.md`.
 
