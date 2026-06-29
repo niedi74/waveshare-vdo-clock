@@ -1615,6 +1615,110 @@ static void handleAdjustTap(uint16_t x, uint16_t y) {
   drawAdjustPage();
 }
 
+// ===== On-Screen-Tastatur (Page 10): SSID/Passwort des aktiven Profils tippen =====
+static void saveWprof(uint8_t, const char*, const char*, const char*);  // fwd
+static void selectWprof(uint8_t);                                       // fwd
+
+static char    g_kbText[65];
+static uint8_t g_kbSlot  = 0;
+static uint8_t g_kbField = 0;   // 0=SSID, 1=Passwort
+static uint8_t g_kbLayer = 0;   // 0=abc 1=ABC 2=123/Sym
+
+static const char* const KB_ROWS[3][4] = {
+  { "1234567890", "qwertzuiop", "asdfghjkl", "yxcvbnm" },
+  { "1234567890", "QWERTZUIOP", "ASDFGHJKL", "YXCVBNM" },
+  { "1234567890", "@#$%&*-_=+", "!?/:;,.",   "()[]<>|" },
+};
+#define KB_KW 44
+#define KB_KH 48
+static inline int kbRowY(int r) { return 150 + r * 56; }
+
+static void drawKeyboardPage();
+
+static void openKeyboard(uint8_t slot, uint8_t field) {
+  g_kbSlot  = (slot < WPROF_COUNT) ? slot : 0;
+  g_kbField = field ? 1 : 0;
+  g_kbLayer = 0;
+  const char* src = g_kbField == 0 ? g_wprof[g_kbSlot].ssid : g_wprof[g_kbSlot].pass;
+  strlcpy(g_kbText, src, sizeof(g_kbText));
+  currentPage = 10;
+  drawKeyboardPage();
+}
+
+static void drawKeyboardPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
+  char t[40];
+  if (g_kbField == 0) snprintf(t, sizeof(t), "SSID %s", WPROF_LABELS[g_kbSlot]);
+  else snprintf(t, sizeof(t), "PW %.14s", g_wprof[g_kbSlot].ssid[0] ? g_wprof[g_kbSlot].ssid : "(?)");
+  drawTextCentered(240, 34, t, RGB565(230, 190, 70), 2);
+  fillRectFast(40, 58, 400, 30, RGB565(28, 28, 30));
+  drawTextSmall(48, 64, g_kbText[0] ? g_kbText : "____", RGB565(120, 220, 140), 2);
+  for (int r = 0; r < 4; r++) {
+    const char* row = KB_ROWS[g_kbLayer][r];
+    int n = (int)strlen(row);
+    int x0 = 240 - (n * KB_KW) / 2;
+    int y  = kbRowY(r);
+    for (int i = 0; i < n; i++) {
+      int kx = x0 + i * KB_KW;
+      fillRectFast(kx + 2, y, KB_KW - 4, KB_KH, RGB565(55, 55, 62));
+      char c[2] = { row[i], 0 };
+      drawTextCentered(kx + KB_KW / 2, y + 14, c, RGB565(235, 235, 225), 2);
+    }
+  }
+  const char* ctl[6];
+  ctl[0] = (g_kbLayer == 0) ? "ABC" : (g_kbLayer == 1) ? "123" : "abc";
+  ctl[1] = "SPC"; ctl[2] = "DEL"; ctl[3] = "CLR"; ctl[4] = "OK"; ctl[5] = "ESC";
+  for (int i = 0; i < 6; i++) {
+    uint16_t bg = (i == 4) ? RGB565(40, 110, 60) : (i == 5) ? RGB565(120, 50, 45) : RGB565(60, 60, 66);
+    fillRectFast(i * 80 + 3, 378, 74, 54, bg);
+    drawTextCentered(i * 80 + 40, 396, ctl[i], RGB565(235, 235, 225), 2);
+  }
+  presentFrame();
+}
+
+static void handleKbTap(uint16_t x, uint16_t y) {
+  if (y >= 378) {                       // Steuerreihe
+    int idx = x / 80; if (idx > 5) idx = 5;
+    int l = (int)strlen(g_kbText);
+    switch (idx) {
+      case 0: g_kbLayer = (g_kbLayer + 1) % 3; break;
+      case 1: if (l < 64) { g_kbText[l] = ' '; g_kbText[l + 1] = 0; } break;
+      case 2: if (l > 0) g_kbText[l - 1] = 0; break;
+      case 3: g_kbText[0] = 0; break;
+      case 4:                           // OK
+        if (g_kbField == 0) {           // SSID gespeichert -> weiter zum Passwort
+          saveWprof(g_kbSlot, g_kbText, g_wprof[g_kbSlot].pass, g_wprof[g_kbSlot].hubip);
+          openKeyboard(g_kbSlot, 1);
+        } else {                        // Passwort gespeichert -> aktiv + verbinden
+          saveWprof(g_kbSlot, g_wprof[g_kbSlot].ssid, g_kbText, g_wprof[g_kbSlot].hubip);
+          selectWprof(g_kbSlot);
+          currentPage = 5; drawSetupPage();
+        }
+        return;
+      case 5: currentPage = 5; drawSetupPage(); return;   // ESC
+    }
+    drawKeyboardPage();
+    return;
+  }
+  for (int r = 0; r < 4; r++) {         // Tastenfeld
+    int yy = kbRowY(r);
+    if ((int)y < yy || (int)y >= yy + KB_KH) continue;
+    const char* row = KB_ROWS[g_kbLayer][r];
+    int n = (int)strlen(row);
+    int x0 = 240 - (n * KB_KW) / 2;
+    if ((int)x < x0 || (int)x >= x0 + n * KB_KW) return;
+    int i = ((int)x - x0) / KB_KW;
+    if (i >= 0 && i < n) {
+      int l = (int)strlen(g_kbText);
+      if (l < 64) { g_kbText[l] = row[i]; g_kbText[l + 1] = 0; }
+    }
+    drawKeyboardPage();
+    return;
+  }
+}
+
 static void drawCurrentPage() {
   if      (currentPage == 0) drawVdoClock();
   else if (currentPage == 1) drawMenuOverview();
@@ -1624,6 +1728,7 @@ static void drawCurrentPage() {
   else if (currentPage == 5) drawSetupPage();
   else if (currentPage == 6) drawImuPage();
   else if (currentPage == 7) drawAdjustPage();
+  else if (currentPage == 10) drawKeyboardPage();
 }
 
 // -------- Preferences --------
@@ -2022,7 +2127,7 @@ static void handleWebPage() {
   if (webServer.hasArg("p")) {
     int page = webServer.arg("p").toInt();
     if (page < 0) page = 0;
-    if (page > 7) page = 7;
+    if (page > 10) page = 10;
     currentPage  = static_cast<uint8_t>(page);
     g_redrawPage = true;
     Serial.printf("Web: page=%u\n", currentPage);
@@ -2155,10 +2260,9 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     currentPage = 7;
     drawAdjustPage();
     Serial.println("setup tap: -> Justage");
-  } else if (y >= 200 && y < 236) {     // WIFI (Zeile 218)
-    cycleWifiProfile();
-    drawSetupPage();
-    Serial.printf("setup tap: wifi profile=%u ssid=%s\n", g_wifiProfile, currentWifiSsid());
+  } else if (y >= 200 && y < 236) {     // WIFI (Zeile 218) -> On-Screen-Tastatur (aktives Profil: SSID -> Passwort -> verbinden)
+    openKeyboard(g_wifiProfile, 0);
+    Serial.printf("setup tap: WLAN-Tastatur Profil %u (%s)\n", g_wifiProfile, WPROF_LABELS[g_wifiProfile]);
   } else if (y >= 236 && y < 272) {     // BLE (Zeile 254)
     saveFeatures(g_featureWifi, !g_featureBle, g_featureBuzzer);
     drawSetupPage();
@@ -2366,6 +2470,8 @@ void loop() {
         handleSetupLongPress(tapY, durMs);
       } else if (currentPage == 7) {
         handleAdjustTap(tapX, tapY);    // Justage: Groesse/Rotation +/-
+      } else if (currentPage == 10) {
+        handleKbTap(tapX, tapY);        // On-Screen-Tastatur
       } else {
         // Data pages (Motor/Lambda/Hub/IMU): Tap -> naechste, dann zurueck zur Uhr.
         if      (currentPage == 4) currentPage = 6;  // Hub -> IMU
@@ -2408,6 +2514,7 @@ void loop() {
         else if (cmd == "rot:-") { saveRotation(g_rotationDeg - 1); g_redrawPage = true; }
         else if (cmd.startsWith("rot:")) { saveRotation(cmd.substring(4).toInt()); g_redrawPage = true; }
         else if (cmd == "clock")   { currentPage = 0; drawVdoClock(); }
+        else if (cmd == "reboot")  { Serial.println("Reboot..."); delay(50); ESP.restart(); }
         else if (cmd == "can:normal" || cmd == "can:listen") {
           g_canListenOnly = (cmd == "can:listen");
           Preferences pc; pc.begin("clock", false); pc.putBool("can_listen", g_canListenOnly); pc.end();
