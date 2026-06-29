@@ -23,6 +23,7 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <ESPmDNS.h>
+#include "esp_wps.h"               // WLAN per Tastendruck (WPS PBC) - wie im M5 Dial
 #include <sys/time.h>
 #include <time.h>
 
@@ -314,6 +315,13 @@ static bool wifiNtpTick() {
   return false;
 }
 
+// ---- WLAN per WPS (PBC = Tastendruck am Router), wie im M5 Dial ----
+static void saveWprof(uint8_t, const char*, const char*, const char*);   // fwd
+enum WpsState : uint8_t { WPS_IDLE = 0, WPS_RUN = 1, WPS_OK = 2, WPS_FAIL = 3 };
+static volatile WpsState g_wpsState       = WPS_IDLE;
+static volatile bool     g_wpsActive      = false;  // WPS laeuft -> normalen Reconnect aussetzen
+static volatile bool     g_wpsSavePending = false;  // nach Erfolg Zugangsdaten ins Heim-Profil sichern
+
 // WLAN-Auto-Fallback: probiert (ohne Scan!) Hub-AP > Heim durch, je ~6 s. KEIN
 // WiFi.scanNetworks() - das crasht auf diesem Arduino-Stand, wenn kein Netz in
 // Reichweite ist (esp_wifi_scan_start StoreProhibited -> Boot-Loop). WiFi.begin
@@ -321,6 +329,22 @@ static bool wifiNtpTick() {
 // (Handy-Hotspot) ist NICHT in der Auto-Kette (nur manuell), damit das Display
 // bei einem kurzen Hub-AP-Abriss nicht am Hotspot ohne Hub-Daten haengenbleibt.
 static void wifiAutoTick() {
+  // Waehrend WPS laeuft: keinen normalen Reconnect (sonst ueberschreibt WiFi.begin
+  // die per WPS empfangene Verbindung). Bei Erfolg Router-Zugangsdaten ins Heim-Profil.
+  if (g_wpsActive) {
+    if (g_wpsSavePending && WiFi.status() == WL_CONNECTED) {
+      String s = WiFi.SSID(), pw = WiFi.psk();
+      if (s.length() > 0) {
+        saveWprof(0, s.c_str(), pw.c_str(), g_wprof[0].hubip);   // Slot 0 = Heim
+        g_wifiProfile = 0;
+        g_wpsState = WPS_OK;
+        Serial.printf("WPS: ok -> Heim '%s' gespeichert\n", s.c_str());
+      }
+      g_wpsSavePending = false;
+      g_wpsActive = false;
+    }
+    return;
+  }
   if (!g_featureWifi || !g_wifiAuto) return;
   if (WiFi.status() == WL_CONNECTED) return;
   // Nur Hub-AP > Heim automatisch. S24 NICHT auto (sonst landet das Display bei
@@ -344,6 +368,45 @@ static void wifiAutoTick() {
     return;
   }
   tryAt = millis() + 5000;                         // kein belegtes Profil
+}
+
+static void onWifiWpsEvent(arduino_event_id_t ev, arduino_event_info_t) {
+  if (ev == ARDUINO_EVENT_WPS_ER_SUCCESS) {
+    esp_wifi_wps_disable();
+    g_wpsSavePending = true;
+    g_wpsState = WPS_RUN;
+    WiFi.begin();                                  // mit den per WPS empfangenen Daten verbinden
+    Serial.println("WPS: Erfolg, verbinde...");
+  } else if (ev == ARDUINO_EVENT_WPS_ER_FAILED || ev == ARDUINO_EVENT_WPS_ER_TIMEOUT) {
+    esp_wifi_wps_disable();
+    g_wpsActive = false;
+    g_wpsSavePending = false;
+    g_wpsState = WPS_FAIL;
+    Serial.println("WPS: fehlgeschlagen/Timeout");
+  }
+}
+
+// WPS (Push-Button) starten: Router-WPS-Taste + diesen Button = verbinden ohne Tippen.
+static void startWps() {
+  static bool evtRegistered = false;
+  if (!evtRegistered) { WiFi.onEvent(onWifiWpsEvent); evtRegistered = true; }
+  g_featureWifi = true;
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, true);
+  esp_wps_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.wps_type = WPS_TYPE_PBC;
+  strcpy(cfg.factory_info.manufacturer, "ESPRESSIF");
+  strcpy(cfg.factory_info.model_number, "ESP32S3");
+  strcpy(cfg.factory_info.model_name,   "VDO-CLOCK");
+  strcpy(cfg.factory_info.device_name,  "VDO-CLOCK");
+  if (esp_wifi_wps_enable(&cfg) == ESP_OK && esp_wifi_wps_start(0) == ESP_OK) {
+    g_wpsActive = true; g_wpsSavePending = false; g_wpsState = WPS_RUN;
+    Serial.println("WPS: gestartet (PBC) - jetzt WPS-Taste am Router druecken");
+  } else {
+    g_wpsActive = false; g_wpsState = WPS_FAIL;
+    Serial.println("WPS: Start fehlgeschlagen");
+  }
 }
 
 // -------- BLE Spartan3-Hub client --------
@@ -1739,6 +1802,46 @@ static void handleKbTap(uint16_t x, uint16_t y) {
   }
 }
 
+// ===== WLAN-Seite (Page 11): grosse Buttons WPS / Tippen / Profil / Zurueck =====
+#define WLAN_BTN_X 108
+#define WLAN_BTN_W 264
+#define WLAN_BTN_H 54
+static const int WLAN_BTN_Y[4] = { 150, 212, 274, 336 };
+
+static void drawWlanPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 214, 3, RGB565(185, 150, 45));
+  drawTextCentered(240, 48, "WLAN", RGB565(230, 190, 70), 3);
+  char l[56];
+  snprintf(l, sizeof(l), "%s: %s", WPROF_LABELS[g_wifiProfile], currentWifiSsid()[0] ? currentWifiSsid() : "(leer)");
+  drawTextCentered(240, 90, l, RGB565(200, 200, 205), 2);
+  bool conn = (WiFi.status() == WL_CONNECTED);
+  if (conn) snprintf(l, sizeof(l), "verbunden  %s", g_ipStr); else snprintf(l, sizeof(l), "nicht verbunden");
+  drawTextCentered(240, 114, l, conn ? RGB565(120, 220, 140) : RGB565(225, 150, 120), 2);
+  if      (g_wpsState == WPS_RUN)  drawTextCentered(240, 136, "WPS laeuft - Router-Taste druecken", RGB565(230, 200, 80), 1);
+  else if (g_wpsState == WPS_OK)   drawTextCentered(240, 136, "WPS ok", RGB565(120, 220, 140), 1);
+  else if (g_wpsState == WPS_FAIL) drawTextCentered(240, 136, "WPS fehlgeschlagen", RGB565(225, 120, 120), 1);
+  const char* lbl[4]  = { "WPS verbinden", "Passwort tippen", "Profil wechseln", "Zurueck" };
+  const uint16_t bg[4] = { RGB565(40,110,60), RGB565(55,80,120), RGB565(70,70,78), RGB565(95,60,55) };
+  for (int i = 0; i < 4; i++) {
+    fillRectFast(WLAN_BTN_X, WLAN_BTN_Y[i], WLAN_BTN_W, WLAN_BTN_H, bg[i]);
+    drawTextCentered(240, WLAN_BTN_Y[i] + 18, lbl[i], RGB565(240, 240, 235), 2);
+  }
+  presentFrame();
+}
+
+static void handleWlanTap(uint16_t x, uint16_t y) {
+  for (int i = 0; i < 4; i++) {
+    if ((int)y < WLAN_BTN_Y[i] || (int)y >= WLAN_BTN_Y[i] + WLAN_BTN_H) continue;
+    if      (i == 0) { startWps();          drawWlanPage(); }            // WPS starten
+    else if (i == 1) { openKeyboard(g_wifiProfile, 0); }                 // -> Tastatur (Page 10)
+    else if (i == 2) { cycleWifiProfile();  drawWlanPage(); }            // naechstes Profil
+    else             { currentPage = 5;     drawSetupPage(); }           // zurueck -> Setup
+    return;
+  }
+}
+
 static void drawCurrentPage() {
   if      (currentPage == 0) drawVdoClock();
   else if (currentPage == 1) drawMenuOverview();
@@ -1749,6 +1852,7 @@ static void drawCurrentPage() {
   else if (currentPage == 6) drawImuPage();
   else if (currentPage == 7) drawAdjustPage();
   else if (currentPage == 10) drawKeyboardPage();
+  else if (currentPage == 11) drawWlanPage();
 }
 
 // -------- Preferences --------
@@ -2147,7 +2251,7 @@ static void handleWebPage() {
   if (webServer.hasArg("p")) {
     int page = webServer.arg("p").toInt();
     if (page < 0) page = 0;
-    if (page > 10) page = 10;
+    if (page > 11) page = 11;
     currentPage  = static_cast<uint8_t>(page);
     g_redrawPage = true;
     Serial.printf("Web: page=%u\n", currentPage);
@@ -2280,15 +2384,10 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
     currentPage = 7;
     drawAdjustPage();
     Serial.println("setup tap: -> Justage");
-  } else if (y >= 200 && y < 236) {     // WIFI (Zeile 218)
-    if (isLong) {                       // LANG -> Tastatur: SSID/Passwort tippen (z.B. Z00-Station)
-      openKeyboard(g_wifiProfile, 0);
-      Serial.printf("setup long: WLAN-Tastatur Profil %u (%s)\n", g_wifiProfile, WPROF_LABELS[g_wifiProfile]);
-    } else {                            // KURZ -> naechstes Profil aktivieren (raus aus S24 -> Hub-AP/Heim)
-      cycleWifiProfile();
-      drawSetupPage();
-      Serial.printf("setup tap: WLAN-Profil -> %u (%s) ssid=%s\n", g_wifiProfile, WPROF_LABELS[g_wifiProfile], currentWifiSsid());
-    }
+  } else if (y >= 200 && y < 236) {     // WIFI (Zeile 218) -> WLAN-Seite (WPS / Tippen / Profil)
+    currentPage = 11;
+    drawWlanPage();
+    Serial.println("setup tap: -> WLAN-Seite");
   } else if (y >= 236 && y < 272) {     // BLE (Zeile 254)
     saveFeatures(g_featureWifi, !g_featureBle, g_featureBuzzer);
     drawSetupPage();
@@ -2498,6 +2597,8 @@ void loop() {
         handleAdjustTap(tapX, tapY);    // Justage: Groesse/Rotation +/-
       } else if (currentPage == 10) {
         handleKbTap(tapX, tapY);        // On-Screen-Tastatur
+      } else if (currentPage == 11) {
+        handleWlanTap(tapX, tapY);      // WLAN-Seite (WPS/Tippen/Profil)
       } else {
         // Data pages (Motor/Lambda/Hub/IMU): Tap -> naechste, dann zurueck zur Uhr.
         if      (currentPage == 4) currentPage = 6;  // Hub -> IMU
@@ -2563,8 +2664,12 @@ void loop() {
     }
   }
 
-  // WLAN-Auto-Fallback (S24 > Heim > Hub-AP) - verbindet zum verfuegbaren Netz
+  // WLAN-Auto-Fallback (Hub-AP > Heim) - verbindet zum verfuegbaren Netz
   wifiAutoTick();
+
+  // WLAN-Seite live halten (WPS-Status / IP aktualisieren)
+  { static uint32_t wlanRedrawAt = 0;
+    if (currentPage == 11 && millis() > wlanRedrawAt) { wlanRedrawAt = millis() + 1200; drawWlanPage(); } }
 
   // Fallback-Setup-AP verwalten (nur AN wenn keine STA-Verbindung)
   manageWifiAp();
