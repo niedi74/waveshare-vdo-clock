@@ -2481,5 +2481,16 @@ void loop() {
     hal_restart();
   }
 
+  // Periodische Status-Zeile fuer Testfahrt-Log (alle 5s)
+  static uint32_t lastStat = 0;
+  if (millis() - lastStat >= 5000) {
+    lastStat = millis();
+    Serial.printf("STAT up=%lus ip=%s wifi=%d prof=%s httpRx=%lu canRx=%lu src=%s age=%lums heap=%u\n",
+                  (unsigned long)(millis() / 1000), g_ipStr, (int)WiFi.status(),
+                  WPROF_LABELS[g_wifiProfile], (unsigned long)g_httpRx, (unsigned long)g_canRx,
+                  g_lastSrc, g_httpLastRxMs ? (unsigned long)(millis() - g_httpLastRxMs) : 0UL,
+                  (unsigned)ESP.getFreeHeap());
+  }
+
   delay(10);
 }
