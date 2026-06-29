@@ -620,16 +620,20 @@ static String hubTarget() {
 static void httpPollTick() {
   if (!g_featureWifi || WiFi.status() != WL_CONNECTED || g_hubIp.length() == 0) return;
   static uint32_t last = 0;
-  if (millis() - last < 500) return;
+  static uint8_t  failStreak = 0;
+  // Backoff: bei totem Hub nur alle 4s pollen, sonst blockiert der GET den Loop
+  // dauernd (Timeout) -> Touch wird traege. Bei Erfolg wieder flott (500ms).
+  const uint32_t interval = (failStreak >= 3) ? 4000 : 500;
+  if (millis() - last < interval) return;
   last = millis();
 
   String tgt = hubTarget();
-  if (tgt.length() == 0) return;                       // Hostname (noch) nicht aufloesbar
+  if (tgt.length() == 0) { if (failStreak < 200) failStreak++; return; }  // Hostname (noch) nicht aufloesbar
   HTTPClient http;
   String url = "http://" + tgt + "/api/status";
-  if (!http.begin(url)) return;
-  http.setConnectTimeout(600);
-  http.setTimeout(800);
+  if (!http.begin(url)) { if (failStreak < 200) failStreak++; return; }
+  http.setConnectTimeout(300);     // kurz halten -> Loop/Touch bleibt reaktiv
+  http.setTimeout(400);
   int code = http.GET();
   if (code == 200) {
     String b = http.getString();
@@ -647,6 +651,9 @@ static void httpPollTick() {
     g_httpRx++;
     if (g_httpRx == 1) Serial.printf("HTTP: erste Daten von %s\n", tgt.c_str());
     g_httpLastRxMs = millis();
+    failStreak = 0;
+  } else {
+    if (failStreak < 200) failStreak++;
   }
   http.end();
 }
