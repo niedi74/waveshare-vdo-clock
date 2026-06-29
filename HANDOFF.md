@@ -15,9 +15,11 @@
   `src=HTTP`, frische Daten (`age ≈ 260 ms`). Kein Hängenbleiben am Handy-Hotspot mehr.
 - ✅ **S24 (Handy-Hotspot) ist NICHT in der Auto-Kette** — nur manuell wählbar. Reißt der
   Hub-AP kurz ab (Hub-Reboot mit Motor), reconnectet das Display auf den Hub-AP statt auf S24.
-- ✅ **On-Screen-Tastatur** (Page 10) zum SSID/Passwort-Tippen am Touch, kompakt (passt in
-  den runden Kreis).
 - ✅ **Flackern weg:** der VSYNC-Doppelpuffer wurde **wieder revertiert** (s. u.).
+- 🟡 **WLAN-Seite (Page 11) + WPS** (Commit `9245db0`): Setup → WIFI öffnet eine Seite mit
+  großen Buttons **WPS verbinden / Passwort tippen / Profil wechseln / Zurück**. WPS (PBC,
+  wie M5 Dial) speichert die Router-Daten ins Heim-Profil. **Gebaut, aber NOCH NICHT
+  geflasht/getestet** (COM13 war ab). On-Screen-Tastatur (Page 10) bleibt als Fallback.
 
 ### Letzte relevante Commits
 ```
@@ -72,8 +74,9 @@ pio run -e waveshare_s3_28c -t upload --upload-port COM13     # Flash (USB)
 
 ## 4. Offene Punkte / TODO
 
-1. **Tastatur-Einstieg umlegen** — der Langdruck auf die WIFI-Zeile passt dem Nutzer nicht;
-   einen besseren/diskreteren Einstieg finden (z. B. eigener Menüpunkt oder WLAN-Unterseite).
+1. **WLAN-Seite + WPS flashen & testen** (`9245db0`) — WPS am echten Router (Z00-Station)
+   prüfen: WLAN-Seite → „WPS verbinden", Router-WPS-Taste drücken → sollte verbinden und
+   ins Heim-Profil speichern. Tastatur (Page 10) ist nur noch Fallback; ggf. noch kleiner.
 2. **Lambda-Verlauf-Graf-Seite** (Backlog): neue Display-Seite mit **Linien-Graph über Zeit**
    für **Lambda vs Drehzahl / Unterdruck(MAP) / Geschwindigkeit** (+ später Gaspedal). Werte
    fließen schon (`g_lambda/g_rpm/g_map`/`speed_kmh`) → Ring-Puffer + Diagramm, keine neue
