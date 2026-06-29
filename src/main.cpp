@@ -301,7 +301,29 @@ static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
 static bool      g_featureEspNow = true;
-static uint8_t   g_espNowChannelPref = 0;  // 0=auto (WiFi), sonst 1..14
+static uint8_t   g_espNowChannelPref = 0;  // 0=auto (WiFi), sonst 1..14 (nur noch fuer NVS-Altlast)
+
+#if !ENABLE_ESP_NOW_CLIENT
+// ESP-NOW entfernt: No-op-Stubs, damit die (teils ungeguardeten) Aufrufer
+// weiter kompilieren. Live-Daten kommen jetzt ueber WiFi-HTTP /api/status,
+// Hub-BLE-Notify oder Direct-123-BLE.
+static bool      g_espNowReady = false;
+static uint8_t   g_espNowActiveChannel = 0;
+static uint32_t  g_espNowRx = 0;
+static uint16_t  g_espNowSeq = 0;
+static uint32_t  g_espNowLastRxMs = 0;
+static inline bool        espNowClientActive()        { return false; }
+static inline bool        espNowDataFresh()           { return false; }
+static inline bool        espNowFallbackAllowed()      { return true; }
+static inline uint8_t     espNowEffectiveChannel()     { return 0; }
+static inline const char* espNowChannelLabel()         { return "AUS"; }
+static inline void        espNowClientTick()           {}
+static inline void        espNowClientProcessPending()  {}
+static inline void        setupEspNowClient()           {}
+static inline void        teardownEspNowClient()        {}
+static inline void        cycleEspNowChannelPref()      {}
+static inline void        saveEspNowFeature(bool)        {}
+#endif
 static bool      g_wifiApOnly   = false;   // Standalone AP (VDO-Clock-Setup), kein Home-STA
 static bool      g_apOn         = false;
 static bool      g_webStarted   = false;
