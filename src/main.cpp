@@ -1468,7 +1468,96 @@ static void drawMotorPage() {
   presentFrame();
 }
 
+// ===== Lambda-Verlauf (Trend ueber Zeit): Ringpuffer, alle 500ms ein Sample =====
+#define TR_N 120                         // 120 * 500ms = 60 s Fenster
+static uint8_t  g_trLam[TR_N];           // λ*100 (0 = ungueltig/Luecke)
+static uint16_t g_trRpm[TR_N];           // 1/min (Kontextlinie)
+static uint16_t g_trHead  = 0;           // naechster Schreibindex
+static uint16_t g_trCount = 0;
+static uint8_t  g_lambdaStyle = 0;       // 0 = Gauge, 1 = Verlauf
+
+static void trendSample() {              // jeden Loop aufrufen; sampelt selbst getaktet
+  static uint32_t at = 0;
+  if (millis() < at) return;
+  at = millis() + 500;
+  bool fresh = httpFresh() || canFresh() || bleFresh() || tune123Fresh();
+  int lx = (fresh && g_lambdaValid) ? (int)lroundf(g_lambda * 100.0f) : 0;
+  g_trLam[g_trHead] = (uint8_t)constrain(lx, 0, 255);
+  g_trRpm[g_trHead] = (uint16_t)constrain((int)lroundf(g_rpm), 0, 9999);
+  g_trHead = (g_trHead + 1) % TR_N;
+  if (g_trCount < TR_N) g_trCount++;
+}
+
+#define TR_PX0 72
+#define TR_PX1 420
+#define TR_PY0 150
+#define TR_PY1 350
+static inline int trLamY(float lam) {    // λ 0.75..1.25 -> y unten..oben
+  float t = (lam - 0.75f) / 0.5f; if (t < 0) t = 0; if (t > 1) t = 1;
+  return TR_PY1 - (int)lroundf(t * (TR_PY1 - TR_PY0));
+}
+static inline int trRpmY(float rpm) {    // 0..6000 1/min auf dieselbe Hoehe
+  float t = rpm / 6000.0f; if (t < 0) t = 0; if (t > 1) t = 1;
+  return TR_PY1 - (int)lroundf(t * (TR_PY1 - TR_PY0));
+}
+
+static void drawTrendPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
+  bool live  = httpFresh() || canFresh() || bleFresh() || tune123Fresh();
+  bool fresh = live && g_lambdaValid;
+  // Kopf: aktueller Lambda-Wert (farbcodiert) + Drehzahl
+  char hb[12];
+  if (fresh) snprintf(hb, sizeof(hb), "%.2f", g_lambda); else strcpy(hb, "--");
+  uint16_t lc = RGB565(70, 210, 100);
+  if (fresh) { if (g_lambda < 0.97f) lc = RGB565(235, 120, 40); else if (g_lambda > 1.03f) lc = RGB565(80, 160, 240); }
+  else lc = RGB565(120, 90, 60);
+  drawTextCentered(240, 48, "LAMBDA  60s", RGB565(200, 200, 205), 2);
+  drawTextCentered(168, 92, hb, lc, 5);
+  char rb[12]; snprintf(rb, sizeof(rb), "%d", (int)lroundf(g_rpm));
+  drawTextCentered(338, 86, rb, RGB565(120, 170, 230), 3);
+  drawTextCentered(338, 116, "1/min", RGB565(110, 110, 120), 1);
+  // Soll-Band 0.95..1.05 + Stoechiometrie 1.0
+  int yb0 = trLamY(1.05f), yb1 = trLamY(0.95f);
+  fillRectFast(TR_PX0, yb0, TR_PX1 - TR_PX0, yb1 - yb0, RGB565(18, 58, 34));
+  // Gitter + Achsbeschriftung
+  const uint16_t grid = RGB565(42, 42, 50), dim = RGB565(120, 120, 130);
+  int yg08 = trLamY(0.8f), yg10 = trLamY(1.0f), yg12 = trLamY(1.2f);
+  drawLineFast(TR_PX0, yg08, TR_PX1, yg08, grid, 1);
+  drawLineFast(TR_PX0, yg12, TR_PX1, yg12, grid, 1);
+  drawLineFast(TR_PX0, yg10, TR_PX1, yg10, RGB565(90, 90, 100), 1);   // λ=1.0
+  drawTextSmall(44, yg12 - 4, "1.2", dim, 1);
+  drawTextSmall(44, yg10 - 4, "1.0", dim, 1);
+  drawTextSmall(44, yg08 - 4, "0.8", dim, 1);
+  drawLineFast(TR_PX0, TR_PY1, TR_PX1, TR_PY1, RGB565(60, 60, 70), 1);
+  // Verlauf zeichnen (Drehzahl blass, dann Lambda kraeftig)
+  int n = g_trCount;
+  if (n >= 2) {
+    int px = -1, pyR = 0, pyL = 0; bool pv = false;
+    for (int i = 0; i < n; i++) {
+      int idx = (g_trHead - n + i + 2 * TR_N) % TR_N;
+      int x = TR_PX0 + (int)lroundf((float)i / (n - 1) * (TR_PX1 - TR_PX0));
+      int yR = trRpmY(g_trRpm[idx]);
+      if (px >= 0) drawLineFast(px, pyR, x, yR, RGB565(55, 95, 165), 1);
+      pyR = yR;
+      uint8_t lv = g_trLam[idx];
+      if (lv > 0) {
+        int yL = trLamY(lv / 100.0f);
+        if (pv && px >= 0) drawLineFast(px, pyL, x, yL, RGB565(230, 190, 70), 2);
+        pyL = yL; pv = true;
+      } else pv = false;
+      px = x;
+    }
+  }
+  drawTextSmall(TR_PX0, 358, "-60s", dim, 1);
+  drawTextSmall(388, 358, "jetzt", dim, 1);
+  drawTextCentered(240, 392, live ? "lang Mitte: Anzeige" : "kein Hub", live ? RGB565(150, 150, 160) : RGB565(200, 120, 50), 1);
+  presentFrame();
+}
+
 static void drawLambdaPage() {
+  if (g_lambdaStyle == 1) { drawTrendPage(); return; }
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(45, 150, 70));
@@ -1894,6 +1983,8 @@ static void loadSettings() {
   g_canListenOnly = p.getBool("can_listen", true);     // CAN: listen-only default (NORMAL = ACK)
   g_motorStyle    = p.getUChar("mstyle", 2);          // 0=digital,1=vdo,2=123tune+
   if (g_motorStyle > 2) g_motorStyle = 2;
+  g_lambdaStyle   = p.getUChar("lstyle", 0);          // 0=Gauge, 1=Verlauf
+  if (g_lambdaStyle > 1) g_lambdaStyle = 0;
   p.end();
   if (g_dialScalePct  < 30)  g_dialScalePct  = 30;
   if (g_dialScalePct  > 150) g_dialScalePct  = 150;
@@ -1948,6 +2039,14 @@ static void saveMotorStyle(int style) {
   Preferences p;
   p.begin("clock", false);
   p.putUChar("mstyle", g_motorStyle);
+  p.end();
+}
+
+static void saveLambdaStyle(int s) {       // 0=Gauge, 1=Verlauf
+  g_lambdaStyle = (uint8_t)(s & 1);
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("lstyle", g_lambdaStyle);
   p.end();
 }
 
@@ -2564,6 +2663,16 @@ void loop() {
           drawMotorPage();
           Serial.printf("motor long-press -> Stil %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
         }
+      } else if (currentPage == 3) {
+        // LAMBDA: langer Druck in die Mitte -> Gauge <-> Verlauf umschalten
+        const int dx = (int)touchLastX - 240, dy = (int)touchLastY - 240;
+        if (dx * dx + dy * dy <= 95 * 95) {
+          touchLongHandled = true;
+          lastTouch = nowMs;
+          saveLambdaStyle(g_lambdaStyle ^ 1);
+          drawLambdaPage();
+          Serial.printf("lambda long-press -> Stil %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
+        }
       }
     }
   } else if (touchActive && nowMs - touchLastSeenMs > (currentPage == 5 ? 700UL : 180UL)) {
@@ -2670,6 +2779,11 @@ void loop() {
   // WLAN-Seite live halten (WPS-Status / IP aktualisieren)
   { static uint32_t wlanRedrawAt = 0;
     if (currentPage == 11 && millis() > wlanRedrawAt) { wlanRedrawAt = millis() + 1200; drawWlanPage(); } }
+
+  // Lambda-Verlauf: immer sampeln (Historie da, egal welche Seite) + Trend-Seite scrollen
+  trendSample();
+  { static uint32_t trRedrawAt = 0;
+    if (currentPage == 3 && g_lambdaStyle == 1 && millis() > trRedrawAt) { trRedrawAt = millis() + 500; drawLambdaPage(); } }
 
   // Fallback-Setup-AP verwalten (nur AN wenn keine STA-Verbindung)
   manageWifiAp();
