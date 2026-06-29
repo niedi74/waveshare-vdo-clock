@@ -77,10 +77,11 @@ pio run -e waveshare_s3_28c -t upload --upload-port COM13     # Flash (USB)
 1. **WLAN-Seite + WPS flashen & testen** (`9245db0`) — WPS am echten Router (Z00-Station)
    prüfen: WLAN-Seite → „WPS verbinden", Router-WPS-Taste drücken → sollte verbinden und
    ins Heim-Profil speichern. Tastatur (Page 10) ist nur noch Fallback; ggf. noch kleiner.
-2. **Lambda-Verlauf-Graf-Seite** (Backlog): neue Display-Seite mit **Linien-Graph über Zeit**
-   für **Lambda vs Drehzahl / Unterdruck(MAP) / Geschwindigkeit** (+ später Gaspedal). Werte
-   fließen schon (`g_lambda/g_rpm/g_map`/`speed_kmh`) → Ring-Puffer + Diagramm, keine neue
-   Datenquelle. Speed aus Rad-Drehzahl/Reed (GPIO27 am Hub), kein GPS nötig.
+2. **Lambda-Verlauf-Seite** (`b8506a7`, gebaut, noch nicht geflasht): 2. Stil der LAMBDA-Seite
+   (Page 3) — Linien-Graph **λ über Zeit** (60 s) mit Soll-Band + Drehzahl-Kontextlinie.
+   **Langer Druck Mitte** schaltet Gauge↔Verlauf (wie MOTOR), persistent (`lstyle`).
+   Ring-Puffer `g_trLam/g_trRpm` (alle 500 ms). Offen/optional: Kontextlinie umschaltbar
+   (Drehzahl/MAP/Speed), evtl. Variante B „λ über Drehzahl".
 3. **CAN physisch** (`0x510`, listen-only, RX=GPIO44/TX=GPIO43): braucht Spartan-ACK am Bus +
    saubere Kontakte (CANH/CANL/GND/3V3) + 60 Ω Gesamt-Terminierung. Decoder/Code sind fertig.
 
