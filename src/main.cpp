@@ -10,6 +10,8 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <NimBLEDevice.h>
+#include "esp_wifi.h"
+#include "esp_wps.h"
 #include "esp_task_wdt.h"
 #include "esp_ota_ops.h"
 #include "esp_sntp.h"
@@ -308,6 +310,11 @@ static volatile bool g_otaBusy  = false;
 static volatile size_t g_otaRxBytes = 0;
 static const char* g_otaBootLabel = "normal";
 static uint8_t   g_wifiProfile  = 0;
+// ---- WLAN WPS (Tastendruck) ----
+enum WpsState : uint8_t { WPS_IDLE = 0, WPS_RUN = 1, WPS_OK = 2, WPS_FAIL = 3 };
+static volatile WpsState g_wpsState = WPS_IDLE;
+static volatile bool g_wpsActive = false;       // WPS laeuft -> normalen Reconnect aussetzen
+static volatile bool g_wpsSavePending = false;  // nach Erfolg Zugangsdaten in Slot 1 sichern
 static WebServer webServer(80);
 static void startWebServer();   // forward declaration
 static void bleAbortDiscoveryScan();
@@ -796,6 +803,30 @@ static void initTimeSource() {
 static bool wifiNtpTick() {
   static uint32_t lastTry = 0;
   static uint32_t failSince = 0;
+
+  // Waehrend WPS laeuft: keinen normalen Reconnect fahren (sonst ueberschreibt
+  // WiFi.begin(ssid,pass) die per WPS empfangene Verbindung). Bei Erfolg die
+  // vom Router gelieferten Zugangsdaten ins Home-Profil (Slot 1) sichern.
+  if (g_wpsActive) {
+    if (g_wpsSavePending && WiFi.status() == WL_CONNECTED) {
+      String s = WiFi.SSID();
+      String pw = WiFi.psk();
+      if (s.length() > 0) {
+        strlcpy(WIFI_PROFILES[1].ssid, s.c_str(), sizeof(WIFI_PROFILES[1].ssid));
+        strlcpy(WIFI_PROFILES[1].pass, pw.c_str(), sizeof(WIFI_PROFILES[1].pass));
+        Preferences p; p.begin("clock", false);
+        p.putString("p1_ssid", s);
+        p.putString("p1_pass", pw);
+        p.end();
+        saveWifiProfile(1);
+        g_wpsState = WPS_OK;
+        Serial.printf("WPS: ok -> Home-Profil '%s' gespeichert\n", s.c_str());
+      }
+      g_wpsSavePending = false;
+      g_wpsActive = false;
+    }
+    return false;
+  }
 
   if (!g_featureWifi || strlen(currentWifiSsid()) == 0) return false;
 
@@ -3513,6 +3544,143 @@ static void drawSetupPage() {
   presentFrame();
 }
 
+// ===== WLAN: WPS (PBC) + On-Screen Passwort-Tastatur (Page 10) =====
+static void requestPage(uint8_t page);  // fwd
+
+static esp_wps_config_t g_wpsCfg;
+
+static void onWifiWpsEvent(arduino_event_id_t ev, arduino_event_info_t) {
+  if (ev == ARDUINO_EVENT_WPS_ER_SUCCESS) {
+    esp_wifi_wps_disable();
+    g_wpsSavePending = true;
+    g_wpsState = WPS_RUN;
+    WiFi.begin();  // mit den per WPS empfangenen Zugangsdaten verbinden
+    Serial.println("WPS: Erfolg, verbinde...");
+  } else if (ev == ARDUINO_EVENT_WPS_ER_FAILED || ev == ARDUINO_EVENT_WPS_ER_TIMEOUT) {
+    esp_wifi_wps_disable();
+    g_wpsActive = false;
+    g_wpsSavePending = false;
+    g_wpsState = WPS_FAIL;
+    Serial.println("WPS: fehlgeschlagen/Timeout");
+  }
+}
+
+static void startWps() {
+  static bool evtRegistered = false;
+  if (!evtRegistered) { WiFi.onEvent(onWifiWpsEvent); evtRegistered = true; }
+  stopApOnlyMode();
+  g_featureWifi = true;
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, true);
+  memset(&g_wpsCfg, 0, sizeof(g_wpsCfg));
+  g_wpsCfg.wps_type = WPS_TYPE_PBC;
+  strcpy(g_wpsCfg.factory_info.manufacturer, "ESPRESSIF");
+  strcpy(g_wpsCfg.factory_info.model_number, "ESP32S3");
+  strcpy(g_wpsCfg.factory_info.model_name, "VDO-CLOCK");
+  strcpy(g_wpsCfg.factory_info.device_name, "VDO-CLOCK");
+  if (esp_wifi_wps_enable(&g_wpsCfg) == ESP_OK && esp_wifi_wps_start(0) == ESP_OK) {
+    g_wpsActive = true; g_wpsSavePending = false; g_wpsState = WPS_RUN;
+    Serial.println("WPS: gestartet (PBC) - jetzt WPS-Taste am Router druecken");
+  } else {
+    g_wpsActive = false; g_wpsState = WPS_FAIL;
+    Serial.println("WPS: Start fehlgeschlagen");
+  }
+}
+
+// --- Passwort-Tastatur ---
+static uint8_t g_wkSlot  = 1;   // 1=Zuhause, 2=Handy
+static uint8_t g_wkLayer = 0;   // 0=abc 1=ABC 2=123/Sym
+static char    g_wkPass[65];
+
+static const char* const WK_ROWS[3][4] = {
+  { "1234567890", "qwertzuiop", "asdfghjkl",  "yxcvbnm"   },
+  { "1234567890", "QWERTZUIOP", "ASDFGHJKL",  "YXCVBNM"   },
+  { "1234567890", "@#$%&*-_=+", "!?/:;,.",    "()[]<>|" },
+};
+static const int WK_KW = 44, WK_KH = 48;
+static inline int wkRowY(int r) { return 150 + r * 56; }
+
+static void openWifiKeyboard(uint8_t slot) {
+  g_wkSlot  = (slot == 2) ? 2 : 1;
+  strlcpy(g_wkPass, WIFI_PROFILES[g_wkSlot].pass, sizeof(g_wkPass));
+  g_wkLayer = 0;
+  currentPage = 10;
+  g_redrawPage = true;
+}
+
+static void drawWifiKeyboardPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
+  char t[40];
+  snprintf(t, sizeof(t), "PW %.14s", WIFI_PROFILES[g_wkSlot].ssid[0] ? WIFI_PROFILES[g_wkSlot].ssid : "(?)");
+  drawTextCentered(240, 36, t, RGB565(230, 190, 70), 2);
+  fillRectFast(40, 60, 400, 30, RGB565(28, 28, 30));
+  drawTextSmall(48, 66, g_wkPass[0] ? g_wkPass : "____", RGB565(120, 220, 140), 2);
+  for (int r = 0; r < 4; r++) {
+    const char* row = WK_ROWS[g_wkLayer][r];
+    int n = (int)strlen(row);
+    int x0 = 240 - (n * WK_KW) / 2;
+    int y  = wkRowY(r);
+    for (int i = 0; i < n; i++) {
+      int kx = x0 + i * WK_KW;
+      fillRectFast(kx + 2, y, WK_KW - 4, WK_KH, RGB565(55, 55, 62));
+      char c[2] = { row[i], 0 };
+      drawTextCentered(kx + WK_KW / 2, y + 14, c, RGB565(235, 235, 225), 2);
+    }
+  }
+  // Steuerreihe: 6 Buttons a 80px (0..479), y=378
+  static const char* ctl[6];
+  ctl[0] = (g_wkLayer == 0) ? "ABC" : (g_wkLayer == 1) ? "123" : "abc";
+  ctl[1] = "SPC"; ctl[2] = "DEL"; ctl[3] = "WPS"; ctl[4] = "OK"; ctl[5] = "ESC";
+  for (int i = 0; i < 6; i++) {
+    uint16_t bg = (i == 4) ? RGB565(40, 110, 60) : (i == 5) ? RGB565(120, 50, 45)
+                : (i == 3) ? RGB565(40, 80, 140) : RGB565(60, 60, 66);
+    fillRectFast(i * 80 + 3, 378, 74, 54, bg);
+    drawTextCentered(i * 80 + 40, 396, ctl[i], RGB565(235, 235, 225), 2);
+  }
+  presentFrame();
+}
+
+static void handleWifiKbTap(uint16_t x, uint16_t y) {
+  if (y >= 378) {
+    int idx = x / 80; if (idx > 5) idx = 5;
+    int l = (int)strlen(g_wkPass);
+    switch (idx) {
+      case 0: g_wkLayer = (g_wkLayer + 1) % 3; break;
+      case 1: if (l < 64) { g_wkPass[l] = ' '; g_wkPass[l + 1] = 0; } break;
+      case 2: if (l > 0) g_wkPass[l - 1] = 0; break;
+      case 3: startWps(); requestPage(5); return;
+      case 4:
+        strlcpy(WIFI_PROFILES[g_wkSlot].pass, g_wkPass, sizeof(WIFI_PROFILES[g_wkSlot].pass));
+        { Preferences p; p.begin("clock", false);
+          p.putString(g_wkSlot == 1 ? "p1_pass" : "p2_pass", String(g_wkPass)); p.end(); }
+        saveWifiProfile(g_wkSlot);
+        reconnectWifiProfile();
+        requestPage(5);
+        return;
+      case 5: requestPage(5); return;
+    }
+    g_redrawPage = true;
+    return;
+  }
+  for (int r = 0; r < 4; r++) {
+    int yy = wkRowY(r);
+    if (y < yy || y >= yy + WK_KH) continue;
+    const char* row = WK_ROWS[g_wkLayer][r];
+    int n = (int)strlen(row);
+    int x0 = 240 - (n * WK_KW) / 2;
+    if ((int)x < x0 || (int)x >= x0 + n * WK_KW) return;
+    int i = ((int)x - x0) / WK_KW;
+    if (i >= 0 && i < n) {
+      int l = (int)strlen(g_wkPass);
+      if (l < 64) { g_wkPass[l] = row[i]; g_wkPass[l + 1] = 0; }
+    }
+    g_redrawPage = true;
+    return;
+  }
+}
+
 static void drawSetup2Page() {
   if (!ensureFrame()) return;
   g_clockFacePage = currentPage;
@@ -3669,6 +3837,7 @@ static void drawCurrentPage() {
   else if (currentPage == 7) drawCombiPage();
   else if (currentPage == 8) drawTachClockCombiPage();
   else if (currentPage == 9) drawSetup2Page();
+  else if (currentPage == 10) drawWifiKeyboardPage();
   else { currentPage = 0; drawVdoClock(); }
 }
 
@@ -5417,8 +5586,13 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     g_redrawPage = true;
     DLOG("[ROT] setup tap -> %d deg\n", g_rotationDeg);
   } else if (y >= 244 && y < 292) {
-    cycleWifiNetworkMode();
-    DLOG("setup tap: wifi network\n");
+    if (durMs >= 600) {            // Langdruck: WLAN-Passwort-Tastatur oeffnen
+      openWifiKeyboard(g_wifiProfile >= 1 ? g_wifiProfile : 1);
+      DLOGN("setup long: wifi keyboard");
+    } else {                       // Kurz-Tap: WLAN-Modus weiterschalten
+      cycleWifiNetworkMode();
+      DLOG("setup tap: wifi network\n");
+    }
   } else if (y >= 292 && y < 340) {
     saveNightMode(!g_nightMode);
     g_redrawPage = true;
@@ -5455,6 +5629,7 @@ static void pagePrev() {
 }
 
 static void handleTouchTap(uint16_t tapX, uint16_t tapY) {
+  if (currentPage == 10) { handleWifiKbTap(tapX, tapY); return; }  // WLAN-Tastatur: eigene Treffer
   if (tapX < EDGE_TAP_W) {
     pagePrev();
     return;
