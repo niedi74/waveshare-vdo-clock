@@ -26,10 +26,16 @@ M5 Dial nutzt im Bus-Profil `.2`, Waveshare nutzt `.3`, der Hub bleibt `.1`.
 
 ## Datenpfad-Prioritaet
 
-1. ESP-NOW Frame aus `include/spartan_cockpit_frame.h`
-2. WiFi HTTP `GET /api/status`
-3. BLE Hub nur als Fallback
-4. Direct 123TUNE+ BLE nur fuer Standalone-/Debug-Betrieb
+> **ESP-NOW entfernt** (`ENABLE_ESP_NOW_CLIENT=0`). Hub-Livedaten laufen jetzt
+> primaer ueber WiFi-HTTP.
+
+1. WiFi HTTP `GET /api/status` (primaer, Hub-AP `192.168.4.1` oder Heim-LAN)
+2. BLE Hub-Notify (ASCII `L..R..A..M..`)
+3. Direct 123TUNE+ BLE (Drehzahl/Zuendung direkt vom Verteiler)
+4. RTC/Build-Zeit als letzter Rueckfall
+
+> Hinweis: `include/spartan_cockpit_frame.h` bleibt fuer den Hub relevant, wird
+> im Display-Build aber nicht mehr genutzt.
 
 ## Zeit
 
