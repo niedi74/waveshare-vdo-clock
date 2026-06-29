@@ -314,23 +314,27 @@ static bool wifiNtpTick() {
   return false;
 }
 
-// WLAN-Auto-Fallback: probiert (ohne Scan!) die belegten Profile der Reihe nach
-// in Prioritaet Heim > Hub-AP > S24 durch, je ~6 s. KEIN WiFi.scanNetworks() -
-// das crasht auf diesem Arduino-Stand, wenn kein Netz in Reichweite ist
-// (esp_wifi_scan_start StoreProhibited -> Boot-Loop). WiFi.begin im AP_STA ist ok.
-// Folge: zuhause = Heim (Internet/OTA), im Auto (Heim weg) = Hub-AP primaer fuer
-// die Cockpit-Daten (vor S24, auch wenn der Handy-Hotspot an ist).
+// WLAN-Auto-Fallback: probiert (ohne Scan!) Hub-AP > Heim durch, je ~6 s. KEIN
+// WiFi.scanNetworks() - das crasht auf diesem Arduino-Stand, wenn kein Netz in
+// Reichweite ist (esp_wifi_scan_start StoreProhibited -> Boot-Loop). WiFi.begin
+// im AP_STA ist ok. Hub-AP zuerst = im Auto immer die primaere Datenquelle; S24
+// (Handy-Hotspot) ist NICHT in der Auto-Kette (nur manuell), damit das Display
+// bei einem kurzen Hub-AP-Abriss nicht am Hotspot ohne Hub-Daten haengenbleibt.
 static void wifiAutoTick() {
   if (!g_featureWifi || !g_wifiAuto) return;
   if (WiFi.status() == WL_CONNECTED) return;
-  static const uint8_t order[WPROF_COUNT] = { 0, 1, 2 };   // Heim > Hub-AP > S24
+  // Nur Hub-AP > Heim automatisch. S24 NICHT auto (sonst landet das Display bei
+  // einem Hub-AP-Abriss am Handy-Hotspot, wo es keine Hub-Daten gibt). S24 bleibt
+  // manuell waehlbar (kurzer Tap auf WIFI). -> im Auto haelt es immer den Hub-AP.
+  static const uint8_t AUTO_N = 2;
+  static const uint8_t order[AUTO_N] = { 1, 0 };   // Hub-AP > Heim (Hub ist im Auto die primaere Verbindung)
   static uint8_t  oi    = 0;
   static uint32_t tryAt = 0;
   if (millis() < tryAt) return;
-  for (uint8_t k = 0; k < WPROF_COUNT; k++) {
-    uint8_t slot = order[(oi + k) % WPROF_COUNT];
+  for (uint8_t k = 0; k < AUTO_N; k++) {
+    uint8_t slot = order[(oi + k) % AUTO_N];
     if (!g_wprof[slot].ssid[0]) continue;          // leeres Profil ueberspringen
-    oi = (uint8_t)((oi + k + 1) % WPROF_COUNT);
+    oi = (uint8_t)((oi + k + 1) % AUTO_N);
     g_wifiProfile = slot;
     if (g_wprof[slot].hubip[0]) g_hubIp = g_wprof[slot].hubip;
     strcpy(g_ipStr, "...");
@@ -1631,9 +1635,9 @@ static const char* const KB_ROWS[3][4] = {
   { "1234567890", "QWERTZUIOP", "ASDFGHJKL", "YXCVBNM" },
   { "1234567890", "@#$%&*-_=+", "!?/:;,.",   "()[]<>|" },
 };
-#define KB_KW 44
-#define KB_KH 48
-static inline int kbRowY(int r) { return 150 + r * 56; }
+#define KB_KW 35
+#define KB_KH 42
+static inline int kbRowY(int r) { return 142 + r * 44; }   // Reihen 142/186/230/274 - passt in den runden Kreis
 
 static void drawKeyboardPage();
 
@@ -1647,16 +1651,27 @@ static void openKeyboard(uint8_t slot, uint8_t field) {
   drawKeyboardPage();
 }
 
+// Steuerreihe-Geometrie (6 Tasten, passt mit Rand in den Kreis)
+#define KB_CTL_Y  320
+#define KB_CTL_H  42
+#define KB_CTL_W  62
+#define KB_CTL_X0 54
+
 static void drawKeyboardPage() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
-  drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
+  drawCircleLine(240, 240, 214, 3, RGB565(185, 150, 45));
   char t[40];
   if (g_kbField == 0) snprintf(t, sizeof(t), "SSID %s", WPROF_LABELS[g_kbSlot]);
-  else snprintf(t, sizeof(t), "PW %.14s", g_wprof[g_kbSlot].ssid[0] ? g_wprof[g_kbSlot].ssid : "(?)");
-  drawTextCentered(240, 34, t, RGB565(230, 190, 70), 2);
-  fillRectFast(40, 58, 400, 30, RGB565(28, 28, 30));
-  drawTextSmall(48, 64, g_kbText[0] ? g_kbText : "____", RGB565(120, 220, 140), 2);
+  else snprintf(t, sizeof(t), "PW %.12s", g_wprof[g_kbSlot].ssid[0] ? g_wprof[g_kbSlot].ssid : "(?)");
+  drawTextCentered(240, 54, t, RGB565(230, 190, 70), 2);
+  // Eingabe-Box (zeigt bei langem Text nur das Ende)
+  fillRectFast(92, 90, 296, 28, RGB565(28, 28, 30));
+  const char* shown = g_kbText[0] ? g_kbText : "____";
+  int sl = (int)strlen(shown);
+  if (sl > 22) shown += (sl - 22);
+  drawTextSmall(98, 96, shown, RGB565(120, 220, 140), 2);
+  // Tastenfeld
   for (int r = 0; r < 4; r++) {
     const char* row = KB_ROWS[g_kbLayer][r];
     int n = (int)strlen(row);
@@ -1664,25 +1679,28 @@ static void drawKeyboardPage() {
     int y  = kbRowY(r);
     for (int i = 0; i < n; i++) {
       int kx = x0 + i * KB_KW;
-      fillRectFast(kx + 2, y, KB_KW - 4, KB_KH, RGB565(55, 55, 62));
+      fillRectFast(kx + 2, y, KB_KW - 4, KB_KH - 4, RGB565(55, 55, 62));
       char c[2] = { row[i], 0 };
-      drawTextCentered(kx + KB_KW / 2, y + 14, c, RGB565(235, 235, 225), 2);
+      drawTextCentered(kx + KB_KW / 2, y + 11, c, RGB565(235, 235, 225), 2);
     }
   }
+  // Steuerreihe
   const char* ctl[6];
   ctl[0] = (g_kbLayer == 0) ? "ABC" : (g_kbLayer == 1) ? "123" : "abc";
   ctl[1] = "SPC"; ctl[2] = "DEL"; ctl[3] = "CLR"; ctl[4] = "OK"; ctl[5] = "ESC";
   for (int i = 0; i < 6; i++) {
+    int bx = KB_CTL_X0 + i * KB_CTL_W;
     uint16_t bg = (i == 4) ? RGB565(40, 110, 60) : (i == 5) ? RGB565(120, 50, 45) : RGB565(60, 60, 66);
-    fillRectFast(i * 80 + 3, 378, 74, 54, bg);
-    drawTextCentered(i * 80 + 40, 396, ctl[i], RGB565(235, 235, 225), 2);
+    fillRectFast(bx + 2, KB_CTL_Y, KB_CTL_W - 4, KB_CTL_H, bg);
+    drawTextCentered(bx + KB_CTL_W / 2, KB_CTL_Y + 13, ctl[i], RGB565(235, 235, 225), 2);
   }
   presentFrame();
 }
 
 static void handleKbTap(uint16_t x, uint16_t y) {
-  if (y >= 378) {                       // Steuerreihe
-    int idx = x / 80; if (idx > 5) idx = 5;
+  if (y >= KB_CTL_Y - 2) {              // Steuerreihe
+    int idx = ((int)x - KB_CTL_X0) / KB_CTL_W;
+    if (idx < 0) idx = 0; if (idx > 5) idx = 5;
     int l = (int)strlen(g_kbText);
     switch (idx) {
       case 0: g_kbLayer = (g_kbLayer + 1) % 3; break;
@@ -2238,8 +2256,8 @@ static void manageWifiAp() {
   }
 }
 
-static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
-  Serial.printf("setup long-press y=%u dur=%lu\n", y, (unsigned long)durMs);
+static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
+  Serial.printf("setup tap y=%u dur=%lu long=%d\n", y, (unsigned long)durMs, isLong);
 
   // Zonen passend zu drawSetupPage (Zeilen-Mitte = Zonenstart + 18, Hoehe 36)
   if (y >= 345) {                       // unten -> zurueck ins Menue
@@ -2262,9 +2280,15 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     currentPage = 7;
     drawAdjustPage();
     Serial.println("setup tap: -> Justage");
-  } else if (y >= 200 && y < 236) {     // WIFI (Zeile 218) -> On-Screen-Tastatur (aktives Profil: SSID -> Passwort -> verbinden)
-    openKeyboard(g_wifiProfile, 0);
-    Serial.printf("setup tap: WLAN-Tastatur Profil %u (%s)\n", g_wifiProfile, WPROF_LABELS[g_wifiProfile]);
+  } else if (y >= 200 && y < 236) {     // WIFI (Zeile 218)
+    if (isLong) {                       // LANG -> Tastatur: SSID/Passwort tippen (z.B. Z00-Station)
+      openKeyboard(g_wifiProfile, 0);
+      Serial.printf("setup long: WLAN-Tastatur Profil %u (%s)\n", g_wifiProfile, WPROF_LABELS[g_wifiProfile]);
+    } else {                            // KURZ -> naechstes Profil aktivieren (raus aus S24 -> Hub-AP/Heim)
+      cycleWifiProfile();
+      drawSetupPage();
+      Serial.printf("setup tap: WLAN-Profil -> %u (%s) ssid=%s\n", g_wifiProfile, WPROF_LABELS[g_wifiProfile], currentWifiSsid());
+    }
   } else if (y >= 236 && y < 272) {     // BLE (Zeile 254)
     saveFeatures(g_featureWifi, !g_featureBle, g_featureBuzzer);
     drawSetupPage();
@@ -2430,7 +2454,7 @@ void loop() {
       if (currentPage == 5) {
         touchLongHandled = true;
         lastTouch = nowMs;
-        handleSetupLongPress(touchLastY, nowMs - touchStartMs);
+        handleSetupLongPress(touchLastY, nowMs - touchStartMs, true);
       } else if (currentPage == 2) {
         // MOTOR: langer Druck in die Mitte -> Anzeige-Stil wechseln (DIGITAL/VDO/123TUNE+)
         const int dx = (int)touchLastX - 240, dy = (int)touchLastY - 240;
@@ -2469,7 +2493,7 @@ void loop() {
       } else if (currentPage == 5) {
         // SETUP: kurzer Tap auf eine Zeile aendert die jeweilige Einstellung
         // (Zifferblatt/Helligkeit/Rotation/WLAN/BLE/Buzzer). Tap unten = Menue.
-        handleSetupLongPress(tapY, durMs);
+        handleSetupLongPress(tapY, durMs, false);
       } else if (currentPage == 7) {
         handleAdjustTap(tapX, tapY);    // Justage: Groesse/Rotation +/-
       } else if (currentPage == 10) {
