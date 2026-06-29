@@ -315,13 +315,15 @@ static bool wifiNtpTick() {
 }
 
 // WLAN-Auto-Fallback: probiert (ohne Scan!) die belegten Profile der Reihe nach
-// in Prioritaet S24 > Heim > Hub-AP durch, je ~6 s. KEIN WiFi.scanNetworks() -
+// in Prioritaet Heim > Hub-AP > S24 durch, je ~6 s. KEIN WiFi.scanNetworks() -
 // das crasht auf diesem Arduino-Stand, wenn kein Netz in Reichweite ist
 // (esp_wifi_scan_start StoreProhibited -> Boot-Loop). WiFi.begin im AP_STA ist ok.
+// Folge: zuhause = Heim (Internet/OTA), im Auto (Heim weg) = Hub-AP primaer fuer
+// die Cockpit-Daten (vor S24, auch wenn der Handy-Hotspot an ist).
 static void wifiAutoTick() {
   if (!g_featureWifi || !g_wifiAuto) return;
   if (WiFi.status() == WL_CONNECTED) return;
-  static const uint8_t order[WPROF_COUNT] = { 2, 0, 1 };   // S24 > Heim > Hub-AP
+  static const uint8_t order[WPROF_COUNT] = { 0, 1, 2 };   // Heim > Hub-AP > S24
   static uint8_t  oi    = 0;
   static uint32_t tryAt = 0;
   if (millis() < tryAt) return;
