@@ -6,6 +6,7 @@
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_rgb.h"
+#include "esp_cache.h"
 
 #define HAL_I2C_SDA 15
 #define HAL_I2C_SCL 7
@@ -47,6 +48,9 @@ static esp_lcd_panel_handle_t hal_panel = nullptr;
 static uint16_t *hal_frame = nullptr;
 static bool hal_ready = false;
 static bool hal_otaPaused = false;
+static bool hal_frame_owned = false;     // true = eigener Malloc-Puffer (Fallback), false = Panel-FB
+static uint16_t *hal_fb_a = nullptr;     // echter Doppelpuffer: zwei interne Panel-FBs
+static uint16_t *hal_fb_b = nullptr;
 
 static uint8_t hal_pca_write_once(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(HAL_PCA9554_ADDR);
@@ -208,10 +212,10 @@ static bool hal_panel_init() {
     esp_lcd_panel_del(hal_panel);
     hal_panel = nullptr;
   }
-  if (hal_frame) {
-    heap_caps_free(hal_frame);
-    hal_frame = nullptr;
-  }
+  if (hal_frame && hal_frame_owned) heap_caps_free(hal_frame);  // nur eigenen Puffer freigeben, NICHT die Panel-FBs
+  hal_frame = nullptr;
+  hal_frame_owned = false;
+  hal_fb_a = hal_fb_b = nullptr;
 
   esp_lcd_rgb_panel_config_t cfg = {};
   cfg.clk_src = LCD_CLK_SRC_PLL160M;
@@ -269,18 +273,51 @@ void hal_backlight(bool on) {
   digitalWrite(HAL_LCD_BL, on ? HIGH : LOW);
 }
 
+// Beide internen Panel-Framebuffer holen (num_fbs=2): abwechselnd in den NICHT
+// angezeigten zeichnen + per draw_bitmap auf VSYNC umschalten = echter Doppelpuffer
+// (kein Kopieren -> kein Flackern/Wisch). Fallback: eigener PSRAM-Puffer.
+static bool hal_bind_framebuffer() {
+  if (!hal_panel) return false;
+  if (hal_frame && hal_frame_owned) { heap_caps_free(hal_frame); hal_frame = nullptr; hal_frame_owned = false; }
+  void *fb0 = nullptr, *fb1 = nullptr;
+  if (esp_lcd_rgb_panel_get_frame_buffer(hal_panel, 2, &fb0, &fb1) == ESP_OK && fb0 && fb1) {
+    hal_fb_a = (uint16_t *)fb0;
+    hal_fb_b = (uint16_t *)fb1;
+    hal_frame = hal_fb_b;          // fb0 wird angezeigt, in fb1 zeichnen
+    hal_frame_owned = false;
+    Serial.printf("hal_fb: double-buffer A=%p B=%p\n", hal_fb_a, hal_fb_b);
+    return true;
+  }
+  if (esp_lcd_rgb_panel_get_frame_buffer(hal_panel, 1, &fb0) == ESP_OK && fb0) {
+    hal_fb_a = hal_fb_b = (uint16_t *)fb0;
+    hal_frame = (uint16_t *)fb0;
+    hal_frame_owned = false;
+    Serial.printf("hal_fb: single FB %p\n", hal_frame);
+    return true;
+  }
+  return false;
+}
+
 uint16_t *hal_fb() {
   if (!hal_frame) {
-    hal_frame = (uint16_t *)heap_caps_malloc(480 * 480 * sizeof(uint16_t),
-                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    Serial.printf("hal_fb: %p\n", hal_frame);
+    if (!hal_bind_framebuffer()) {
+      hal_frame = (uint16_t *)heap_caps_malloc(480 * 480 * sizeof(uint16_t),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      hal_frame_owned = (hal_frame != nullptr);
+      Serial.printf("hal_fb: malloc fallback %p\n", hal_frame);
+    }
   }
   return hal_frame;
 }
 
 void hal_present() {
-  if (hal_frame && hal_panel) {
-    esp_lcd_panel_draw_bitmap(hal_panel, 0, 0, 480, 480, hal_frame);
+  if (!hal_frame || !hal_panel) return;
+  // CPU-Schreibzugriffe in den PSRAM-FB flushen, dann umschalten (VSYNC-Swap).
+  if (!hal_frame_owned) esp_cache_msync(hal_frame, 480 * 480 * sizeof(uint16_t), 0);
+  esp_lcd_panel_draw_bitmap(hal_panel, 0, 0, 480, 480, hal_frame);
+  // Naechster Frame in den jeweils ANDEREN Panel-FB.
+  if (!hal_frame_owned && hal_fb_a && hal_fb_b && hal_fb_a != hal_fb_b) {
+    hal_frame = (hal_frame == hal_fb_a) ? hal_fb_b : hal_fb_a;
   }
 }
 
