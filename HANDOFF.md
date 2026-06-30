@@ -37,11 +37,21 @@ e2718f0 HTTP poll: backoff + shorter timeouts
 
 ```bash
 pio run -e waveshare_s3_28c                                   # Build
-pio run -e waveshare_s3_28c -t upload --upload-port COM13     # Flash (USB)
+# OTA (bevorzugt, kein Kabel) - Display muss im Heimnetz sein:
+curl -F "firmware=@.pio/build/waveshare_s3_28c/firmware.bin" http://vdo-clock.local/update
+# oder per IP: http://192.168.0.76/update   (~118 KB/s, ~16 s; bei schwachem Signal evtl. 1x wiederholen)
+# USB-Fallback:
+pio run -e waveshare_s3_28c -t upload --upload-port COM13
 ```
+- ✅ **OTA funktioniert** (bewiesen 2026-06-30): `POST /update` multipart, Panel pausiert
+  automatisch, Gerät rebootet + kommt im Heimnetz wieder hoch. **COM13 nicht mehr nötig.**
+  Bei schwachem WLAN (Display-Antenne ist abgeschirmt, RSSI ~‑90 am Schreibtisch) kann der
+  erste Upload abreißen → einfach nochmal.
 - ⚠️ **USB-Auto-Reset nach dem Flash greift auf diesem Board NICHT zuverlässig** → die neue
   Firmware läuft erst nach einem Neustart. Dafür gibt es das Serial-Kommando **`reboot`**
-  (sendet `ESP.restart()`). Nach dem Flash also `reboot` über COM13 schicken.
+  (sendet `ESP.restart()`). Nach USB-Flash also `reboot` über COM13 schicken (OTA rebootet selbst).
+- **Serial-Setup ohne Touch:** `wifi:show` (Profile dumpen) und `wifi:set <slot> <SSID>|<Passwort>`
+  (case-sensitiv!) setzen WLAN-Zugänge direkt. Heim = `Z00-Station` (Profil 0).
 - Serial lesen NICHT mit `pio device monitor` (resettet), sondern RTS/DTR=0. STAT-Zeile
   alle 5 s: `STAT up=.. ip=.. wifi=.. prof=.. httpRx=.. canRx=.. src=.. age=.. heap=..`.
 - Weitere Serial-Cmds: `can:test`/`can:rx`, `imu:null`, `wifi:next`, `ap:on`, `123:on`.
@@ -74,9 +84,12 @@ pio run -e waveshare_s3_28c -t upload --upload-port COM13     # Flash (USB)
 
 ## 4. Offene Punkte / TODO
 
-1. **WLAN-Seite + WPS flashen & testen** (`9245db0`) — WPS am echten Router (Z00-Station)
-   prüfen: WLAN-Seite → „WPS verbinden", Router-WPS-Taste drücken → sollte verbinden und
-   ins Heim-Profil speichern. Tastatur (Page 10) ist nur noch Fallback; ggf. noch kleiner.
+1. **WLAN/WPS — erledigt, mit Einschränkung.** Geflasht & getestet. **WPS klappt mit dieser
+   FRITZ!Box NICHT** (PBC-Timeout, router-seitig) — die Zugangsdaten wurden stattdessen per
+   `wifi:set 0 Z00-Station|<pw>` gesetzt; Z00 hängt (IP 192.168.0.76). **Offen: schwaches
+   WLAN-Signal am Display** (RSSI ~‑90 trotz 3 m → Antenne durch RGB-Panel/Flachband
+   abgeschirmt). Fürs Auto egal (Hub-AP ist cm-nah), aber Heim-OTA kann dadurch mal abreißen.
+   Optional: bessere Platzierung/Antenne; Tastatur (Page 10) ggf. noch kleiner.
 2. **Lambda-Verlauf-Seite** (`b8506a7`, gebaut, noch nicht geflasht): 2. Stil der LAMBDA-Seite
    (Page 3) — Linien-Graph **λ über Zeit** (60 s) mit Soll-Band + Drehzahl-Kontextlinie.
    **Langer Druck Mitte** schaltet Gauge↔Verlauf (wie MOTOR), persistent (`lstyle`).
