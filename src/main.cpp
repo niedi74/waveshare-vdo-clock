@@ -2755,7 +2755,9 @@ void loop() {
     if (c == '\n' || c == '\r') {
       if (serialLine.length() > 0) {
         String cmd = serialLine; serialLine = "";
-        cmd.trim(); cmd.toLowerCase();
+        cmd.trim();
+        String rawCmd = cmd;            // Original-Schreibweise behalten (SSID/Passwort case-sensitiv!)
+        cmd.toLowerCase();
         if      (cmd == "ble:on")  { saveFeatures(g_featureWifi, true, g_featureBuzzer); }
         else if (cmd == "ble:off") { saveFeatures(g_featureWifi, false, g_featureBuzzer); }
         else if (cmd == "buzzer:on")  { saveFeatures(g_featureWifi, g_featureBle, true); }
@@ -2774,6 +2776,27 @@ void loop() {
           Serial.printf("WLAN-Auto = %s\n", g_wifiAuto ? "AN (S24>Heim>Hub)" : "AUS");
         }
         else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
+        else if (cmd == "wifi:show") {           // alle Profile dumpen (Debug)
+          for (int i = 0; i < WPROF_COUNT; i++)
+            Serial.printf("Profil %d (%s): ssid='%s' pass='%s' hubip='%s'\n",
+                          i, WPROF_LABELS[i], g_wprof[i].ssid, g_wprof[i].pass, g_wprof[i].hubip);
+        }
+        else if (cmd.startsWith("wifi:set ")) {  // wifi:set <slot> <SSID>|<Passwort> (case-sensitiv!)
+          String rest = rawCmd.substring(9);
+          int sp = rest.indexOf(' ');
+          if (sp > 0) {
+            int slot = rest.substring(0, sp).toInt();
+            String body = rest.substring(sp + 1);
+            int bar = body.indexOf('|');
+            if (slot >= 0 && slot < WPROF_COUNT && bar >= 0) {
+              String ss = body.substring(0, bar), pw = body.substring(bar + 1);
+              saveWprof((uint8_t)slot, ss.c_str(), pw.c_str(), g_wprof[slot].hubip);
+              selectWprof((uint8_t)slot);
+              Serial.printf("wifi:set Profil %d ssid='%s' pass-len=%u -> aktiv+verbinde\n",
+                            slot, ss.c_str(), (unsigned)pw.length());
+            } else Serial.println("wifi:set: nutze 'wifi:set 0 SSID|Passwort'");
+          }
+        }
         else if (cmd == "wifi:off")  { saveFeatures(false, g_featureBle, g_featureBuzzer); g_redrawPage = true; }
         else if (cmd == "rot:+") { saveRotation(g_rotationDeg + 1); g_redrawPage = true; }
         else if (cmd == "rot:-") { saveRotation(g_rotationDeg - 1); g_redrawPage = true; }
