@@ -132,6 +132,7 @@ static void startWebServer();   // forward declaration
 static bool        g_sdMounted = false;   // Micro-SD: Mount-Status (Test)
 static uint32_t    g_sdSizeMB  = 0;
 static const char* g_sdType    = "-";
+static int         g_sdWifiLoaded = -2;   // -2=keine SD/Datei, -1=Vorlage angelegt, >=0=Profile geladen
 static void reconnectWifiProfile();
 static void cycleWifiProfile();
 static void updateRotationCache();
@@ -1640,7 +1641,10 @@ static void drawHubPage() {
   if (wok) snprintf(wbuf, sizeof(wbuf), "%ddBm", (int)WiFi.RSSI());
   else     snprintf(wbuf, sizeof(wbuf), "%s", wifiReasonText(g_wifiStaReason));
   drawDataRow(330, "WLAN",   wbuf, wok ? gr : og);
-  drawTextCentered(240, 362, "TIP MENU", RGB565(180, 180, 170), 2);
+  char sdb[20];
+  if (g_sdMounted) snprintf(sdb, sizeof(sdb), "%s %luG", g_sdType, (unsigned long)((g_sdSizeMB + 512) / 1024));
+  else             strcpy(sdb, "---");
+  drawDataRow(362, "SD", sdb, g_sdMounted ? gr : dk);
   presentFrame();
 }
 
@@ -2469,7 +2473,7 @@ static void startWebServer() {
   webServer.on("/update",  HTTP_POST, handleOtaDone, handleOtaUpload);
   webServer.on("/sd", []() {
     char b[96];
-    snprintf(b, sizeof(b), "mounted=%d type=%s sizeMB=%lu", g_sdMounted ? 1 : 0, g_sdType, (unsigned long)g_sdSizeMB);
+    snprintf(b, sizeof(b), "mounted=%d type=%s sizeMB=%lu wifitxt=%d", g_sdMounted ? 1 : 0, g_sdType, (unsigned long)g_sdSizeMB, g_sdWifiLoaded);
     webServer.send(200, "text/plain", b);
   });
   webServer.begin();
@@ -2589,7 +2593,45 @@ static void cycleWifiProfile() {                 // zum naechsten belegten Profi
   }
 }
 
-// ===== Micro-SD mounten (nur Test: Typ/Groesse erkennen) =====
+// ===== Micro-SD: WLAN-Profile aus /wifi.txt laden (oder Vorlage anlegen) =====
+// Format je Zeile:  <Slot>=<SSID>|<Passwort>   (0=Heim 1=Hub-AP 2=S24), '#' = Kommentar.
+static void loadWifiFromSd() {
+  if (!g_sdMounted) return;
+  if (!SD_MMC.exists("/wifi.txt")) {                 // noch keine Datei -> Vorlage mit aktuellen Profilen
+    File w = SD_MMC.open("/wifi.txt", FILE_WRITE);
+    if (w) {
+      w.println("# WLAN-Profile:  <Slot>=<SSID>|<Passwort>   (0=Heim 1=Hub-AP 2=S24)");
+      for (int i = 0; i < WPROF_COUNT; i++)
+        if (g_wprof[i].ssid[0]) w.printf("%d=%s|%s\n", i, g_wprof[i].ssid, g_wprof[i].pass);
+      w.close();
+      g_sdWifiLoaded = -1;
+      Serial.println("SD: /wifi.txt Vorlage angelegt (aktuelle Profile)");
+    }
+    return;
+  }
+  File f = SD_MMC.open("/wifi.txt", FILE_READ);
+  if (!f) return;
+  int n = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();                                     // entfernt \r und Rand-Leerzeichen
+    if (line.length() == 0 || line[0] == '#') continue;
+    int eq = line.indexOf('='), bar = line.indexOf('|');
+    if (eq < 1 || bar <= eq) continue;
+    int slot = line.substring(0, eq).toInt();
+    if (slot < 0 || slot >= WPROF_COUNT) continue;
+    String ssid = line.substring(eq + 1, bar);
+    String pass = line.substring(bar + 1);
+    saveWprof((uint8_t)slot, ssid.c_str(), pass.c_str(), g_wprof[slot].hubip);  // -> g_wprof + NVS
+    n++;
+    Serial.printf("SD wifi.txt: Profil %d = '%s' (pw-len %u)\n", slot, ssid.c_str(), (unsigned)pass.length());
+  }
+  f.close();
+  g_sdWifiLoaded = n;
+  Serial.printf("SD: %d WLAN-Profil(e) aus /wifi.txt geladen\n", n);
+}
+
+// ===== Micro-SD mounten + wifi.txt verarbeiten =====
 static void setupSdCard() {
   hal_free_lcd_spi();                                   // Pins 1/2 vom LCD-SPI freigeben
   hal_sd_d3_high();                                     // EXIO4 (SD_D3) Output + HIGH
@@ -2604,6 +2646,7 @@ static void setupSdCard() {
   g_sdMounted = true;
   Serial.printf("SD: OK %s %luMB (frei %lluMB)\n", g_sdType, (unsigned long)g_sdSizeMB,
                 (unsigned long long)((SD_MMC.totalBytes() - SD_MMC.usedBytes()) / (1024ULL * 1024ULL)));
+  loadWifiFromSd();
 }
 
 void setup() {
