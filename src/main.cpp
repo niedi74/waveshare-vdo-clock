@@ -261,8 +261,32 @@ static void initTimeSource() {
   prefs.end();
 }
 
+// ---- WLAN-Diagnose: letzter STA-Disconnect-Grund (Klartext) + RSSI ----
+// Portiert aus deep-search b25c270 (nur Diagnose-Teil). Hilft beim Z00-Verbinden:
+// zeigt WARUM es nicht geht (falsches PW / Netz nicht da / keine IP) statt nur "weg".
+static volatile uint8_t g_wifiStaReason = 0;
+static void onWifiStaEvent(arduino_event_id_t ev, arduino_event_info_t info) {
+  if      (ev == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) g_wifiStaReason = info.wifi_sta_disconnected.reason;
+  else if (ev == ARDUINO_EVENT_WIFI_STA_GOT_IP)       g_wifiStaReason = 0;
+}
+static const char* wifiReasonText(uint8_t r) {
+  switch (r) {
+    case 0:   return "-";
+    case 201: return "Netz n.gef.";   // NO_AP_FOUND: SSID nicht in Reichweite/falsch
+    case 202: return "falsches PW";   // AUTH_FAIL
+    case 15:  return "falsches PW";   // 4WAY_HANDSHAKE_TIMEOUT
+    case 2:   return "Auth weg";
+    case 8:   return "keine IP";
+    case 200: return "Beacon weg";
+    case 205: return "Connect-Fail";
+    default:  return "Abbruch";
+  }
+}
+
 // Non-blocking WiFi/NTP handler. Returns true on fresh NTP sync.
 static bool wifiNtpTick() {
+  static bool staEvtReg = false;
+  if (!staEvtReg) { WiFi.onEvent(onWifiStaEvent); staEvtReg = true; }
   static bool     sntpStarted = false;
   static bool     ntpSynced   = false;
   static uint32_t lastTry     = 0;
@@ -1607,7 +1631,12 @@ static void drawHubPage() {
                              g_tune123Conn ? gr : (g_feature123 ? og : dk));
   drawDataRow(266, "HUBIP",  g_hubIp.c_str(), RGB565(150, 200, 150));
   drawDataRow(300, "IP",     g_ipStr, RGB565(150, 200, 150));
-  drawTextCentered(240, 360, "TIP MENU", RGB565(180, 180, 170), 2);
+  char wbuf[20];
+  bool wok = (WiFi.status() == WL_CONNECTED);
+  if (wok) snprintf(wbuf, sizeof(wbuf), "%ddBm", (int)WiFi.RSSI());
+  else     snprintf(wbuf, sizeof(wbuf), "%s", wifiReasonText(g_wifiStaReason));
+  drawDataRow(330, "WLAN",   wbuf, wok ? gr : og);
+  drawTextCentered(240, 362, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
 
@@ -2844,9 +2873,11 @@ void loop() {
   static uint32_t lastStat = 0;
   if (millis() - lastStat >= 5000) {
     lastStat = millis();
-    Serial.printf("STAT up=%lus ip=%s wifi=%d prof=%s httpRx=%lu canRx=%lu src=%s age=%lums heap=%u\n",
+    Serial.printf("STAT up=%lus ip=%s wifi=%d prof=%s rssi=%d wr=%s httpRx=%lu canRx=%lu src=%s age=%lums heap=%u\n",
                   (unsigned long)(millis() / 1000), g_ipStr, (int)WiFi.status(),
-                  WPROF_LABELS[g_wifiProfile], (unsigned long)g_httpRx, (unsigned long)g_canRx,
+                  WPROF_LABELS[g_wifiProfile],
+                  (WiFi.status() == WL_CONNECTED) ? (int)WiFi.RSSI() : 0, wifiReasonText(g_wifiStaReason),
+                  (unsigned long)g_httpRx, (unsigned long)g_canRx,
                   g_lastSrc, g_httpLastRxMs ? (unsigned long)(millis() - g_httpLastRxMs) : 0UL,
                   (unsigned)ESP.getFreeHeap());
   }
