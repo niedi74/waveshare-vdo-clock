@@ -301,6 +301,8 @@ static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
 static bool      g_featureEspNow = true;
+static volatile uint8_t g_wifiStaReason    = 0;      // letzter STA-Disconnect-Reason
+static volatile bool    g_wifiHomeNotFound = false;  // Ziel-SSID beim Scan nicht gefunden
 static uint8_t   g_espNowChannelPref = 0;  // 0=auto (WiFi), sonst 1..14 (nur noch fuer NVS-Altlast)
 
 #if !ENABLE_ESP_NOW_CLIENT
@@ -497,6 +499,9 @@ struct WifiProfile {
 #ifndef HUB_SETUP_WIFI_SSID
 #define HUB_SETUP_WIFI_SSID "Spartan3-Setup"
 #endif
+#ifndef HUB_SETUP_WIFI_SSID2
+#define HUB_SETUP_WIFI_SSID2 "Spartan3-TestHub"
+#endif
 #ifndef HUB_SETUP_WIFI_PASS
 #define HUB_SETUP_WIFI_PASS "lambda123"
 #endif
@@ -540,12 +545,13 @@ static uint8_t preferredHomeWifiProfileIndex() {
 }
 
 static bool isBusWifiSsid(const char* ssid) {
-  return ssid && strcmp(ssid, HUB_SETUP_WIFI_SSID) == 0;
+  return ssid && (strcmp(ssid, HUB_SETUP_WIFI_SSID) == 0 ||
+                  strcmp(ssid, HUB_SETUP_WIFI_SSID2) == 0);
 }
 
 static bool isOnBusWifi() {
   if (isBusWifiSsid(currentWifiSsid())) return true;
-  return WiFi.status() == WL_CONNECTED && WiFi.SSID() == HUB_SETUP_WIFI_SSID;
+  return WiFi.status() == WL_CONNECTED && isBusWifiSsid(WiFi.SSID().c_str());
 }
 
 static void syncHubHostForWifi() {
@@ -854,7 +860,7 @@ static bool wifiNtpTick() {
 
   if (WiFi.status() != WL_CONNECTED) {
     if (failSince == 0) failSince = millis();
-    if (millis() - lastTry > 30000) {
+    if (millis() - lastTry > 5000) {   // schneller Reconnect, toleriert kurzen AP-Ausfall (5-20s)
       lastTry = millis();
       applyWifiIpConfig();
       WiFi.begin(currentWifiSsid(), currentWifiPassword());  // kein disconnect() davor
@@ -3587,6 +3593,30 @@ static void onWifiWpsEvent(arduino_event_id_t ev, arduino_event_info_t) {
   }
 }
 
+// Allgemeiner STA-Event-Handler: Disconnect-Reason erfassen (Diagnose) +
+// "Home nicht gefunden" markieren. Reconnect macht Arduino/setAutoReconnect.
+static void onWifiStaEvent(arduino_event_id_t ev, arduino_event_info_t info) {
+  if (ev == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    g_wifiStaReason = info.wifi_sta_disconnected.reason;
+    if (g_wifiStaReason == WIFI_REASON_NO_AP_FOUND) g_wifiHomeNotFound = true;
+  } else if (ev == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    g_wifiStaReason = 0;
+    g_wifiHomeNotFound = false;
+  }
+}
+
+static const char* wifiReasonText(uint8_t r) {
+  switch (r) {
+    case 0:   return "OK";
+    case 8:   return "keine IP";     // nach Assoc raus (DHCP/Router)
+    case 201: return "Home n.gef.";  // WIFI_REASON_NO_AP_FOUND
+    case 15:  return "Auth/4way";    // 4WAY_HANDSHAKE_TIMEOUT
+    case 2:   return "Auth?";        // AUTH_EXPIRE
+    case 205: return "Conn lost";    // CONNECTION_FAIL
+    default:  return "Funk?";
+  }
+}
+
 static void startWps() {
   static bool evtRegistered = false;
   if (!evtRegistered) { WiFi.onEvent(onWifiWpsEvent); evtRegistered = true; }
@@ -3715,15 +3745,24 @@ static void drawSetup2Page() {
   drawDataRow(154, "BLE SRC", g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "SPARTAN" : "123 DIREKT",
               g_bleConnMode == BLE_MODE_SPARTAN_HUB ? RGB565(120, 200, 120) : RGB565(235, 150, 60));
   {
-    char ebuf[20];
-    if (!g_featureEspNow) snprintf(ebuf, sizeof(ebuf), "AUS");
-    else if (espNowDataFresh()) snprintf(ebuf, sizeof(ebuf), "OK rx%lu", (unsigned long)g_espNowRx);
-    else snprintf(ebuf, sizeof(ebuf), "AN %s", espNowChannelLabel());
-    drawDataRow(196, "ESPNOW", ebuf,
-                g_featureEspNow && espNowDataFresh() ? RGB565(60, 210, 100) :
-                (g_featureEspNow ? RGB565(220, 180, 60) : RGB565(150, 150, 150)));
+    char chbuf[20];
+    if (WiFi.status() == WL_CONNECTED) {
+      if (g_apOn) snprintf(chbuf, sizeof(chbuf), "STA:%u AP:%u", WiFi.channel(), WiFi.softAPChannel());
+      else        snprintf(chbuf, sizeof(chbuf), "STA:%u", WiFi.channel());
+    } else if (g_apOn) {
+      snprintf(chbuf, sizeof(chbuf), "AP:%u", WiFi.softAPChannel());
+    } else {
+      strcpy(chbuf, "---");
+    }
+    drawDataRow(196, "WLAN-CH", chbuf, RGB565(120, 180, 240));
   }
-  drawDataRow(238, "ESPN CH", espNowChannelLabel(), RGB565(120, 180, 240));
+  {
+    char wrbuf[24];
+    if (WiFi.status() == WL_CONNECTED) snprintf(wrbuf, sizeof(wrbuf), "OK %ddBm", (int)WiFi.RSSI());
+    else snprintf(wrbuf, sizeof(wrbuf), "%s", wifiReasonText(g_wifiStaReason));
+    drawDataRow(238, "WLAN", wrbuf,
+                WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  }
   drawDataRow(280, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
               g_featureBuzzer ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
   drawDataRow(322, "QUELLE", sourceModeLabel(),
@@ -5005,6 +5044,16 @@ static void handleWebStatus() {
   else json += F("off");
   json += F("\",\"wifi_ap_on\":");
   json += g_apOn ? F("true") : F("false");
+  json += F(",\"wifi_sta_channel\":");
+  json += String((int)(WiFi.status() == WL_CONNECTED ? WiFi.channel() : 0));
+  json += F(",\"wifi_sta_rssi\":");
+  json += String((int)(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0));
+  json += F(",\"wifi_ap_channel\":");
+  json += String((int)(g_apOn ? WiFi.softAPChannel() : 0));
+  json += F(",\"wifi_sta_reason\":");
+  json += String((int)g_wifiStaReason);
+  json += F(",\"wifi_home_not_found\":");
+  json += g_wifiHomeNotFound ? F("true") : F("false");
   json += F(",\"hub_host\":\"");
   json += jsonEscape(String(g_hubHost));
   json += F("\",\"hub_wifi_ok\":");
@@ -5749,6 +5798,9 @@ static void reconnectWifiProfile() {
   const String hostName = configuredHostname();
   WiFi.setHostname(hostName.c_str());
   WiFi.mode(WIFI_STA);
+  static bool wifiEvtReg = false;
+  if (!wifiEvtReg) { WiFi.onEvent(onWifiStaEvent); wifiEvtReg = true; }
+  WiFi.setAutoReconnect(true);
   applyWifiIpConfig();
   WiFi.begin(currentWifiSsid(), currentWifiPassword());
   Serial.printf("WiFi: Profil %u -> '%s'\n", g_wifiProfile, currentWifiSsid());
