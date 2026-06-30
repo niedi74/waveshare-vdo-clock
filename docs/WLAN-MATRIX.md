@@ -1,5 +1,9 @@
 ﻿# WLAN & Hub - Kurzuebersicht fuer M5 und Waveshare
 
+> **Firmware-Quelle = Trunk `claude/cranky-proskuriakova-cafad7`** (kanonisch:
+> dessen `HANDOFF.md`). Diese Doku spiegelt den Trunk-Stand; ESP-NOW ist dort
+> **gestrichen**.
+
 ## Neue Ausrichtung
 
 Der Motorraum-Hub `Spartan3-Hub` ist die zentrale Datenquelle. Im Fahrbetrieb soll er moeglichst wenig BLE-Radio-Last haben:
@@ -8,34 +12,38 @@ Der Motorraum-Hub `Spartan3-Hub` ist die zentrale Datenquelle. Im Fahrbetrieb so
 | --- | --- |
 | Spartan 3 v2 -> Hub | CAN Lambda, UART Setup |
 | 123TUNE+ -> Display | Direkt-BLE am Display, wenn benoetigt |
-| Hub -> Displays | ESP-NOW Broadcast, Kanal 6 |
+| Hub -> Displays | **WiFi-HTTP `/api/status`** (primaer) + CAN `0x510` (geplant) |
 | Displays -> Hub | HTTP `/api/status` als Fallback und fuer Zeit |
 | Hub -> Internet | Optional ueber Handy-Hotspot fuer NTP |
 
-ESP-NOW ist fuer Live-Daten der bevorzugte Weg. HTTP bleibt wichtig fuer Diagnose, Setup und `time_epoch`.
+WiFi-HTTP ist der **primaere** Live-Pfad (ESP-NOW gestrichen). **CAN `0x510`** (listen-only, RX=GPIO44/TX=GPIO43) ist die geplante Primaerquelle, sobald verkabelt.
 
 ## Profile
 
-| Profil | SSID | Display-IP | Hub-Host | Zweck |
-| --- | --- | --- | --- | --- |
-| Home | `Z00-Station` | DHCP | `192.168.0.87` oder gespeicherter Host | Werkstatt, Debug, OTA |
-| Phone | `Android-AP1` | DHCP | Gateway-IP oder gespeicherter Host | Unterwegs mit Handy-Uplink |
-| Bus | `Spartan3-Setup` | `192.168.4.3` | `192.168.4.1` | Fahrtprofil, ESP-NOW ch6 + HTTP-Fallback |
+Trunk-Profile `g_wprof[3]`:
 
-M5 Dial nutzt im Bus-Profil `.2`, Waveshare nutzt `.3`, der Hub bleibt `.1`.
+| Slot | Profil | SSID / PW | Hub-Host | In Auto-Kette? |
+| --- | --- | --- | --- | --- |
+| 0 | Heim | `Z00-Station` | Heim-LAN | ja |
+| 1 | **Hub-AP** | `Spartan3-TestHub` / `lambda123` | Hub-AP (`192.168.4.x`) | **ja, primaer** |
+| 2 | S24 | `Android-AP1` / `Frankfurt1` (mDNS `spartanhub.local`) | Gateway | **nur manuell** |
+
+**Auto-Fallback** `wifiAutoTick()`: **ohne Scan** (Scan crasht), probiert
+**Hub-AP > Heim** je ~6 s. Beim Boot ist der Hub-AP die primaere Datenverbindung;
+S24 reisst die Auto-Kette nicht an sich. AP-Kanal folgt zwangsweise dem STA-Kanal
+(ein Funkmodul) — kein Hardcode.
 
 ## Datenpfad-Prioritaet
 
 > **ESP-NOW entfernt** (`ENABLE_ESP_NOW_CLIENT=0`). Hub-Livedaten laufen jetzt
 > primaer ueber WiFi-HTTP.
 
-1. WiFi HTTP `GET /api/status` (primaer, Hub-AP `192.168.4.1` oder Heim-LAN)
-2. BLE Hub-Notify (ASCII `L..R..A..M..`)
-3. Direct 123TUNE+ BLE (Drehzahl/Zuendung direkt vom Verteiler)
-4. RTC/Build-Zeit als letzter Rueckfall
+1. **WiFi-HTTP** `GET /api/status` (primaer, Hub-AP bzw. Heim-LAN)
+2. **CAN `0x510`** (geplant, sobald verkabelt)
+3. BLE-Hub-Notify (ASCII `L..R..A..M..`, optional/default aus)
+4. Direct 123TUNE+ BLE (Drehzahl/Zuendung direkt, optional/default aus)
 
-> Hinweis: `include/spartan_cockpit_frame.h` bleibt fuer den Hub relevant, wird
-> im Display-Build aber nicht mehr genutzt.
+> ESP-NOW ist **gestrichen**; `include/spartan_cockpit_frame.h` = Legacy.
 
 ## Zeit
 
@@ -51,9 +59,9 @@ Der Hub ist bis zur stabilen RTC-Versorgung der Time-Master.
 
 | Geraet | Umschalten |
 | --- | --- |
-| Waveshare 2.8C | Touch Setup oder WebGUI, Profil `Bus` fuer Fahrbetrieb |
+| Waveshare 2.8C | Setup -> WIFI: kurz=Profil wechseln, lang=Tastatur; **WLAN-Seite Page 11** (WPS / Passwort / Profil) |
 | M5 Dial | Settings/System/WiFi, Profil `Bus` fuer Fahrbetrieb |
-| Hub | WebGUI `Spartan3-Setup`, Funktionen: ESP-NOW an, AP an, BLE 123/BM6 nur bei Bedarf |
+| Hub | WebGUI, Funktionen: AP an, CAN 0x510, BLE 123/BM6 nur bei Bedarf |
 
 ## Zugangsdaten
 

@@ -5,11 +5,18 @@
 This repository is the Waveshare ESP32-S3-Touch-LCD-2.8C round cockpit display.
 It is not the motor-room hub. The hub lives in `niedi74/spartan3v2-can-adapter`.
 
-## Current Direction
+## Firmware source of truth
 
-- Primary driving data path: ESP-NOW broadcast from `Spartan3-Hub` on channel 6.
-- Fallback/status path: WiFi HTTP poll of `http://192.168.4.1/api/status` on the bus profile.
-- BLE to `Spartan3-Hub` is only a fallback/debug path.
+- The firmware **trunk** is branch `claude/cranky-proskuriakova-cafad7` (canonical:
+  its `HANDOFF.md`). This deep-search branch maintains **docs/research/protocol
+  headers only** — no firmware features.
+
+## Current Direction (trunk)
+
+- Primary data path: **WiFi-HTTP `/api/status`** -> **CAN `0x510`** -> BLE-Hub
+  (opt., default off) -> 123TUNE+ direct (opt., default off). **ESP-NOW is dropped.**
+- WiFi auto-fallback (no scan): **Hub-AP > Home**, ~6 s each; S24 manual only.
+- WLAN page (Page 11) + WPS; on-screen keyboard (Page 10) as fallback.
 - Direct 123TUNE+ BLE can stay for standalone testing, but the normal bus setup should avoid competing with M5/Hub BLE.
 - Hub time is the time master when `/api/status` reports `ntp_synced:true` and `time_epoch`.
 

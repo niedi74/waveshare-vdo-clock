@@ -3,12 +3,16 @@
 > Überblick, welches Repo welche Logik hält und was zwischen den Projekten
 > geteilt wird/werden sollte. Bezug: VW-T2b-Cockpit mit Spartan-Hub als Gateway
 > und mehreren Displays.
+>
+> **Firmware-Quelle = Trunk `claude/cranky-proskuriakova-cafad7`** (kanonisch:
+> dessen `HANDOFF.md`). Dieser deep-search-Branch pflegt **Docs/Research/
+> Protokoll-Header**, keine Firmware-Features.
 
 ## Repos & Rollen
 
 | Repo | Rolle | 123-BLE | ESP-NOW | CAN | Anzeige |
 | --- | --- | --- | --- | --- | --- |
-| **waveshare-vdo-clock** *(dieses)* | VDO-Rund-Display | Client (direct/Hub) | **RX** | – | ST7701 480×480 |
+| **waveshare-vdo-clock** *(dieses)* | VDO-Rund-Display | Client (direct/Hub, opt.) | – (gestrichen) | **0x510** (geplant) + WiFi-HTTP | ST7701 480×480 |
 | **m5stack-123** | M5Dial 123-Ignition-Board | Client (Original-RE) | **RX** | – | M5Dial |
 | **spartan3v2-can-adapter** | **Spartan-Hub / Gateway** | Client | **TX (Broadcast)** | Spartan λ (ID 0x400, 500 kbit/s) | I2C-LCD + Web |
 | **norbi-espnow** | ESP-NOW-Monorepo: Doku + `tools/bus-debug-dashboard` | – | Doku/Debug | – | – |
@@ -30,17 +34,18 @@ Reed-Speed ──GPIO27─────┘   • packt SpartanCockpitFrame (17B, 
    + optional Direct-123-BLE         + optional Direct-123-BLE
 ```
 
-Datenpfad-Priorität in den Displays: **ESP-NOW → Direct-123-BLE → Hub-BLE →
-WiFi-HTTP** (NVS-gesteuert; `feat_espnow`, `data_path`, `ble_mode` etc., siehe
-`CODEX-HANDOFF.md`).
+> ⚠️ **Stand veraltet (Hub-zentriert / ESP-NOW).** Der Firmware-Trunk
+> `claude/cranky-proskuriakova-cafad7` (Quelle: dessen `HANDOFF.md`) hat **ESP-NOW
+> gestrichen**. Aktuelle Display-Datenpfad-Priorität:
+> **WiFi-HTTP `/api/status` (primär) → CAN `0x510` → BLE-Hub (opt.) → 123-direkt
+> (opt.)**. Das Diagramm oben zeigt den alten ESP-NOW-Broadcast-Weg (Legacy).
 
 ## Geteilte Artefakte
 
-### ✅ Bereits kanonisch geteilt
-- **`include/spartan_cockpit_frame.h`** — binäres ESP-NOW-Frame (17B, v2, CRC8,
-  Encode/Decode-Helper). Datei trägt den Hinweis *„Copy this header into
-  M5/Waveshare firmware"* → **single source of truth**; bei Änderungen in **alle**
-  Display-Repos kopieren und `kSpartanCockpitVersion` hochziehen.
+### ⚠️ Legacy (ESP-NOW gestrichen)
+- **`include/spartan_cockpit_frame.h`** — binäres ESP-NOW-Frame (17B, v2, CRC8).
+  Der Trunk hat **ESP-NOW gestrichen**; dieser Header wird **nicht mehr gepflegt**
+  und im Display-Build nicht genutzt (nur historisch relevant für den Hub).
 
 ### ✅ Neu kanonisch geteilt: `include/tune123_decode.h`
 - **123-Frame-Decoder** (NUS-UUIDs + Opcode-/Handshake-Konstanten +
@@ -56,12 +61,12 @@ WiFi-HTTP** (NVS-gesteuert; `feat_espnow`, `data_path`, `ble_mode` etc., siehe
     `kTune123PingIntervalMs 1650`) liegen ebenfalls im Header; die Schreib-/
     Keepalive-Logik bleibt pro Firmware.
 
-## Konsistenz-Checkliste bei 123-/ESP-NOW-Änderungen
+## Konsistenz-Checkliste bei 123-Änderungen
 1. Opcode-Tabelle (inkl. `0x35`) in allen drei Firmwares gleich? → am besten
    `include/tune123_decode.h` 1:1 kopieren statt nachpflegen.
 2. NUS-UUIDs + `$`/`\r`-Handshake identisch? → `tune123_decode.h` / Handshake-Doku.
-3. `SpartanCockpitFrame`-Version & Felder synchron kopiert?
-4. Datenpfad-Priorität/NVS-Keys dokumentiert? → `CODEX-HANDOFF.md`.
+3. Datenpfad-Priorität (HTTP → CAN 0x510 → BLE-Hub → 123) konsistent? → Trunk
+   `HANDOFF.md`.
 
 ## Verwandte Dokumente
 - [`123TUNE-BLE-Protokoll.md`](123TUNE-BLE-Protokoll.md) — UUIDs, Frame, Skalierung

@@ -78,7 +78,12 @@ Beispiel: `L0.95R2500A15M45V13.5S65I12.5T85C3.2`
 
 ---
 
-## 4) ESP-NOW-Frame (primärer Pfad) — verifiziert
+## 4) ESP-NOW-Frame (LEGACY — Pfad gestrichen)
+
+> ⚠️ Der Firmware-Trunk `claude/cranky-proskuriakova-cafad7` hat **ESP-NOW
+> gestrichen**. Dieser Abschnitt + `spartan_cockpit_frame.h` sind nur noch
+> historisch; primärer Pfad ist **WiFi-HTTP `/api/status` → CAN `0x510`**.
+> Der NUS-Decoder/`tune123_decode.h` (oben) bleibt gültig und kanonisch.
 
 Binäres 17-Byte-Frame `SpartanCockpitFrame` (`include/spartan_cockpit_frame.h`,
 v2, Magic `0x53`, CRC8). Felder u.a.: `lambda_x1000`, `rpm`, `advance_x10`,
