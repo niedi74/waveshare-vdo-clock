@@ -2164,6 +2164,50 @@ static void saveFeature123(bool on) {
 }
 
 // -------- Web-GUI --------
+// --- SD/WLAN-Helfer fuer die WebGUI ---
+static String htmlEscape(const String& in) {
+  String o; o.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if      (c == '&') o += "&amp;";
+    else if (c == '<') o += "&lt;";
+    else if (c == '>') o += "&gt;";
+    else o += c;
+  }
+  return o;
+}
+static String sdReadWifiTxt() {
+  if (!g_sdMounted || !SD_MMC.exists("/wifi.txt")) return String("");
+  File f = SD_MMC.open("/wifi.txt", FILE_READ);
+  if (!f) return String("");
+  String s = f.readString();
+  f.close();
+  return s;
+}
+// /wifi.txt parsen -> g_wprof + NVS. Anzahl geladener Profile (-2 = keine Datei).
+static int sdApplyWifiTxt() {
+  if (!g_sdMounted || !SD_MMC.exists("/wifi.txt")) return -2;
+  File f = SD_MMC.open("/wifi.txt", FILE_READ);
+  if (!f) return -2;
+  int n = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0 || line[0] == '#') continue;
+    int eq = line.indexOf('='), bar = line.indexOf('|');
+    if (eq < 1 || bar <= eq) continue;
+    int slot = line.substring(0, eq).toInt();
+    if (slot < 0 || slot >= WPROF_COUNT) continue;
+    String ssid = line.substring(eq + 1, bar);
+    String pass = line.substring(bar + 1);
+    saveWprof((uint8_t)slot, ssid.c_str(), pass.c_str(), g_wprof[slot].hubip);
+    n++;
+    Serial.printf("wifi.txt: Profil %d = '%s' (pw-len %u)\n", slot, ssid.c_str(), (unsigned)pass.length());
+  }
+  f.close();
+  return n;
+}
+
 static void handleWebRoot() {
   struct tm now = {};
   readClockTime(&now);
@@ -2190,7 +2234,8 @@ static void handleWebRoot() {
     "<button class='tabbtn' onclick=\"sh('wlan',this)\">WLAN</button>"
     "<button class='tabbtn' onclick=\"sh('anz',this)\">Anzeige</button>"
     "<button class='tabbtn' onclick=\"sh('imu',this)\">IMU</button>"
-    "<button class='tabbtn' onclick=\"sh('sys',this)\">System</button></div>");
+    "<button class='tabbtn' onclick=\"sh('sys',this)\">System</button>"
+    "<button class='tabbtn' onclick=\"sh('sd',this)\">SD</button></div>");
 
   // ===== Tab: Live =====
   html += F("<div class='tab on' id='t-live'>");
@@ -2310,6 +2355,29 @@ static void handleWebRoot() {
     "<input type='file' name='firmware' accept='.bin' style='width:88%;margin:6px'><br>"
     "<button type='submit'>Firmware flashen</button></form>"
     "<div style='color:#888'>.bin aus .pio/build/waveshare_s3_28c/firmware.bin</div></div>");
+  html += F("</div>");
+
+  // ===== Tab: SD =====
+  html += F("<div class='tab' id='t-sd'><div class='card'><h3>SD-Karte</h3>");
+  if (g_sdMounted) {
+    html += "<div>Status: <b style='color:#6c6'>gemountet</b> &middot; " + String(g_sdType) +
+            " &middot; " + String((g_sdSizeMB + 512) / 1024) + " GB</div>";
+    html += "<div style='color:#888'>wifi.txt: " +
+            String(g_sdWifiLoaded == -1 ? "Vorlage angelegt" :
+                   g_sdWifiLoaded >= 0 ? String(g_sdWifiLoaded) + " Profil(e) geladen" : "keine Datei") +
+            "</div></div>";
+    html += F("<div class='card'><h3>WLAN per wifi.txt</h3>"
+      "<form action='/sdwifi' method='post'>"
+      "<textarea name='txt' spellcheck='false' style='width:92%;height:130px;background:#111;color:#eee;"
+      "border:0;border-radius:6px;padding:8px;font-family:monospace;font-size:1em'>");
+    html += htmlEscape(sdReadWifiTxt());
+    html += F("</textarea><br><button type='submit'>Auf SD speichern + &uuml;bernehmen</button></form>"
+      "<div style='color:#888;text-align:left'>Je Zeile <b>Slot=SSID|Passwort</b> "
+      "(0=Heim 1=Hub-AP 2=S24), '#' = Kommentar. Wird auf die Karte geschrieben und sofort "
+      "in die Profile geladen (aktiv beim n&auml;chsten Reconnect/Neustart).</div></div>");
+  } else {
+    html += F("<div>Status: <b style='color:#c66'>nicht gemountet</b> &ndash; keine Karte erkannt.</div></div>");
+  }
   html += F("</div>");
 
   html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p>"
@@ -2464,6 +2532,17 @@ static void handleOtaDone() {
   else    { g_otaBusy = false; hal_pause_for_ota(false); }
 }
 
+static void handleWebSdWifi() {
+  if (g_sdMounted && webServer.hasArg("txt")) {
+    File w = SD_MMC.open("/wifi.txt", FILE_WRITE);
+    if (w) { w.print(webServer.arg("txt")); w.close(); }
+    g_sdWifiLoaded = sdApplyWifiTxt();                  // sofort in die Profile uebernehmen
+    Serial.printf("Web: /wifi.txt gespeichert -> %d Profil(e)\n", g_sdWifiLoaded);
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303, "text/plain", "ok");
+}
+
 static void startWebServer() {
   webServer.on("/",        handleWebRoot);
   webServer.on("/set",     handleWebSet);
@@ -2476,6 +2555,7 @@ static void startWebServer() {
     snprintf(b, sizeof(b), "mounted=%d type=%s sizeMB=%lu wifitxt=%d", g_sdMounted ? 1 : 0, g_sdType, (unsigned long)g_sdSizeMB, g_sdWifiLoaded);
     webServer.send(200, "text/plain", b);
   });
+  webServer.on("/sdwifi", HTTP_POST, handleWebSdWifi);
   webServer.begin();
   Serial.println("WebGUI: gestartet auf Port 80");
 }
@@ -2609,26 +2689,8 @@ static void loadWifiFromSd() {
     }
     return;
   }
-  File f = SD_MMC.open("/wifi.txt", FILE_READ);
-  if (!f) return;
-  int n = 0;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();                                     // entfernt \r und Rand-Leerzeichen
-    if (line.length() == 0 || line[0] == '#') continue;
-    int eq = line.indexOf('='), bar = line.indexOf('|');
-    if (eq < 1 || bar <= eq) continue;
-    int slot = line.substring(0, eq).toInt();
-    if (slot < 0 || slot >= WPROF_COUNT) continue;
-    String ssid = line.substring(eq + 1, bar);
-    String pass = line.substring(bar + 1);
-    saveWprof((uint8_t)slot, ssid.c_str(), pass.c_str(), g_wprof[slot].hubip);  // -> g_wprof + NVS
-    n++;
-    Serial.printf("SD wifi.txt: Profil %d = '%s' (pw-len %u)\n", slot, ssid.c_str(), (unsigned)pass.length());
-  }
-  f.close();
-  g_sdWifiLoaded = n;
-  Serial.printf("SD: %d WLAN-Profil(e) aus /wifi.txt geladen\n", n);
+  g_sdWifiLoaded = sdApplyWifiTxt();                 // vorhandene Datei anwenden
+  Serial.printf("SD: %d WLAN-Profil(e) aus /wifi.txt geladen\n", g_sdWifiLoaded);
 }
 
 // ===== Micro-SD mounten + wifi.txt verarbeiten =====
