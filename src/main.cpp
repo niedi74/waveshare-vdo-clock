@@ -24,6 +24,7 @@
 #include <Update.h>
 #include <ESPmDNS.h>
 #include "esp_wps.h"               // WLAN per Tastendruck (WPS PBC) - wie im M5 Dial
+#include "SD_MMC.h"                // Micro-SD am 2.8C (SDMMC 1-bit: CLK=2/CMD=1/D0=42, D3=EXIO4)
 #include <sys/time.h>
 #include <time.h>
 
@@ -128,6 +129,9 @@ static bool      g_redrawPage   = false;
 static uint8_t   g_wifiProfile  = 0;
 static WebServer webServer(80);
 static void startWebServer();   // forward declaration
+static bool        g_sdMounted = false;   // Micro-SD: Mount-Status (Test)
+static uint32_t    g_sdSizeMB  = 0;
+static const char* g_sdType    = "-";
 static void reconnectWifiProfile();
 static void cycleWifiProfile();
 static void updateRotationCache();
@@ -2463,6 +2467,11 @@ static void startWebServer() {
   webServer.on("/page",    handleWebPage);
   webServer.on("/wifi",    handleWebWifi);
   webServer.on("/update",  HTTP_POST, handleOtaDone, handleOtaUpload);
+  webServer.on("/sd", []() {
+    char b[96];
+    snprintf(b, sizeof(b), "mounted=%d type=%s sizeMB=%lu", g_sdMounted ? 1 : 0, g_sdType, (unsigned long)g_sdSizeMB);
+    webServer.send(200, "text/plain", b);
+  });
   webServer.begin();
   Serial.println("WebGUI: gestartet auf Port 80");
 }
@@ -2580,6 +2589,23 @@ static void cycleWifiProfile() {                 // zum naechsten belegten Profi
   }
 }
 
+// ===== Micro-SD mounten (nur Test: Typ/Groesse erkennen) =====
+static void setupSdCard() {
+  hal_free_lcd_spi();                                   // Pins 1/2 vom LCD-SPI freigeben
+  hal_sd_d3_high();                                     // EXIO4 (SD_D3) Output + HIGH
+  if (!SD_MMC.setPins(2, 1, 42, -1, -1, -1)) { Serial.println("SD: setPins FAIL"); return; }
+  if (!SD_MMC.begin("/sdcard", true)) {                 // true = 1-bit-Modus
+    Serial.println("SD: begin FAIL (Karte drin? Kontakt?)"); return;
+  }
+  uint8_t ct = SD_MMC.cardType();
+  if (ct == CARD_NONE) { Serial.println("SD: keine Karte"); return; }
+  g_sdType   = (ct == CARD_MMC) ? "MMC" : (ct == CARD_SD) ? "SDSC" : (ct == CARD_SDHC) ? "SDHC" : "?";
+  g_sdSizeMB = (uint32_t)(SD_MMC.cardSize() / (1024ULL * 1024ULL));
+  g_sdMounted = true;
+  Serial.printf("SD: OK %s %luMB (frei %lluMB)\n", g_sdType, (unsigned long)g_sdSizeMB,
+                (unsigned long long)((SD_MMC.totalBytes() - SD_MMC.usedBytes()) / (1024ULL * 1024ULL)));
+}
+
 void setup() {
   // Cold-Boot Robustness: let power rails settle before touching I2C/display.
   delay(500);
@@ -2633,6 +2659,8 @@ void setup() {
 
   // CAN-Cockpit-Empfaenger (TWAI, listen-only) starten: hoert 0x510 vom Test-Hub
   setupCockpitCan();
+
+  setupSdCard();                 // Micro-SD mounten (Test: Typ/Groesse) - gibt LCD-SPI frei
 
   initTimeSource();
   hal_backlight(true);

@@ -20,6 +20,7 @@
 #define HAL_EXIO_TP_RST  (1 << 1)
 #define HAL_EXIO_LCD_CS  (1 << 2)
 #define HAL_EXIO_BUZZER  (1 << 7)  // PCA9554 Pin 8 = Bit 7 (Buzzer)
+#define HAL_EXIO_SD_CS   (1 << 4)  // PCA9554 EXIO4 = SD_D3 (SDMMC-1bit: auf HIGH halten)
 
 #define HAL_PIN_DE     40
 #define HAL_PIN_VSYNC  39
@@ -47,6 +48,7 @@ static esp_lcd_panel_handle_t hal_panel = nullptr;
 static uint16_t *hal_frame = nullptr;
 static bool hal_ready = false;
 static bool hal_otaPaused = false;
+static bool hal_sdD3High = false;   // SD aktiv -> EXIO4 (SD_D3) im PCA-Output high halten
 
 static uint8_t hal_pca_write_once(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(HAL_PCA9554_ADDR);
@@ -87,7 +89,8 @@ static void hal_buzzer(bool on) {
   // KEIN Read-Modify-Write! Ein fehlschlagender PCA-Read wuerde 0 liefern
   // und CS/RST/TP_RST loeschen -> Touch (TP_RST) und Display tot. Stattdessen
   // immer den bekannten Betriebs-Zustand schreiben + Buzzer-Bit oben drauf.
-  const uint8_t base = HAL_EXIO_LCD_RST | HAL_EXIO_TP_RST | HAL_EXIO_LCD_CS;
+  const uint8_t base = HAL_EXIO_LCD_RST | HAL_EXIO_TP_RST | HAL_EXIO_LCD_CS
+                       | (hal_sdD3High ? HAL_EXIO_SD_CS : 0);   // SD_D3 high halten
   hal_pca_write(HAL_PCA_OUTPUT, on ? (base | HAL_EXIO_BUZZER) : base);
 }
 
@@ -320,6 +323,21 @@ void hal_fill(uint16_t color) {
 
 bool hal_ok() {
   return hal_ready && hal_panel != nullptr;
+}
+
+// SD-Karte: LCD-SPI (SPI2, Pins 1/2) freigeben, damit der SDMMC-Host CLK=2/CMD=1 nutzen kann.
+// Sicher nach dem Boot: ST7701-Init (einziger SPI-Nutzer) ist dann durch; OTA-Resume macht
+// nur hal_panel_init() (RGB-Panel), kein SPI mehr.
+void hal_free_lcd_spi() {
+  if (hal_spi) { spi_bus_remove_device(hal_spi); hal_spi = nullptr; }
+  spi_bus_free(SPI2_HOST);
+}
+
+// SD_D3 (EXIO4) als Output + HIGH (SDMMC-1bit-Modus). LCD_CS/RST bleiben high.
+void hal_sd_d3_high() {
+  hal_pca_write(HAL_PCA_CONFIG, 0x68);   // wie 0x78, aber Bit4 (EXIO4) = Output
+  hal_sdD3High = true;
+  hal_pca_write(HAL_PCA_OUTPUT, HAL_EXIO_LCD_RST | HAL_EXIO_TP_RST | HAL_EXIO_LCD_CS | HAL_EXIO_SD_CS);
 }
 
 void hal_init() {
