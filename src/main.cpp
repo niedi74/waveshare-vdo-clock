@@ -2254,7 +2254,8 @@ static void handleWebRoot() {
     "<button class='tabbtn' onclick=\"sh('anz',this)\">Anzeige</button>"
     "<button class='tabbtn' onclick=\"sh('imu',this)\">IMU</button>"
     "<button class='tabbtn' onclick=\"sh('sys',this)\">System</button>"
-    "<button class='tabbtn' onclick=\"sh('sd',this)\">SD</button></div>");
+    "<button class='tabbtn' onclick=\"sh('sd',this)\">SD</button>"
+    "<button class='tabbtn' onclick=\"sh('dev',this)\">Dev</button></div>");
 
   // ===== Tab: Live =====
   html += F("<div class='tab on' id='t-live'>");
@@ -2366,15 +2367,8 @@ static void handleWebRoot() {
   html += F(" onchange='this.form.submit()'> 123TUNE+ direkt (Fallback bei Hub-Ausfall)</label></p><p><label>"
     "<input type='checkbox' name='wauto' value='1' ");
   html += g_wifiAuto ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label></p><p><label>"
-    "<input type='checkbox' name='acock' value='1' ");
-  html += g_autoCockpit ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> Auto-Cockpit (Motor l&auml;uft &rarr; Motor-Seite)</label></p>"
-    "<p>Schwelle Drehzahl: <input type='number' name='acockrpm' min='100' max='5000' value='");
-  html += String(g_autoCockpitRpm);
-  html += F("' style='width:90px;padding:6px;border:0;border-radius:6px'> 1/min</p>"
-    "<div style='color:#888'>Auto-Cockpit springt ab dieser Drehzahl auf die Motor-Seite (nur von Uhr/Men&uuml;). "
-    "WLAN-Auto verbindet automatisch das verf&uuml;gbare Netz nach Priorit&auml;t.</div>"
+  html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label></p>"
+    "<div style='color:#888'>WLAN-Auto verbindet automatisch das verf&uuml;gbare Netz nach Priorit&auml;t.</div>"
     "<button type='submit'>Speichern</button></form></div>");
   html += F("<div class='card'><h3>Firmware-Update (OTA)</h3>"
     "<form method='POST' action='/update' enctype='multipart/form-data'>"
@@ -2416,6 +2410,20 @@ static void handleWebRoot() {
     html += F("<div>Status: <b style='color:#c66'>nicht gemountet</b> &ndash; keine Karte erkannt.</div></div>");
   }
   html += F("</div>");
+
+  // ===== Tab: Dev =====
+  html += F("<div class='tab' id='t-dev'><div class='card'><h3>Dev / Spielereien</h3>"
+    "<form action='/set' method='get'><input type='hidden' name='devsave' value='1'>"
+    "<p><label><input type='checkbox' name='acock' value='1' ");
+  html += g_autoCockpit ? "checked" : "";
+  html += F("> Auto-Cockpit aktiv</label></p>"
+    "<p>Drehzahl-Schwelle: <input type='number' name='acockrpm' min='100' max='5000' value='");
+  html += String(g_autoCockpitRpm);
+  html += F("' style='width:90px;padding:6px;border:0;border-radius:6px'> 1/min</p>"
+    "<button type='submit'>Speichern</button></form>"
+    "<div style='color:#888;text-align:left'>Ab dieser Drehzahl (Hub/CAN/123) springt das Display "
+    "automatisch aufs Motor-Cockpit; Motor aus &rarr; zur&uuml;ck zur Uhr (nur von Uhr/Men&uuml;). "
+    "Weitere Parameter (redline, Gauge-Bereiche, Soll-Band) kommen hier dazu.</div></div></div>");
 
   html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p>"
     "<script>function sh(t,b){var x=document.querySelectorAll('.tab');"
@@ -2465,6 +2473,18 @@ static void handleWebSet() {
     saveImuNull();
     g_redrawPage = true;
   }
+  if (webServer.hasArg("devsave")) {                 // Dev-Tab: Auto-Cockpit an/aus + Schwelle
+    bool ac = webServer.hasArg("acock");
+    Preferences p; p.begin("clock", false);
+    if (ac != g_autoCockpit) { g_autoCockpit = ac; p.putBool("auto_cock", g_autoCockpit); }
+    if (webServer.hasArg("acockrpm")) {
+      int v = webServer.arg("acockrpm").toInt();
+      if (v >= 100 && v <= 5000) { g_autoCockpitRpm = v; p.putInt("acock_rpm", g_autoCockpitRpm); }
+    }
+    p.end();
+    Serial.printf("Web/Dev: Auto-Cockpit %s, Schwelle %d 1/min\n",
+                  g_autoCockpit ? "an" : "aus", g_autoCockpitRpm);
+  }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -2475,24 +2495,11 @@ static void handleWebFeatures() {
   const bool buzzer = webServer.hasArg("buzzer");
   const bool f123   = webServer.hasArg("f123");
   const bool wauto  = webServer.hasArg("wauto");
-  const bool acock  = webServer.hasArg("acock");
   saveFeatures(wifi, ble, buzzer);
   if (f123 != g_feature123) saveFeature123(f123);
   if (wauto != g_wifiAuto) {
     g_wifiAuto = wauto;
     Preferences p; p.begin("clock", false); p.putBool("wifi_auto", g_wifiAuto); p.end();
-  }
-  if (acock != g_autoCockpit) {
-    g_autoCockpit = acock;
-    Preferences p; p.begin("clock", false); p.putBool("auto_cock", g_autoCockpit); p.end();
-  }
-  if (webServer.hasArg("acockrpm")) {
-    int v = webServer.arg("acockrpm").toInt();
-    if (v >= 100 && v <= 5000 && v != g_autoCockpitRpm) {
-      g_autoCockpitRpm = v;
-      Preferences p; p.begin("clock", false); p.putInt("acock_rpm", g_autoCockpitRpm); p.end();
-      Serial.printf("Web: Auto-Cockpit-Schwelle = %d 1/min\n", g_autoCockpitRpm);
-    }
   }
   Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s 123=%s\n",
                 g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off",
