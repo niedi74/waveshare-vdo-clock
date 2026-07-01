@@ -1395,10 +1395,10 @@ static void drawMiniGauge(int cx, int cy, int r, float value, float vmin, float 
 // Main RPM tachometer: 240deg sweep, Gap unten, Rand-Zeiger (Mitte frei).
 // Stil je nach Theme: digital (gestreiftes Band + roter Bereich) oder diskrete Striche.
 static const uint16_t TACH_RED = RGB565(220, 44, 32);
-static void drawTach(int cx, int cy, float rpm, bool valid, const GaugeTheme& t) {
+static void drawTach(int cx, int cy, float rpm, bool valid, const GaugeTheme& t, float sc = 1.0f) {
   const float A0 = 150.0f, A1 = 390.0f;
   if (t.bandTach) {                                 // digital: Streifenband
-    const int rIn = 152, rOut = 212;
+    const int rIn = (int)lroundf(152 * sc), rOut = (int)lroundf(212 * sc);
     drawArcBand(cx, cy, rIn, rOut, A0, A1, RGB565(45, 45, 50));
     drawArcBand(cx, cy, rIn, rOut, gaugeAngle(6000, 0, 8000, A0, A1), A1, RGB565(150, 30, 28));
     for (int k = 0; k <= 8; k++) {
@@ -1406,67 +1406,74 @@ static void drawTach(int cx, int cy, float rpm, bool valid, const GaugeTheme& t)
       uint16_t tc = (k >= 6) ? RGB565(235, 80, 70) : RGB565(190, 190, 190);
       plotRadial(cx, cy, a, rIn, rOut, tc, (k % 2) ? 2 : 3);
       float ar = a * (float)PI / 180.0f;
-      int lx = cx + (int)(cosf(ar) * (rIn - 18));
-      int ly = cy + (int)(sinf(ar) * (rIn - 18));
+      int lx = cx + (int)(cosf(ar) * (rIn - (int)lroundf(18 * sc)));
+      int ly = cy + (int)(sinf(ar) * (rIn - (int)lroundf(18 * sc)));
       char n[3]; snprintf(n, sizeof(n), "%d", k);
       drawTextCentered(lx, ly - 7, n, tc, 2);
     }
     float pa = gaugeAngle(valid ? rpm : 0, 0, 8000, A0, A1);
     plotRadial(cx, cy, pa, rIn - 6, rOut + 2, t.needle, 6);
-    plotRadial(cx, cy, pa, rOut - 16, rOut + 2, TACH_RED, 6);
+    plotRadial(cx, cy, pa, rOut - (int)lroundf(16 * sc), rOut + 2, TACH_RED, 6);
     return;
   }
-  const int rOut = 208;                             // diskrete Striche
+  const int rOut = (int)lroundf(208 * sc);          // diskrete Striche
   for (int v = 0; v <= 8000; v += 200) {
     float a = gaugeAngle(v, 0, 8000, A0, A1);
     bool major = (v % 1000) == 0;
     uint16_t tc = (t.redlineMark && v >= 6000) ? TACH_RED : (major ? t.tickMaj : t.tickMin);
-    plotRadial(cx, cy, a, rOut - (major ? 24 : 12), rOut, tc, major ? 3 : 2);
+    plotRadial(cx, cy, a, rOut - (int)lroundf((major ? 24 : 12) * sc), rOut, tc, major ? 3 : 2);
   }
   for (int k = 0; k <= 8; k++) {
     float a  = gaugeAngle(k * 1000, 0, 8000, A0, A1);
     float ar = a * (float)PI / 180.0f;
-    int lx = cx + (int)(cosf(ar) * (rOut - 42));
-    int ly = cy + (int)(sinf(ar) * (rOut - 42));
+    int lx = cx + (int)(cosf(ar) * (rOut - (int)lroundf(42 * sc)));
+    int ly = cy + (int)(sinf(ar) * (rOut - (int)lroundf(42 * sc)));
     char n[3]; snprintf(n, sizeof(n), "%d", k);
     drawTextCentered(lx, ly - 10, n, (t.redlineMark && k >= 6) ? TACH_RED : t.numCol, 3);
   }
   float pa = gaugeAngle(valid ? rpm : 0, 0, 8000, A0, A1);
-  plotRadial(cx, cy, pa, 150, rOut + 2, t.needle, 6);
-  if (t.redTip) plotRadial(cx, cy, pa, rOut - 16, rOut + 2, TACH_RED, 6);
+  plotRadial(cx, cy, pa, (int)lroundf(150 * sc), rOut + 2, t.needle, 6);
+  if (t.redTip) plotRadial(cx, cy, pa, rOut - (int)lroundf(16 * sc), rOut + 2, TACH_RED, 6);
 }
+
+// Skalierung der MOTOR-Kombi mit GROESSE (g_dialScalePct), um die Mitte 240,240 - wie die Uhr.
+#define M_S    (g_dialScalePct / 100.0f)
+#define M_X(x) (240 + (int)lroundf(((x) - 240) * M_S))
+#define M_Y(y) (240 + (int)lroundf(((y) - 240) * M_S))
+#define M_R(r) ((int)lroundf((r) * M_S))
+#define M_F(f) (max(1, min(8, (int)lroundf((f) * M_S))))
 
 static void drawMotorPage() {
   if (!ensureFrame()) return;
   const GaugeTheme& t = gTheme();
   fillFrame(t.face);
   if (t.chrome) {
-    drawCircleLine(240, 240, 236, 7, t.bezel);           // heller Chrom-Ring
-    drawCircleLine(240, 240, 229, 2, t.bezelDk);          // dunkle Innenkante
+    drawCircleLine(240, 240, M_R(236), 7, t.bezel);        // heller Chrom-Ring
+    drawCircleLine(240, 240, M_R(229), 2, t.bezelDk);       // dunkle Innenkante
   }
   const bool fresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
   char buf[16];
 
-  drawTach(240, 240, g_rpm, fresh, t);
+  drawTach(240, 240, g_rpm, fresh, t, M_S);
 
   // RPM digital (oben, innerhalb des Rings)
   if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_rpm); else strcpy(buf, "----");
-  drawTextCentered(240, 92, buf, fresh ? t.txt : t.txtDim, 5);
-  drawTextCentered(240, 134, "RPM", t.txtDim, 2);
+  drawTextCentered(240, M_Y(92), buf, fresh ? t.txt : t.txtDim, M_F(5));
+  drawTextCentered(240, M_Y(134), "RPM", t.txtDim, M_F(2));
 
   // Vier Mini-Gauges (Akzentfarben nur im Digital-Stil genutzt)
   const bool g123 = fresh && g_g123Valid;
   if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_adv); else strcpy(buf, "--");
-  drawMiniGauge(148, 196, 36, g_adv, 0, 50, "ADV", buf, RGB565(40, 150, 210), fresh, t);
+  drawMiniGauge(M_X(148), M_Y(196), M_R(36), g_adv, 0, 50, "ADV", buf, RGB565(40, 150, 210), fresh, t);
   if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_map); else strcpy(buf, "--");
-  drawMiniGauge(332, 196, 36, g_map, 0, 200, "KPA", buf, RGB565(60, 185, 90), fresh, t);
+  drawMiniGauge(M_X(332), M_Y(196), M_R(36), g_map, 0, 200, "KPA", buf, RGB565(60, 185, 90), fresh, t);
   if (g123) snprintf(buf, sizeof(buf), "%d", (int)g_g123Temp); else strcpy(buf, "--");
-  drawMiniGauge(148, 324, 36, g_g123Temp, 0, 120, "TEMP", buf, RGB565(210, 120, 50), g123, t);
+  drawMiniGauge(M_X(148), M_Y(324), M_R(36), g_g123Temp, 0, 120, "TEMP", buf, RGB565(210, 120, 50), g123, t);
   if (g123) snprintf(buf, sizeof(buf), "%.1f", g_g123Volt); else strcpy(buf, "--");
-  drawMiniGauge(332, 324, 36, g_g123Volt, 10, 15, "VOLT", buf, RGB565(210, 180, 60), g123, t);
+  drawMiniGauge(M_X(332), M_Y(324), M_R(36), g_g123Volt, 10, 15, "VOLT", buf, RGB565(210, 180, 60), g123, t);
 
   // Lambda zentral
-  drawTextCentered(240, 196, "LAMBDA", t.txtDim, 2);
+  drawTextCentered(240, M_Y(196), "LAMBDA", t.txtDim, M_F(2));
   uint16_t lcol;
   if (fresh && g_lambdaValid) {
     snprintf(buf, sizeof(buf), "%.2f", g_lambda);
@@ -1478,7 +1485,7 @@ static void drawMotorPage() {
       lcol = (g_lambda < 0.95f || g_lambda > 1.05f) ? TACH_RED : t.txt;
     }
   } else { strcpy(buf, "----"); lcol = t.txtDim; }
-  drawTextCentered(240, 216, buf, lcol, 6);
+  drawTextCentered(240, M_Y(216), buf, lcol, M_F(6));
 
   // AMP (Zuendspulenstrom) + Tempo, dann Status, im unteren Ring-Gap
   char line[24];
@@ -1486,16 +1493,21 @@ static void drawMotorPage() {
   if (g123)        snprintf(amp, sizeof(amp), "%.1fA", g_g123Coil); else strcpy(amp, "--");
   if (fresh && g_speedValid) snprintf(spd, sizeof(spd), "%dKMH", (int)g_speedKmh); else strcpy(spd, "--");
   snprintf(line, sizeof(line), "AMP %s  %s", amp, spd);
-  drawTextCentered(240, 396, line, t.txtDim, 2);
+  drawTextCentered(240, M_Y(396), line, t.txtDim, M_F(2));
 
   char st[16];
   if (fresh)            snprintf(st, sizeof(st), "LIVE %s", g_lastSrc);
   else if (g_bleConn)   strcpy(st, "WARTE");
   else if (g_canReady)  strcpy(st, "CAN WARTE");
   else                  strcpy(st, "KEIN HUB");
-  drawTextCentered(240, 424, st, fresh ? t.liveCol : t.statusBad, 2);
+  drawTextCentered(240, M_Y(424), st, fresh ? t.liveCol : t.statusBad, M_F(2));
   presentFrame();
 }
+#undef M_S
+#undef M_X
+#undef M_Y
+#undef M_R
+#undef M_F
 
 // ===== Lambda-Verlauf (Trend ueber Zeit): Ringpuffer, alle 500ms ein Sample =====
 #define TR_N 120                         // 120 * 500ms = 60 s Fenster
