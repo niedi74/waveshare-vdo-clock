@@ -120,8 +120,8 @@ static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
 static bool      g_feature123    = false;  // 123-Direkt-Fallback: default AUS (sonst Dauer-BLE -> Ruckeln)
-static bool      g_autoCockpit   = true;   // Drehzahl > Schwelle -> automatisch Motor-Seite (von Uhr/Menue)
-#define AUTO_COCKPIT_RPM 600               // ab dieser Drehzahl gilt der Motor als "laeuft"
+static bool      g_autoCockpit    = true;  // Drehzahl > Schwelle -> automatisch Motor-Seite (von Uhr/Menue)
+static int       g_autoCockpitRpm = 600;   // Schwelle, per WebGUI variabel einstellbar
 #define FW_BUILD __DATE__ " " __TIME__     // Firmware-Stand (Compile-Zeit) fuer die WebGUI
 static float     g_imuOffPitch   = 0.0f;   // IMU-Nullung (Einbaulage) - Pitch/Roll-Offset
 static float     g_imuOffRoll    = 0.0f;
@@ -136,6 +136,7 @@ static bool        g_sdMounted = false;   // Micro-SD: Mount-Status (Test)
 static uint32_t    g_sdSizeMB  = 0;
 static const char* g_sdType    = "-";
 static int         g_sdWifiLoaded = -2;   // -2=keine SD/Datei, -1=Vorlage angelegt, >=0=Profile geladen
+static const char* g_sdOtaResult   = "-"; // SD-OTA-Recovery: "-", "OK", "FEHLER"
 static void reconnectWifiProfile();
 static void cycleWifiProfile();
 static void updateRotationCache();
@@ -2029,7 +2030,9 @@ static void loadSettings() {
   g_featureBle    = p.getBool("feat_ble",  false);
   g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
   g_feature123    = p.getBool("feat_123", false);     // 123-Fallback default OFF
-  g_autoCockpit   = p.getBool("auto_cock", true);     // Auto-Cockpit default AN
+  g_autoCockpit    = p.getBool("auto_cock", true);    // Auto-Cockpit default AN
+  g_autoCockpitRpm = p.getInt("acock_rpm", 600);      // Schwelle variabel
+  if (g_autoCockpitRpm < 100 || g_autoCockpitRpm > 5000) g_autoCockpitRpm = 600;
   g_imuOffPitch   = p.getFloat("imu_off_p", 0.0f);     // IMU-Nullung
   g_imuOffRoll    = p.getFloat("imu_off_r", 0.0f);
   g_wifiAuto      = p.getBool("wifi_auto", true);      // WLAN-Auto-Fallback default AN
@@ -2366,9 +2369,12 @@ static void handleWebRoot() {
   html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label></p><p><label>"
     "<input type='checkbox' name='acock' value='1' ");
   html += g_autoCockpit ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> Auto-Cockpit (Drehzahl &gt; 600 &rarr; Motor-Seite)</label></p>"
-    "<div style='color:#888'>WLAN-Auto verbindet automatisch das verf&uuml;gbare Netz nach Priorit&auml;t. "
-    "Auto-Cockpit springt bei laufendem Motor auf die Motor-Seite (nur von Uhr/Men&uuml;).</div>"
+  html += F(" onchange='this.form.submit()'> Auto-Cockpit (Motor l&auml;uft &rarr; Motor-Seite)</label></p>"
+    "<p>Schwelle Drehzahl: <input type='number' name='acockrpm' min='100' max='5000' value='");
+  html += String(g_autoCockpitRpm);
+  html += F("' style='width:90px;padding:6px;border:0;border-radius:6px'> 1/min</p>"
+    "<div style='color:#888'>Auto-Cockpit springt ab dieser Drehzahl auf die Motor-Seite (nur von Uhr/Men&uuml;). "
+    "WLAN-Auto verbindet automatisch das verf&uuml;gbare Netz nach Priorit&auml;t.</div>"
     "<button type='submit'>Speichern</button></form></div>");
   html += F("<div class='card'><h3>Firmware-Update (OTA)</h3>"
     "<form method='POST' action='/update' enctype='multipart/form-data'>"
@@ -2398,6 +2404,14 @@ static void handleWebRoot() {
       "<div style='color:#888;text-align:left'>Je Zeile <b>Slot=SSID|Passwort</b> "
       "(0=Heim 1=Hub-AP 2=S24), '#' = Kommentar. Wird auf die Karte geschrieben und sofort "
       "in die Profile geladen (aktiv beim n&auml;chsten Reconnect/Neustart).</div></div>");
+    html += F("<div class='card'><h3>OTA-Recovery von SD</h3>"
+      "<div style='color:#888;text-align:left'>Firmware als <b>/update.bin</b> auf die Karte legen "
+      "und Display neu starten &rarr; flasht lokal <b>ohne WLAN</b>, benennt danach in "
+      "<b>update.done</b> (Erfolg) bzw. <b>update.bad</b> um.</div>");
+    html += "<div>Letztes Ergebnis: <b style='color:#e0c040'>" + String(g_sdOtaResult) + "</b>";
+    if (SD_MMC.exists("/update.done")) html += F(" &middot; update.done da");
+    if (SD_MMC.exists("/update.bad"))  html += F(" &middot; update.bad da");
+    html += F("</div></div>");
   } else {
     html += F("<div>Status: <b style='color:#c66'>nicht gemountet</b> &ndash; keine Karte erkannt.</div></div>");
   }
@@ -2471,6 +2485,14 @@ static void handleWebFeatures() {
   if (acock != g_autoCockpit) {
     g_autoCockpit = acock;
     Preferences p; p.begin("clock", false); p.putBool("auto_cock", g_autoCockpit); p.end();
+  }
+  if (webServer.hasArg("acockrpm")) {
+    int v = webServer.arg("acockrpm").toInt();
+    if (v >= 100 && v <= 5000 && v != g_autoCockpitRpm) {
+      g_autoCockpitRpm = v;
+      Preferences p; p.begin("clock", false); p.putInt("acock_rpm", g_autoCockpitRpm); p.end();
+      Serial.printf("Web: Auto-Cockpit-Schwelle = %d 1/min\n", g_autoCockpitRpm);
+    }
   }
   Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s 123=%s\n",
                 g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off",
@@ -2739,6 +2761,31 @@ static void setupSdCard() {
   loadWifiFromSd();
 }
 
+// ===== OTA-Recovery von SD: /update.bin beim Boot flashen (ohne WLAN/COM13) =====
+// Robust: nur wenn Datei plausibel gross ist; Datei wird IMMER umbenannt (kein Boot-Loop).
+static void sdCheckFirmwareUpdate() {
+  if (!g_sdMounted || !SD_MMC.exists("/update.bin")) return;
+  File f = SD_MMC.open("/update.bin", FILE_READ);
+  if (!f) return;
+  size_t sz = f.size();
+  if (sz < 100000) { f.close(); SD_MMC.remove("/update.bad"); SD_MMC.rename("/update.bin", "/update.bad");
+                     Serial.println("SD-OTA: /update.bin zu klein -> .bad"); g_sdOtaResult = "FEHLER"; return; }
+  Serial.printf("SD-OTA: /update.bin %u Bytes -> flashe...\n", (unsigned)sz);
+  hal_pause_for_ota(true);                              // RGB-Panel anhalten (Flash-Cache)
+  bool ok = false;
+  if (Update.begin(sz)) {
+    size_t w = Update.writeStream(f);
+    ok = (w == sz) && Update.end(true);
+  }
+  f.close();
+  SD_MMC.remove(ok ? "/update.done" : "/update.bad");   // alt weg
+  SD_MMC.rename("/update.bin", ok ? "/update.done" : "/update.bad");  // nie erneut flashen
+  g_sdOtaResult = ok ? "OK" : "FEHLER";
+  Serial.printf("SD-OTA: %s\n", ok ? "OK -> Neustart" : "FEHLER");
+  if (ok) { delay(300); ESP.restart(); }
+  hal_pause_for_ota(false);                              // bei Fehler Panel zurueck
+}
+
 void setup() {
   // Cold-Boot Robustness: let power rails settle before touching I2C/display.
   delay(500);
@@ -2793,7 +2840,8 @@ void setup() {
   // CAN-Cockpit-Empfaenger (TWAI, listen-only) starten: hoert 0x510 vom Test-Hub
   setupCockpitCan();
 
-  setupSdCard();                 // Micro-SD mounten (Test: Typ/Groesse) - gibt LCD-SPI frei
+  setupSdCard();                 // Micro-SD mounten - gibt LCD-SPI frei, liest wifi.txt
+  sdCheckFirmwareUpdate();       // Recovery: /update.bin von SD flashen (falls vorhanden)
 
   initTimeSource();
   hal_backlight(true);
@@ -2810,7 +2858,7 @@ static void autoCockpitTick() {
   static uint32_t idleSince   = 0;
   bool fresh = httpFresh() || canFresh() || bleFresh() || tune123Fresh();
   float rpm  = fresh ? g_rpm : 0.0f;
-  if (rpm > AUTO_COCKPIT_RPM) {
+  if (rpm > g_autoCockpitRpm) {
     idleSince = 0;
     if (currentPage == 0 || currentPage == 1) {        // von Uhr/Menue aufs Cockpit
       currentPage = 2; drawMotorPage(); autoEntered = true;
