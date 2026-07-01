@@ -120,6 +120,9 @@ static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
 static bool      g_feature123    = false;  // 123-Direkt-Fallback: default AUS (sonst Dauer-BLE -> Ruckeln)
+static bool      g_autoCockpit   = true;   // Drehzahl > Schwelle -> automatisch Motor-Seite (von Uhr/Menue)
+#define AUTO_COCKPIT_RPM 600               // ab dieser Drehzahl gilt der Motor als "laeuft"
+#define FW_BUILD __DATE__ " " __TIME__     // Firmware-Stand (Compile-Zeit) fuer die WebGUI
 static float     g_imuOffPitch   = 0.0f;   // IMU-Nullung (Einbaulage) - Pitch/Roll-Offset
 static float     g_imuOffRoll    = 0.0f;
 static bool      g_wifiAuto      = true;   // WLAN-Auto-Fallback: S24 > Heim > Hub-AP (verfuegbares Netz)
@@ -2026,6 +2029,7 @@ static void loadSettings() {
   g_featureBle    = p.getBool("feat_ble",  false);
   g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
   g_feature123    = p.getBool("feat_123", false);     // 123-Fallback default OFF
+  g_autoCockpit   = p.getBool("auto_cock", true);     // Auto-Cockpit default AN
   g_imuOffPitch   = p.getFloat("imu_off_p", 0.0f);     // IMU-Nullung
   g_imuOffRoll    = p.getFloat("imu_off_r", 0.0f);
   g_wifiAuto      = p.getBool("wifi_auto", true);      // WLAN-Auto-Fallback default AN
@@ -2359,14 +2363,21 @@ static void handleWebRoot() {
   html += F(" onchange='this.form.submit()'> 123TUNE+ direkt (Fallback bei Hub-Ausfall)</label></p><p><label>"
     "<input type='checkbox' name='wauto' value='1' ");
   html += g_wifiAuto ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label></p>"
-    "<div style='color:#888'>WLAN-Auto verbindet automatisch das verf&uuml;gbare Netz nach Priorit&auml;t.</div>"
+  html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label></p><p><label>"
+    "<input type='checkbox' name='acock' value='1' ");
+  html += g_autoCockpit ? "checked" : "";
+  html += F(" onchange='this.form.submit()'> Auto-Cockpit (Drehzahl &gt; 600 &rarr; Motor-Seite)</label></p>"
+    "<div style='color:#888'>WLAN-Auto verbindet automatisch das verf&uuml;gbare Netz nach Priorit&auml;t. "
+    "Auto-Cockpit springt bei laufendem Motor auf die Motor-Seite (nur von Uhr/Men&uuml;).</div>"
     "<button type='submit'>Speichern</button></form></div>");
   html += F("<div class='card'><h3>Firmware-Update (OTA)</h3>"
     "<form method='POST' action='/update' enctype='multipart/form-data'>"
     "<input type='file' name='firmware' accept='.bin' style='width:88%;margin:6px'><br>"
     "<button type='submit'>Firmware flashen</button></form>"
     "<div style='color:#888'>.bin aus .pio/build/waveshare_s3_28c/firmware.bin</div></div>");
+  html += F("<div class='card' style='color:#888'>Firmware-Stand: <b style='color:#e0c040'>");
+  html += F(FW_BUILD);
+  html += F("</b></div>");
   html += F("</div>");
 
   // ===== Tab: SD =====
@@ -2450,11 +2461,16 @@ static void handleWebFeatures() {
   const bool buzzer = webServer.hasArg("buzzer");
   const bool f123   = webServer.hasArg("f123");
   const bool wauto  = webServer.hasArg("wauto");
+  const bool acock  = webServer.hasArg("acock");
   saveFeatures(wifi, ble, buzzer);
   if (f123 != g_feature123) saveFeature123(f123);
   if (wauto != g_wifiAuto) {
     g_wifiAuto = wauto;
     Preferences p; p.begin("clock", false); p.putBool("wifi_auto", g_wifiAuto); p.end();
+  }
+  if (acock != g_autoCockpit) {
+    g_autoCockpit = acock;
+    Preferences p; p.begin("clock", false); p.putBool("auto_cock", g_autoCockpit); p.end();
   }
   Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s 123=%s\n",
                 g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off",
@@ -2785,6 +2801,32 @@ void setup() {
   Serial.println("VDO clock drawn.");
 }
 
+// Auto-Cockpit: Motor laeuft (Drehzahl > AUTO_COCKPIT_RPM) -> Motor-Seite; Motor aus -> Uhr.
+// Nur von Uhr/Menue automatisch REIN, und nur ZURUECK wenn wir selbst rein sind (stoert dich
+// nicht, wenn du z.B. auf Lambda/Setup navigiert hast). Quelle egal (Hub/CAN/123).
+static void autoCockpitTick() {
+  if (!g_autoCockpit) return;
+  static bool     autoEntered = false;
+  static uint32_t idleSince   = 0;
+  bool fresh = httpFresh() || canFresh() || bleFresh() || tune123Fresh();
+  float rpm  = fresh ? g_rpm : 0.0f;
+  if (rpm > AUTO_COCKPIT_RPM) {
+    idleSince = 0;
+    if (currentPage == 0 || currentPage == 1) {        // von Uhr/Menue aufs Cockpit
+      currentPage = 2; drawMotorPage(); autoEntered = true;
+      Serial.printf("Auto-Cockpit: Motor an (%d) -> Motor-Seite\n", (int)rpm);
+    }
+  } else if (autoEntered && currentPage == 2) {         // Motor (fast) aus + wir sind autom. drin
+    if (idleSince == 0) idleSince = millis();
+    else if (millis() - idleSince > 5000) {             // 5 s Ruhe -> zurueck zur Uhr
+      currentPage = 0; drawVdoClock(); autoEntered = false; idleSince = 0;
+      Serial.println("Auto-Cockpit: Motor aus -> Uhr");
+    }
+  } else {
+    idleSince = 0;
+  }
+}
+
 void loop() {
   static uint32_t lastTouch = 0;
   static uint32_t lastDraw  = 0;
@@ -2976,6 +3018,9 @@ void loop() {
   // WLAN-Seite live halten (WPS-Status / IP aktualisieren)
   { static uint32_t wlanRedrawAt = 0;
     if (currentPage == 11 && millis() > wlanRedrawAt) { wlanRedrawAt = millis() + 1200; drawWlanPage(); } }
+
+  // Auto-Cockpit: bei laufendem Motor automatisch aufs Motor-Display (von Uhr/Menue)
+  autoCockpitTick();
 
   // Lambda-Verlauf: immer sampeln (Historie da, egal welche Seite) + Trend-Seite scrollen
   trendSample();
