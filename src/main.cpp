@@ -1323,7 +1323,9 @@ static const GaugeTheme THEME_DIGITAL = {
   RGB565(60,200,90), RGB565(200,120,50), true, RGB565(28,24,20) };
 
 static const GaugeTheme THEME_VDO = {
-  RGB565(40,42,46), RGB565(214,218,222), RGB565(110,114,120), true, false, true, true,
+  // Zifferblatt-Grau: an das (ausgeblichene) Original-VDO-Grau im T2b angepasst -
+  // vorher RGB(40,42,46) = fast schwarz, real ist es deutlich heller (Foto 2.7.).
+  RGB565(84,86,90), RGB565(214,218,222), RGB565(110,114,120), true, false, true, true,
   RGB565(234,230,208), RGB565(150,148,130), RGB565(234,230,208),
   RGB565(234,230,208), RGB565(166,122,42), RGB565(40,30,16),
   false, RGB565(234,230,208), RGB565(150,148,130),
@@ -1503,11 +1505,14 @@ static void drawMotorPage() {
   snprintf(line, sizeof(line), "AMP %s  %s", amp, spd);
   drawTextCentered(240, M_Y(396), line, t.txtDim, M_F(2));
 
-  char st[16];
-  if (fresh)            snprintf(st, sizeof(st), "LIVE %s", g_lastSrc);
-  else if (g_bleConn)   strcpy(st, "WARTE");
-  else if (g_canReady)  strcpy(st, "CAN WARTE");
-  else                  strcpy(st, "KEIN HUB");
+  // Statuszeile unten: Uhrzeit + Datenquelle (Uhr fehlt sonst im Kombi)
+  char st[24];
+  const char* src = fresh ? g_lastSrc : (g_bleConn ? "WARTE" : (g_canReady ? "CAN WARTE" : "KEIN HUB"));
+  struct tm mnow = {};
+  if (readClockTime(&mnow))
+    snprintf(st, sizeof(st), "%02d:%02d  %s%s", mnow.tm_hour, mnow.tm_min, fresh ? "LIVE " : "", src);
+  else
+    snprintf(st, sizeof(st), "%s%s", fresh ? "LIVE " : "", src);
   drawTextCentered(240, M_Y(424), st, fresh ? t.liveCol : t.statusBad, M_F(2));
   presentFrame();
 }
@@ -2895,24 +2900,33 @@ void setup() {
 // nicht, wenn du z.B. auf Lambda/Setup navigiert hast). Quelle egal (Hub/CAN/123).
 static void autoCockpitTick() {
   if (!g_autoCockpit) return;
-  static bool     autoEntered = false;
+  static bool     autoEntered = false;   // wir sind automatisch auf der Motor-Seite gelandet
+  static bool     jumped      = false;   // pro MOTORSTART nur EIN Auto-Sprung
   static uint32_t idleSince   = 0;
   bool fresh = httpFresh() || canFresh() || bleFresh() || tune123Fresh();
   float rpm  = fresh ? g_rpm : 0.0f;
   if (rpm > g_autoCockpitRpm) {
     idleSince = 0;
-    if (currentPage == 0 || currentPage == 1) {        // von Uhr/Menue aufs Cockpit
-      currentPage = 2; drawMotorPage(); autoEntered = true;
-      Serial.printf("Auto-Cockpit: Motor an (%d) -> Motor-Seite\n", (int)rpm);
+    // Nur beim Motorstart einmal springen. Danach frei navigieren: wer waehrend
+    // der Fahrt zur Uhr/Setup wechselt, BLEIBT dort (kein Zurueck-Reissen mehr).
+    if (!jumped) {
+      jumped = true;
+      if (currentPage == 0 || currentPage == 1) {
+        currentPage = 2; drawMotorPage(); autoEntered = true;
+        Serial.printf("Auto-Cockpit: Motor an (%d) -> Motor-Seite\n", (int)rpm);
+      }
     }
-  } else if (autoEntered && currentPage == 2) {         // Motor (fast) aus + wir sind autom. drin
-    if (idleSince == 0) idleSince = millis();
-    else if (millis() - idleSince > 5000) {             // 5 s Ruhe -> zurueck zur Uhr
-      currentPage = 0; drawVdoClock(); autoEntered = false; idleSince = 0;
-      Serial.println("Auto-Cockpit: Motor aus -> Uhr");
-    }
+    if (currentPage != 2) autoEntered = false;          // Nutzer ist selbst weg-navigiert
   } else {
-    idleSince = 0;
+    if (idleSince == 0) { idleSince = millis(); return; }
+    if (millis() - idleSince > 5000) {                  // Motor 5 s aus
+      if (autoEntered && currentPage == 2) {            // nur zurueck, wenn WIR rein sind
+        currentPage = 0; drawVdoClock();
+        Serial.println("Auto-Cockpit: Motor aus -> Uhr");
+      }
+      autoEntered = false;
+      jumped = false;                                   // naechster Motorstart darf wieder springen
+    }
   }
 }
 
