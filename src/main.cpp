@@ -123,6 +123,10 @@ static bool      g_feature123    = false;  // 123-Direkt-Fallback: default AUS (
 static bool      g_autoCockpit    = true;  // Drehzahl > Schwelle -> automatisch Motor-Seite (von Uhr/Menue)
 static int       g_autoCockpitRpm = 600;   // Schwelle, per WebGUI variabel einstellbar
 #define FW_BUILD __DATE__ " " __TIME__     // Firmware-Stand (Compile-Zeit) fuer die WebGUI
+#ifndef GIT_REV
+  #define GIT_REV "unknown"                // wird von scripts/inject_time.py injiziert
+#endif
+#define GITHUB_URL "https://github.com/niedi74/waveshare-vdo-clock/commit/" GIT_REV
 static float     g_imuOffPitch   = 0.0f;   // IMU-Nullung (Einbaulage) - Pitch/Roll-Offset
 static float     g_imuOffRoll    = 0.0f;
 static bool      g_wifiAuto      = true;   // WLAN-Auto-Fallback: S24 > Heim > Hub-AP (verfuegbares Netz)
@@ -2352,7 +2356,8 @@ static void handleWebRoot() {
 
   // ===== Tab: System =====
   html += F("<div class='tab' id='t-sys'>");
-  html += F("<div class='card'><h3>Funktionen</h3><form action='/features' method='get'>");
+  html += F("<div class='card'><h3>Funktionen</h3><form action='/features' method='get'>"
+            "<input type='hidden' name='fsave' value='1'>");
   html += "<p><label><input type='checkbox' name='wifi' value='1' ";
   html += g_featureWifi ? "checked" : "";
   html += F("> WLAN/Web aktiv</label></p><p><label>"
@@ -2377,7 +2382,8 @@ static void handleWebRoot() {
     "<div style='color:#888'>.bin aus .pio/build/waveshare_s3_28c/firmware.bin</div></div>");
   html += F("<div class='card' style='color:#888'>Firmware-Stand: <b style='color:#e0c040'>");
   html += F(FW_BUILD);
-  html += F("</b></div>");
+  html += F("</b><br>Git: <a href='" GITHUB_URL "' target='_blank'>" GIT_REV "</a>"
+    " &middot; <a href='/version'>/version</a></div>");
   html += F("</div>");
 
   // ===== Tab: SD =====
@@ -2490,6 +2496,11 @@ static void handleWebSet() {
 }
 
 static void handleWebFeatures() {
+  if (!webServer.hasArg("fsave")) {        // Schutz: nackter /features-Aufruf (Crawler/Tippfehler)
+    webServer.sendHeader("Location", "/"); // wuerde sonst ALLE Features abschalten
+    webServer.send(303);
+    return;
+  }
   const bool wifi   = webServer.hasArg("wifi");
   const bool ble    = webServer.hasArg("ble");
   const bool buzzer = webServer.hasArg("buzzer");
@@ -2613,6 +2624,29 @@ static void startWebServer() {
     webServer.send(200, "text/plain", b);
   });
   webServer.on("/sdwifi", HTTP_POST, handleWebSdWifi);
+  webServer.on("/version", []() {          // Maschinenlesbarer Stand: Build/Git/Features (JSON)
+    String j = F("{\"fw\":\"" FW_BUILD "\",\"git\":\"" GIT_REV "\",\"github\":\"" GITHUB_URL "\"");
+    j += ",\"up_s\":" + String(millis() / 1000);
+    j += ",\"ip\":\"" + String(g_ipStr) + "\",\"profil\":\"" + String(WPROF_LABELS[g_wifiProfile]) + "\"";
+    j += ",\"features\":{\"wifi\":" + String(g_featureWifi ? 1 : 0) +
+         ",\"wifi_auto\":" + String(g_wifiAuto ? 1 : 0) +
+         ",\"ble\":" + String(g_featureBle ? 1 : 0) +
+         ",\"buzzer\":" + String(g_featureBuzzer ? 1 : 0) +
+         ",\"123\":" + String(g_feature123 ? 1 : 0) +
+         ",\"auto_cockpit\":" + String(g_autoCockpit ? 1 : 0) +
+         ",\"auto_cockpit_rpm\":" + String(g_autoCockpitRpm) + "}";
+    j += ",\"anzeige\":{\"motor_stil\":" + String(g_motorStyle) +
+         ",\"lambda_stil\":" + String(g_lambdaStyle) +
+         ",\"groesse_pct\":" + String(g_dialScalePct) +
+         ",\"rotation\":" + String(g_rotationDeg) + "}";
+    j += ",\"sd\":{\"mounted\":" + String(g_sdMounted ? 1 : 0) +
+         ",\"type\":\"" + String(g_sdType) + "\",\"mb\":" + String((unsigned long)g_sdSizeMB) +
+         ",\"wifitxt\":" + String(g_sdWifiLoaded) + ",\"ota\":\"" + String(g_sdOtaResult) + "\"}";
+    j += ",\"daten\":{\"quelle\":\"" + String(g_lastSrc) + "\",\"httpRx\":" + String((unsigned long)g_httpRx) +
+         ",\"canRx\":" + String((unsigned long)g_canRx) + "}";
+    j += ",\"heap\":" + String(ESP.getFreeHeap()) + "}";
+    webServer.send(200, "application/json", j);
+  });
   webServer.begin();
   Serial.println("WebGUI: gestartet auf Port 80");
 }

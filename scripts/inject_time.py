@@ -1,5 +1,6 @@
 Import("env")
 import datetime
+import subprocess
 
 # Aktuelle lokale PC-Zeit beim Kompilieren als Build-Flags injizieren.
 # Wird genutzt um den PCF85063 RTC beim Flashen auf die korrekte
@@ -21,3 +22,16 @@ env.Append(CPPDEFINES=[
     ("RTC_BUILD_ID", build_id),
 ])
 print(f"[inject_time] RTC build time = {now.isoformat()} (id {build_id})")
+
+# Git-Kurzhash injizieren: WebGUI zeigt ihn + verlinkt auf den GitHub-Stand.
+# "+"-Suffix = Working Tree hatte beim Build uncommittete Aenderungen.
+try:
+    _cwd = env.subst("$PROJECT_DIR")
+    rev = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                  cwd=_cwd, text=True).strip()
+    if subprocess.call(["git", "diff", "--quiet"], cwd=_cwd) != 0:
+        rev += "+"
+except Exception:
+    rev = "unknown"
+env.Append(CPPDEFINES=[("GIT_REV", env.StringifyMacro(rev))])
+print(f"[inject_time] GIT_REV = {rev}")
