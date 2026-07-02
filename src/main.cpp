@@ -106,6 +106,9 @@ static bool     gt911Found = false;
 static uint16_t g_lastTouchX = 0, g_lastTouchY = 0;
 static uint32_t g_lastTouchMs = 0;
 static uint8_t  g_lastTouchStatus = 0;
+// true solange ein Finger auf dem Touch ist -> blockierenden HTTP-Poll aussetzen,
+// damit kein Tap mit einem GET-Timeout kollidiert (Touch bleibt reaktiv).
+static volatile bool g_uiTouchActive = false;
 
 // ---- App state ----
 static uint8_t   currentPage    = 0;
@@ -676,16 +679,24 @@ static void runCanPing() {
 // -------- HTTP-Poll-Client --------
 static bool httpFresh() { return g_httpLastRxMs != 0 && millis() - g_httpLastRxMs < 3000; }
 
-// Minimaler JSON-Feldparser: sucht "key": und liest die folgende Zahl.
-static bool jsonNum(const String& s, const char* key, float& out) {
-  String k = String("\"") + key + "\":";
-  int i = s.indexOf(k);
-  if (i < 0) return false;
-  out = s.substring(i + k.length()).toFloat();
+// Minimaler JSON-Feldparser auf char*-Basis: sucht "key": und liest die folgende
+// Zahl. Bewusst OHNE String/substring -> keine Heap-Allokation im 2-Hz-Poll (frueher
+// ~30 kleine malloc/free pro Poll = Fragmentierung ueber Stunden). Semantik identisch:
+// Muster "key": , dann strtof (ueberspringt Whitespace, stoppt am Komma/'}').
+static bool jsonNum(const char* s, const char* key, float& out) {
+  char pat[24];
+  int n = snprintf(pat, sizeof(pat), "\"%s\":", key);
+  if (n <= 0 || n >= (int)sizeof(pat)) return false;
+  const char* p = strstr(s, pat);
+  if (!p) return false;
+  out = strtof(p + n, nullptr);
   return true;
 }
-static bool jsonTrue(const String& s, const char* key) {
-  return s.indexOf(String("\"") + key + "\":true") >= 0;
+static bool jsonTrue(const char* s, const char* key) {
+  char pat[28];
+  int n = snprintf(pat, sizeof(pat), "\"%s\":true", key);
+  if (n <= 0 || n >= (int)sizeof(pat)) return false;
+  return strstr(s, pat) != nullptr;
 }
 
 static bool hubIsDottedIp() {
@@ -715,7 +726,7 @@ static String hubTarget() {
   String name = g_hubIp;
   int dot = name.indexOf(".local");
   if (dot > 0) name = name.substring(0, dot);
-  IPAddress ip = MDNS.queryHost(name.c_str(), 1500);
+  IPAddress ip = MDNS.queryHost(name.c_str(), 400);   // kurz halten -> blockiert den Loop/Touch nicht 1,5 s
   if (ip != IPAddress(0, 0, 0, 0)) {
     g_hubResolvedIp = ip.toString();
     Serial.printf("mDNS: %s -> %s\n", g_hubIp.c_str(), g_hubResolvedIp.c_str());
@@ -725,6 +736,10 @@ static String hubTarget() {
 
 static void httpPollTick() {
   if (!g_featureWifi || WiFi.status() != WL_CONNECTED || g_hubIp.length() == 0) return;
+  // Solange ein Finger auf dem Touch ist NICHT pollen: der GET blockiert den Loop
+  // (bes. bei schwachem WLAN) und wuerde genau den Tap verschlucken. Daten pausieren
+  // nur fuer die Dauer der Beruehrung -> unmerklich, Touch bleibt reaktiv.
+  if (g_uiTouchActive) return;
   static uint32_t last = 0;
   static uint8_t  failStreak = 0;
   // Backoff: bei totem Hub nur alle 4s pollen, sonst blockiert der GET den Loop
@@ -735,24 +750,30 @@ static void httpPollTick() {
 
   String tgt = hubTarget();
   if (tgt.length() == 0) { if (failStreak < 200) failStreak++; return; }  // Hostname (noch) nicht aufloesbar
-  HTTPClient http;
+  // Statischer Client + Keep-Alive: die TCP-Verbindung zum Hub bleibt offen und
+  // wird wiederverwendet, statt alle 500ms neu zu handshaken -> jeder Poll kostet
+  // nur noch wenige ms (frueher: TCP-Setup + GET pro Poll).
+  static HTTPClient http;
+  static bool httpCfg = false;
+  if (!httpCfg) { http.setReuse(true); httpCfg = true; }
   String url = "http://" + tgt + "/api/status";
   if (!http.begin(url)) { if (failStreak < 200) failStreak++; return; }
-  http.setConnectTimeout(300);     // kurz halten -> Loop/Touch bleibt reaktiv
-  http.setTimeout(400);
+  http.setConnectTimeout(150);     // kurz halten -> Loop/Touch bleibt reaktiv
+  http.setTimeout(250);
   int code = http.GET();
   if (code == 200) {
     String b = http.getString();
+    const char* bc = b.c_str();
     float v;
-    if (jsonNum(b, "rpm", v))       g_rpm = v;
-    if (jsonNum(b, "advance", v))   g_adv = v;
-    if (jsonNum(b, "map", v))       g_map = v;
-    if (jsonNum(b, "lambda", v))  { g_lambda = v; g_lambdaValid = jsonTrue(b, "valid") && v > 0; }
-    if (jsonNum(b, "tune_temp", v)) g_g123Temp = v;
-    if (jsonNum(b, "volt", v))      g_g123Volt = v;
-    if (jsonNum(b, "tune_amp", v))  g_g123Coil = v;
-    if (jsonNum(b, "speed_kmh", v)){ g_speedKmh = v; g_speedValid = true; }
-    g_g123Valid   = jsonTrue(b, "tune_connected");
+    if (jsonNum(bc, "rpm", v))       g_rpm = v;
+    if (jsonNum(bc, "advance", v))   g_adv = v;
+    if (jsonNum(bc, "map", v))       g_map = v;
+    if (jsonNum(bc, "lambda", v))  { g_lambda = v; g_lambdaValid = jsonTrue(bc, "valid") && v > 0; }
+    if (jsonNum(bc, "tune_temp", v)) g_g123Temp = v;
+    if (jsonNum(bc, "volt", v))      g_g123Volt = v;
+    if (jsonNum(bc, "tune_amp", v))  g_g123Coil = v;
+    if (jsonNum(bc, "speed_kmh", v)){ g_speedKmh = v; g_speedValid = true; }
+    g_g123Valid   = jsonTrue(bc, "tune_connected");
     g_lastSrc     = "HTTP";
     g_httpRx++;
     if (g_httpRx == 1) Serial.printf("HTTP: erste Daten von %s\n", tgt.c_str());
@@ -3037,6 +3058,7 @@ void loop() {
       }
     }
   }
+  g_uiTouchActive = touchActive;   // HTTP-Poll pausiert, solange beruehrt (kein verschluckter Tap)
 #endif
 
   // Serial commands
