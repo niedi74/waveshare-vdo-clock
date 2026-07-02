@@ -750,16 +750,17 @@ static void httpPollTick() {
 
   String tgt = hubTarget();
   if (tgt.length() == 0) { if (failStreak < 200) failStreak++; return; }  // Hostname (noch) nicht aufloesbar
-  // Statischer Client + Keep-Alive: die TCP-Verbindung zum Hub bleibt offen und
-  // wird wiederverwendet, statt alle 500ms neu zu handshaken -> jeder Poll kostet
-  // nur noch wenige ms (frueher: TCP-Setup + GET pro Poll).
-  static HTTPClient http;
-  static bool httpCfg = false;
-  if (!httpCfg) { http.setReuse(true); httpCfg = true; }
+  // Frische Verbindung pro Poll (KEIN Keep-Alive): der Hub-WebServer schliesst die
+  // Verbindung nach jedem Request -> ein wiederverwendeter Socket liefe ins Leere und
+  // erzeugte periodische Fehl-Polls (failStreak-Backoff -> 4-5 s alte Cockpit-Daten).
+  // Fresh-Connect ist robust; der Touch wird nicht ueber kurze Timeouts, sondern ueber
+  // die Poll-Pause bei Fingerkontakt (g_uiTouchActive) geschuetzt.
+  HTTPClient http;
+  http.setReuse(false);
   String url = "http://" + tgt + "/api/status";
   if (!http.begin(url)) { if (failStreak < 200) failStreak++; return; }
-  http.setConnectTimeout(150);     // kurz halten -> Loop/Touch bleibt reaktiv
-  http.setTimeout(250);
+  http.setConnectTimeout(200);     // kurz halten -> Loop/Touch bleibt reaktiv
+  http.setTimeout(350);            // etwas Luft fuer langsamere Hub-Antworten
   int code = http.GET();
   if (code == 200) {
     String b = http.getString();
