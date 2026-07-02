@@ -2281,6 +2281,7 @@ static void handleWebRoot() {
 
   html += F("<div class='tabs'>"
     "<button class='tabbtn' id='b-live' onclick=\"sh('live',this)\">Live</button>"
+    "<button class='tabbtn' onclick=\"sh('scr',this);drawScreen()\">Vorschau</button>"
     "<button class='tabbtn' onclick=\"sh('wlan',this)\">WLAN</button>"
     "<button class='tabbtn' onclick=\"sh('anz',this)\">Anzeige</button>"
     "<button class='tabbtn' onclick=\"sh('imu',this)\">IMU</button>"
@@ -2310,6 +2311,16 @@ static void handleWebRoot() {
     "<a href='/page?p=6'><button>IMU</button></a>"
     "<a href='/page?p=5'><button>Setup</button></a></div>");
   html += F("</div>");
+
+  // ===== Tab: Vorschau (Live-Screenshot des Displays) =====
+  html += F("<div class='tab' id='t-scr'><div class='card'><h3>Display-Vorschau</h3>"
+    "<canvas id='scr' width='160' height='160' style='width:288px;height:288px;border-radius:50%;"
+    "background:#000;image-rendering:pixelated'></canvas>"
+    "<div style='margin-top:10px'><label><input type='checkbox' id='scrAuto' checked> Auto (1,5 s)</label> "
+    "<button onclick='drawScreen()'>Aktualisieren</button></div>"
+    "<div id='scrInfo' style='color:#888'>&nbsp;</div>"
+    "<div style='color:#666;font-size:.85em'>Spiegelt den echten Screen (inkl. Rotation). "
+    "Auto-Refresh nur solange dieser Tab offen ist.</div></div></div>");
 
   // ===== Tab: WLAN =====
   html += F("<div class='tab' id='t-wlan'>");
@@ -2465,6 +2476,15 @@ static void handleWebRoot() {
     "var y=document.querySelectorAll('.tabbtn');"
     "for(var i=0;i<y.length;i++)y[i].style.background='';b.style.background='#6c6';}"
     "window.addEventListener('load',function(){var b=document.getElementById('b-live');if(b)b.style.background='#6c6';});"
+    "function drawScreen(){var c=document.getElementById('scr');if(!c)return;"
+    "fetch('/screen?t='+Date.now()).then(function(r){return r.arrayBuffer();}).then(function(ab){"
+    "var dv=new DataView(ab),n=160*160,ctx=c.getContext('2d'),img=ctx.createImageData(160,160);"
+    "for(var i=0;i<n;i++){var v=dv.getUint16(i*2,true),r=(v>>11)&31,g=(v>>5)&63,b=v&31,o=i*4;"
+    "img.data[o]=(r<<3)|(r>>2);img.data[o+1]=(g<<2)|(g>>4);img.data[o+2]=(b<<3)|(b>>2);img.data[o+3]=255;}"
+    "ctx.putImageData(img,0,0);var el=document.getElementById('scrInfo');if(el)el.textContent=new Date().toLocaleTimeString();"
+    "}).catch(function(e){var el=document.getElementById('scrInfo');if(el)el.textContent='Fehler';});}"
+    "setInterval(function(){var a=document.getElementById('scrAuto'),t=document.getElementById('t-scr');"
+    "if(a&&a.checked&&t&&t.className.indexOf('on')>=0)drawScreen();},1500);"
     "</script></body></html>");
   webServer.send(200, "text/html", html);
 }
@@ -2638,8 +2658,32 @@ static void handleWebSdWifi() {
   webServer.send(303, "text/plain", "ok");
 }
 
+// Display-Vorschau: Framebuffer (480x480 RGB565) auf 160x160 heruntersampeln (nearest
+// neighbor) und als Roh-Binaerdaten (LE uint16) senden. Der Browser dekodiert RGB565 auf
+// ein Canvas. Bewusst klein (~50KB): das Senden blockiert den Loop kurz -> Schreibtisch-Tool,
+// Auto-Refresh laeuft nur solange der Vorschau-Tab offen ist.
+static void handleWebScreen() {
+  uint16_t* fb = hal_fb();
+  if (!fb) { webServer.send(503, "text/plain", "no fb"); return; }
+  const int OUT = 160, STEP = 3;                 // 480 / 160 = 3
+  const size_t len = (size_t)OUT * OUT * 2;
+  uint16_t* buf = (uint16_t*)ps_malloc(len);
+  if (!buf) { webServer.send(503, "text/plain", "no mem"); return; }
+  for (int oy = 0; oy < OUT; oy++) {
+    const uint16_t* srow = fb + (size_t)(oy * STEP) * 480;
+    uint16_t* drow = buf + (size_t)oy * OUT;
+    for (int ox = 0; ox < OUT; ox++) drow[ox] = srow[ox * STEP];
+  }
+  webServer.setContentLength(len);
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/octet-stream", "");
+  webServer.sendContent((const char*)buf, len);
+  free(buf);
+}
+
 static void startWebServer() {
   webServer.on("/",        handleWebRoot);
+  webServer.on("/screen",  handleWebScreen);
   webServer.on("/set",     handleWebSet);
   webServer.on("/features",handleWebFeatures);
   webServer.on("/page",    handleWebPage);
