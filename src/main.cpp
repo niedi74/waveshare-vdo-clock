@@ -2293,15 +2293,17 @@ static void handleWebRoot() {
   html += F("<div class='tab on' id='t-live'>");
   html += F("<div class='card'><h3>Spartan-Hub Live</h3>");
   bool anyFresh = bleFresh() || canFresh() || httpFresh();
-  html += "<div>Quelle: <b>" + String(anyFresh ? g_lastSrc : "---") + "</b> &middot; " +
-          String(anyFresh ? "LIVE" : "keine Daten") + "</div>";
-  html += "<div>Lambda: " + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) +
-          " &nbsp; RPM: " + String((int)g_rpm) + " &nbsp; ADV: " + String(g_adv, 1) + "</div>";
-  html += "<div>MAP: " + String((int)g_map) + " &nbsp; TEMP: " + String((int)g_g123Temp) +
-          " &nbsp; VOLT: " + String(g_g123Volt, 1) + " &nbsp; AMP: " + String(g_g123Coil, 1) + "</div>";
-  html += "<div style='color:#888'>HTTP rx " + String((unsigned long)g_httpRx) +
-          " &middot; CAN rx " + String((unsigned long)g_canRx) +
-          " &middot; BLE rx " + String((unsigned long)g_bleRxCnt) + "</div></div>";
+  html += "<div>Quelle: <b id='lv_src'>" + String(anyFresh ? g_lastSrc : "---") + "</b> &middot; " +
+          "<span id='lv_fresh'>" + String(anyFresh ? "LIVE" : "keine Daten") + "</span></div>";
+  html += "<div>Lambda: <span id='lv_lam'>" + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) +
+          "</span> &nbsp; RPM: <span id='lv_rpm'>" + String((int)g_rpm) +
+          "</span> &nbsp; ADV: <span id='lv_adv'>" + String(g_adv, 1) + "</span></div>";
+  html += "<div>MAP: <span id='lv_map'>" + String((int)g_map) + "</span> &nbsp; TEMP: <span id='lv_temp'>" +
+          String((int)g_g123Temp) + "</span> &nbsp; VOLT: <span id='lv_volt'>" + String(g_g123Volt, 1) +
+          "</span> &nbsp; AMP: <span id='lv_amp'>" + String(g_g123Coil, 1) + "</span></div>";
+  html += "<div style='color:#888'>HTTP rx <span id='lv_http'>" + String((unsigned long)g_httpRx) +
+          "</span> &middot; CAN rx <span id='lv_can'>" + String((unsigned long)g_canRx) +
+          "</span> &middot; BLE rx <span id='lv_ble'>" + String((unsigned long)g_bleRxCnt) + "</span></div></div>";
   html += F("<div class='card'><h3>Display-Seite</h3>"
     "<a href='/page?p=0'><button>Uhr</button></a>"
     "<a href='/page?p=1'><button>Menu</button></a>"
@@ -2485,6 +2487,14 @@ static void handleWebRoot() {
     "}).catch(function(e){var el=document.getElementById('scrInfo');if(el)el.textContent='Fehler';});}"
     "setInterval(function(){var a=document.getElementById('scrAuto'),t=document.getElementById('t-scr');"
     "if(a&&a.checked&&t&&t.className.indexOf('on')>=0)drawScreen();},1500);"
+    "function updLive(){fetch('/live?t='+Date.now()).then(function(r){return r.json();}).then(function(d){"
+    "function S(id,v){var e=document.getElementById(id);if(e)e.textContent=v;}"
+    "S('lv_src',d.src);S('lv_fresh',d.fresh?'LIVE':'keine Daten');"
+    "S('lv_lam',d.lambda==null?'---':d.lambda.toFixed(2));S('lv_rpm',d.rpm);S('lv_adv',d.adv.toFixed(1));"
+    "S('lv_map',d.map);S('lv_temp',d.temp);S('lv_volt',d.volt.toFixed(1));S('lv_amp',d.amp.toFixed(1));"
+    "S('lv_http',d.httpRx);S('lv_can',d.canRx);S('lv_ble',d.bleRx);}).catch(function(){});}"
+    "setInterval(function(){var t=document.getElementById('t-live');"
+    "if(t&&t.className.indexOf('on')>=0)updLive();},1000);"
     "</script></body></html>");
   webServer.send(200, "text/html", html);
 }
@@ -2681,9 +2691,31 @@ static void handleWebScreen() {
   free(buf);
 }
 
+// Live-Cockpitwerte als JSON fuer den Live-Tab (pollt im Sekundentakt statt Reload).
+// Klein (~200 B) -> blockiert den Loop kaum, laeuft nur solange der Live-Tab offen ist.
+static void handleWebLive() {
+  const bool anyFresh = bleFresh() || canFresh() || httpFresh();
+  String j = "{";
+  j += "\"src\":\"" + String(anyFresh ? g_lastSrc : "---") + "\",";
+  j += "\"fresh\":" + String(anyFresh ? "true" : "false") + ",";
+  j += "\"lambda\":" + (g_lambdaValid ? String(g_lambda, 2) : String("null")) + ",";
+  j += "\"rpm\":" + String((int)g_rpm) + ",";
+  j += "\"adv\":" + String(g_adv, 1) + ",";
+  j += "\"map\":" + String((int)g_map) + ",";
+  j += "\"temp\":" + String((int)g_g123Temp) + ",";
+  j += "\"volt\":" + String(g_g123Volt, 1) + ",";
+  j += "\"amp\":" + String(g_g123Coil, 1) + ",";
+  j += "\"httpRx\":" + String((unsigned long)g_httpRx) + ",";
+  j += "\"canRx\":" + String((unsigned long)g_canRx) + ",";
+  j += "\"bleRx\":" + String((unsigned long)g_bleRxCnt) + "}";
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/json", j);
+}
+
 static void startWebServer() {
   webServer.on("/",        handleWebRoot);
   webServer.on("/screen",  handleWebScreen);
+  webServer.on("/live",    handleWebLive);
   webServer.on("/set",     handleWebSet);
   webServer.on("/features",handleWebFeatures);
   webServer.on("/page",    handleWebPage);
