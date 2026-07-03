@@ -1124,6 +1124,8 @@ static void drawHand(float value, float maxValue, int length, int thickness, uin
 static uint8_t glyphColumn(char c, uint8_t col) {
   static const uint8_t blank[5] = {0,0,0,0,0};
   const uint8_t *g = blank;
+  if (c >= 'a' && c <= 'z') c -= 32;   // Font ist UPPERCASE-only -> Kleinbuchstaben als CAPS rendern
+                                        // (vorher wurden sie zu Leerzeichen: "Passwort" -> "P   ")
   switch (c) {
     case 'A': { static const uint8_t v[5]={0x7E,0x11,0x11,0x11,0x7E}; g=v; break; }
     case 'B': { static const uint8_t v[5]={0x7F,0x49,0x49,0x49,0x36}; g=v; break; }
