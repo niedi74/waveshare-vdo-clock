@@ -109,6 +109,9 @@ static uint8_t  g_lastTouchStatus = 0;
 // true solange ein Finger auf dem Touch ist -> blockierenden HTTP-Poll aussetzen,
 // damit kein Tap mit einem GET-Timeout kollidiert (Touch bleibt reaktiv).
 static volatile bool g_uiTouchActive = false;
+// true waehrend eines WiFi-Scans -> BLE-Ticks (Hub/123) aussetzen: BLE und WiFi
+// teilen sich das 2.4GHz-Radio, ein laufender BLE-Scan laesst den WiFi-Scan haengen.
+static volatile bool g_wlanScanBusy = false;
 
 // ---- App state ----
 static uint8_t   currentPage    = 0;
@@ -584,6 +587,7 @@ static void bleConnect() {
 }
 
 static void bleTick() {
+  if (g_wlanScanBusy) return;                // waehrend WiFi-Scan Radio nicht fuer BLE nutzen
   if (bleDoConnect) { bleConnect(); return; }
   if (!g_bleConn && bleNextScanAt != 0 && millis() >= bleNextScanAt) {
     bleNextScanAt = 0;
@@ -920,6 +924,7 @@ static void tune123Connect() {
 }
 
 static void tune123ScanTick() {
+  if (g_wlanScanBusy) return;                    // waehrend WiFi-Scan kein BLE-Scan (Radio-Konflikt)
   if (!g_feature123) return;                     // Fallback nur wenn bewusst aktiviert (sonst kein BLE -> fluessig)
   if (g_featureBle) return;                      // wenn Hub-BLE aktiv: Radio gehoert dem Hub-Client
   if (httpFresh() || canFresh()) {               // Hub-Quelle da -> 123 freigeben
@@ -2217,20 +2222,21 @@ static void runWlanScan() {
   drawCircleLine(240, 240, 214, 3, RGB565(185, 150, 45));
   drawTextCentered(240, 220, "Scanne...", RGB565(230, 190, 70), 3);
   presentFrame();
+  g_wlanScanBusy = true;                    // Hub-/123-BLE-Ticks aussetzen (Radio-Konflikt)
+  // KERN-FIX: laufenden NimBLE-Scan stoppen. BLE + WiFi teilen sich das 2.4GHz-Radio;
+  // ein aktiver BLE-Scan (123-Fallback bei fehlenden Hub-Daten) laesst esp_wifi_scan_start
+  // haengen/scheitern ("wlan scan failed"). Genau der Zustand des Bus-Displays.
+  if (g_bleInited) { NimBLEDevice::getScan()->stop(); delay(150); }
   WiFi.scanDelete();
-  // Laufenden Connect sauber abbrechen: solange der Stack "sta is connecting" ist,
-  // schlaegt esp_wifi_scan_start fehl (-2 = "Scan-Fehler"). AutoReconnect kurz aus,
-  // disconnecten, Status abwarten, dann scannen - mit einem Retry als Nachfasser.
   WiFi.setAutoReconnect(false);
-  WiFi.disconnect();
-  for (int i = 0; i < 20 && WiFi.status() == WL_CONNECTED; i++) delay(50);
-  delay(400);                              // Stack von "connecting" nach idle kommen lassen
-  g_scanN = WiFi.scanNetworks();           // synchron, ~2-3 s
-  if (g_scanN < 0) {                       // einmal nachfassen (Stack brauchte noch Zeit)
-    delay(800);
-    g_scanN = WiFi.scanNetworks();
-  }
+  WiFi.disconnect();                        // laufenden Connect abbrechen (sonst "sta is connecting")
+  delay(300);
+  // Kurze Kanalzeit (200ms) -> ~3s statt >5s, sonst schlaegt der Task-Watchdog an.
+  g_scanN = WiFi.scanNetworks(false, false, false, 200);
+  if (g_scanN < 0) { delay(400); g_scanN = WiFi.scanNetworks(false, false, false, 200); }
   WiFi.setAutoReconnect(true);
+  g_wlanScanBusy = false;
+  reconnectWifiProfile();                   // gleich wieder verbinden (nicht auf Auto-Tick warten)
   Serial.printf("WLAN-Scan: %d Netze\n", (int)g_scanN);
   currentPage = 12;
   drawScanPage();
