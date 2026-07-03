@@ -2289,9 +2289,9 @@ static void loadSettings() {
   }
   if (!g_wprof[0].hubip[0]) p.getString("hub_ip", g_wprof[0].hubip, sizeof(g_wprof[0].hubip));
   if (!g_wprof[1].ssid[0]) {                        // Default Hub-AP in Slot 1
-    // ECHTER Bus-Hub = "Spartan3-Hub" (auf Z00 als .91). Der Test-Hub im Haus heisst
-    // "Spartan3-TestHub" - fuer Schreibtisch-Displays per wifi:set/WebGUI eintragen.
-    strncpy(g_wprof[1].ssid, "Spartan3-Hub", sizeof(g_wprof[1].ssid) - 1);
+    // ECHTER Bus-Hub-AP = "SPARTAN3-HUB" (per Hub-API bestaetigt; auf Z00 als .91).
+    // Der Test-Hub im Haus heisst "Spartan3-TestHub" - per wifi:set/wifi.txt eintragen.
+    strncpy(g_wprof[1].ssid, "SPARTAN3-HUB", sizeof(g_wprof[1].ssid) - 1);
     strncpy(g_wprof[1].pass, "lambda123",    sizeof(g_wprof[1].pass) - 1);
   }
   if (!g_wprof[1].hubip[0]) strncpy(g_wprof[1].hubip, "spartanhub.local", sizeof(g_wprof[1].hubip) - 1);  // Hub-AP: Gateway/mDNS (Subnetz egal)
@@ -2330,6 +2330,19 @@ static void loadSettings() {
   g_lambdaStyle   = p.getUChar("lstyle", 0);          // 0=Gauge, 1=Verlauf
   if (g_lambdaStyle > 1) g_lambdaStyle = 0;
   p.end();
+  // Einmalige Migration: falsch getippte/veraltete Hub-AP-Namen (Tastatur konnte nur
+  // eine Schreibung darstellen, SSIDs sind case-sensitiv) auf den echten AP-Namen
+  // ziehen. "Spartan3-TestHub" bleibt bewusst unangetastet (Schreibtisch/Test).
+  if (!strcmp(g_wprof[1].ssid, "Spartan3-hup") || !strcmp(g_wprof[1].ssid, "SPARTAN3-HUP") ||
+      !strcmp(g_wprof[1].ssid, "Spartan3-Hub")) {
+    strncpy(g_wprof[1].ssid, "SPARTAN3-HUB", sizeof(g_wprof[1].ssid) - 1);
+    strncpy(g_wprof[1].pass, "lambda123",    sizeof(g_wprof[1].pass) - 1);
+    Preferences pm; pm.begin("clock", false);
+    pm.putString("wp1_s", g_wprof[1].ssid);
+    pm.putString("wp1_p", g_wprof[1].pass);
+    pm.end();
+    Serial.println("Migration: Hub-AP-Profil -> SPARTAN3-HUB");
+  }
   if (g_dialScalePct  < 30)  g_dialScalePct  = 30;
   if (g_dialScalePct  > 150) g_dialScalePct  = 150;
   if (g_brightnessPct < 5)   g_brightnessPct = 5;
