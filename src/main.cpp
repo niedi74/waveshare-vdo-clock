@@ -1439,14 +1439,15 @@ static const GaugeTheme THEME_DIGITAL = {
   RGB565(60,200,90), RGB565(200,120,50), true, RGB565(28,24,20) };
 
 static const GaugeTheme THEME_VDO = {
-  // Farben DIREKT vom VDO-Quartz-Zeit-Zifferblatt gesampelt (/screen der Uhr-Seite,
-  // Foto-Abgleich 3.7.): Flaeche RGB(16,16,16) fast schwarz, Creme RGB(232,232,224),
-  // Gold-Nabe RGB(208,168,40). Vorher (84,86,90) war deutlich zu hell.
-  RGB565(16,16,16), RGB565(214,218,222), RGB565(110,114,120), true, false, true, true,
-  RGB565(232,232,224), RGB565(150,148,130), RGB565(232,232,224),
-  RGB565(232,232,224), RGB565(208,168,40), RGB565(40,30,16),
-  false, RGB565(232,232,224), RGB565(150,148,130),
-  RGB565(232,232,224), RGB565(220,44,32), false, RGB565(30,32,36) };
+  // ZWEI Original-Referenzen im T2b (Cockpit-Fotos 3.7.): der TACHO daneben ist
+  // ausgeblichen-GRAU mit weissen Zahlen, die Quartz-Zeit-UHR fast schwarz mit Creme.
+  // Kombi-Flaeche = Tacho-Grau (84,86,90); die dunkle Uhr-Scheibe zeichnet der
+  // VDO+UHR-Stil separat (RGB 16,16,16, von der Uhr-Seite gesampelt).
+  RGB565(84,86,90), RGB565(214,218,222), RGB565(110,114,120), true, false, true, true,
+  RGB565(228,228,222), RGB565(150,148,138), RGB565(228,228,222),
+  RGB565(232,230,214), RGB565(208,168,40), RGB565(40,30,16),
+  false, RGB565(228,228,222), RGB565(150,148,138),
+  RGB565(228,228,222), RGB565(220,44,32), false, RGB565(30,32,36) };
 
 static const GaugeTheme THEME_123 = {
   RGB565(12,12,14), RGB565(206,210,214), RGB565(90,94,100), true, false, false, false,
@@ -1589,14 +1590,19 @@ static void drawMotorPage() {
   drawTach(240, 240, g_rpm, fresh, t, M_S);
 
   if (g_motorStyle == 3) {
-    // ===== VDO+UHR: Tacho aussen (VDO-Look), ANALOGE UHR in der Mitte =====
+    // ===== VDO+UHR: Tacho aussen (Tacho-Grau wie der Speedo daneben), in der
+    // ===== Mitte die fast schwarze Uhr-Scheibe (wie die echte Quartz-Zeit) =====
     if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_rpm); else strcpy(buf, "----");
     drawTextCentered(240, M_Y(104), buf, fresh ? t.txt : t.txtDim, M_F(3));
-    // Uhr-Ticks: 12 Striche auf Radius ~100 (3/6/9/12 kraeftiger)
+    // Dunkle Uhr-Scheibe (zweifarbig wie das echte Cockpit: grauer Tacho + schwarze Uhr)
+    fillCircleFast(240, 240, M_R(106), RGB565(16, 16, 16));
+    drawCircleLine(240, 240, M_R(106), 2, RGB565(40, 42, 44));   // dezente Kante
+    // Uhr-Ticks: 12 Striche (3/6/9/12 kraeftiger), Creme wie die Original-Uhr
     for (int k = 0; k < 12; k++) {
       float a = k * 30.0f - 90.0f;
       bool major = (k % 3) == 0;
-      plotRadial(240, 240, a, M_R(major ? 88 : 93), M_R(100), major ? t.tickMaj : t.tickMin, major ? 3 : 2);
+      plotRadial(240, 240, a, M_R(major ? 88 : 93), M_R(100),
+                 major ? RGB565(232,232,224) : RGB565(170,168,156), major ? 3 : 2);
     }
     struct tm cn = {};
     if (readClockTime(&cn)) {
