@@ -418,7 +418,8 @@ static void wifiAutoTick() {
     if (g_wprof[slot].hubip[0]) g_hubIp = g_wprof[slot].hubip;
     strcpy(g_ipStr, "...");
     WiFi.begin(g_wprof[slot].ssid, g_wprof[slot].pass);
-    tryAt = millis() + 6000;                       // diesem Profil 6 s geben
+    tryAt = millis() + 9000;                       // diesem Profil 9 s geben (schwaches Signal:
+                                                   // Assoc+DHCP brauchen >6 s -> "keine IP"-Abbrueche)
     Serial.printf("WiFi-Auto: versuche %s (%s)\n", WPROF_LABELS[slot], g_wprof[slot].ssid);
     return;
   }
@@ -2198,8 +2199,10 @@ static void loadSettings() {
   }
   if (!g_wprof[0].hubip[0]) p.getString("hub_ip", g_wprof[0].hubip, sizeof(g_wprof[0].hubip));
   if (!g_wprof[1].ssid[0]) {                        // Default Hub-AP in Slot 1
-    strncpy(g_wprof[1].ssid, "Spartan3-TestHub", sizeof(g_wprof[1].ssid) - 1);
-    strncpy(g_wprof[1].pass, "lambda123",        sizeof(g_wprof[1].pass) - 1);
+    // ECHTER Bus-Hub = "Spartan3-Hub" (auf Z00 als .91). Der Test-Hub im Haus heisst
+    // "Spartan3-TestHub" - fuer Schreibtisch-Displays per wifi:set/WebGUI eintragen.
+    strncpy(g_wprof[1].ssid, "Spartan3-Hub", sizeof(g_wprof[1].ssid) - 1);
+    strncpy(g_wprof[1].pass, "lambda123",    sizeof(g_wprof[1].pass) - 1);
   }
   if (!g_wprof[1].hubip[0]) strncpy(g_wprof[1].hubip, "spartanhub.local", sizeof(g_wprof[1].hubip) - 1);  // Hub-AP: Gateway/mDNS (Subnetz egal)
   if (!g_wprof[2].ssid[0])  strncpy(g_wprof[2].ssid,  "Android-AP1",      sizeof(g_wprof[2].ssid)  - 1);  // S24: Hotspot-SSID
