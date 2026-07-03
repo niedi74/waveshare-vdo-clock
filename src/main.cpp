@@ -2218,9 +2218,19 @@ static void runWlanScan() {
   drawTextCentered(240, 220, "Scanne...", RGB565(230, 190, 70), 3);
   presentFrame();
   WiFi.scanDelete();
-  WiFi.disconnect();                       // laufenden Connect abbrechen (sonst Scan-Fehler)
-  delay(150);
+  // Laufenden Connect sauber abbrechen: solange der Stack "sta is connecting" ist,
+  // schlaegt esp_wifi_scan_start fehl (-2 = "Scan-Fehler"). AutoReconnect kurz aus,
+  // disconnecten, Status abwarten, dann scannen - mit einem Retry als Nachfasser.
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect();
+  for (int i = 0; i < 20 && WiFi.status() == WL_CONNECTED; i++) delay(50);
+  delay(400);                              // Stack von "connecting" nach idle kommen lassen
   g_scanN = WiFi.scanNetworks();           // synchron, ~2-3 s
+  if (g_scanN < 0) {                       // einmal nachfassen (Stack brauchte noch Zeit)
+    delay(800);
+    g_scanN = WiFi.scanNetworks();
+  }
+  WiFi.setAutoReconnect(true);
   Serial.printf("WLAN-Scan: %d Netze\n", (int)g_scanN);
   currentPage = 12;
   drawScanPage();
