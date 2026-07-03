@@ -3553,6 +3553,21 @@ void loop() {
         }
         else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
         else if (cmd == "scan")      { runWlanScan(); }   // Test: einmaliger WLAN-Scan + Ergebnisseite
+        else if (cmd == "thub:show") { Serial.printf("Test-Hub: %s ip=%s\n", g_testHub ? "AN" : "aus", g_testHubIp); }
+        else if (cmd == "thub:on" || cmd == "thub:off") {
+          g_testHub = (cmd == "thub:on");
+          Preferences pt; pt.begin("clock", false); pt.putBool("thub", g_testHub); pt.end();
+          if (!g_testHub && g_lastSrc && !strcmp(g_lastSrc, "TEST")) g_lastSrc = "HTTP";
+          Serial.printf("Test-Hub = %s (ip=%s)\n", g_testHub ? "AN" : "aus", g_testHubIp);
+        }
+        else if (cmd.startsWith("thub:ip ")) {
+          String v = rawCmd.substring(8); v.trim();
+          if (v.length() && v.length() < sizeof(g_testHubIp)) {
+            snprintf(g_testHubIp, sizeof(g_testHubIp), "%s", v.c_str());
+            Preferences pt; pt.begin("clock", false); pt.putString("thub_ip", g_testHubIp); pt.end();
+            Serial.printf("Test-Hub-IP = %s\n", g_testHubIp);
+          }
+        }
         else if (cmd == "wifi:show") {           // alle Profile dumpen (Debug)
           for (int i = 0; i < WPROF_COUNT; i++)
             Serial.printf("Profil %d (%s): ssid='%s' pass='%s' hubip='%s'\n",
