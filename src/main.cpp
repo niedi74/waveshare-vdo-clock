@@ -799,7 +799,9 @@ static void httpPollTick() {
     if (jsonNum(bc, "tune_amp", v))  g_g123Coil = v;
     if (jsonNum(bc, "speed_kmh", v)){ g_speedKmh = v; g_speedValid = true; }
     g_g123Valid   = jsonTrue(bc, "tune_connected");
-    g_lastSrc     = g_testHub ? "TEST" : "HTTP";   // Test-Modus ueberall sichtbar machen
+    // Quelle kennzeichnen: Dev-Schalter ODER Test-Hub-AP erkannt am Subnetz.
+    // Beschluss 3.7.: Live-Hub-AP = 192.168.4.x, Test-Hub-AP = 192.168.5.x.
+    g_lastSrc     = (g_testHub || tgt.startsWith("192.168.5.")) ? "TEST" : "HTTP";
     g_httpRx++;
     if (g_httpRx == 1) Serial.printf("HTTP: erste Daten von %s\n", tgt.c_str());
     g_httpLastRxMs = millis();
