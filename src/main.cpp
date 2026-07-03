@@ -127,6 +127,19 @@ static bool      g_autoCockpit    = true;  // Drehzahl > Schwelle -> automatisch
 static int       g_autoCockpitRpm = 600;   // Schwelle, per WebGUI variabel einstellbar
 static bool      g_testHub        = false; // Dev: Daten vom Test-Hub (feste IP) statt Profil-Hub; Quelle heisst dann "TEST"
 static char      g_testHubIp[40]  = "192.168.0.87";  // Test-Hub im Heimnetz, per Dev-Tab einstellbar
+// ---- Alarme (Grenzwerte per Dev-Tab, NVS-persistent). Bei Verletzung blinkt auf
+// ---- JEDER Seite ein roter Ring (Overlay in presentFrame) + optional Buzzer-Piep.
+static bool      g_alertsOn  = true;       // Alarme global an/aus
+static float     g_alLamMin  = 0.90f;      // Lambda-Soll-Band (auch gruenes Band im Trend)
+static float     g_alLamMax  = 1.10f;
+static int       g_alRpmMax  = 4500;       // Drehzahl-Alarm (T2b Typ4)
+static int       g_alTempMax = 90;         // 123TUNE-Temp-Alarm (Grad C)
+static float     g_alVoltMin = 11.5f;      // Unterspannung bei laufendem Motor
+static uint8_t   g_alertMask = 0;          // Bits: 1=Lambda 2=Drehzahl 4=Temp 8=Volt
+static char      g_alertText[24] = "";     // z.B. "DREHZAHL LAMBDA"
+// ---- Tacho-Konfiguration (Dev-Tab): roter Bereich + Skalenende
+static int       g_rpmRedline = 6000;      // Tacho: rot ab hier
+static int       g_rpmScaleMax = 8000;     // Tacho: Skalenende
 #define FW_BUILD __DATE__ " " __TIME__     // Firmware-Stand (Compile-Zeit) fuer die WebGUI
 #ifndef GIT_REV
   #define GIT_REV "unknown"                // wird von scripts/inject_time.py injiziert
@@ -1038,7 +1051,17 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
 
 // ---- Display helpers (all writes go through HAL) ----
 static bool ensureFrame()         { return hal_fb() != nullptr; }
-static void presentFrame()        { hal_present(); }
+static void drawCircleLine(int cx, int cy, int radius, int thickness, uint16_t color);  // fwd
+static void drawTextCentered(int cx, int y, const char *text, uint16_t color, int scale);  // fwd
+// Zentraler Present: bei aktivem Alarm blinkt ein roter Ring + Grund als Overlay
+// auf JEDER Seite (alle Seiten zeichnen voll neu -> Overlay verschwindet sauber).
+static void presentFrame() {
+  if (g_alertMask && (millis() / 500) % 2 == 0) {
+    drawCircleLine(240, 240, 236, 10, RGB565(220, 44, 32));
+    if (g_alertText[0]) drawTextCentered(240, 20, g_alertText, RGB565(235, 60, 45), 2);
+  }
+  hal_present();
+}
 static void fillFrame(uint16_t c) { hal_fill(c); }
 
 static void setPixel(int x, int y, uint16_t color) {
@@ -1104,8 +1127,12 @@ static uint8_t glyphColumn(char c, uint8_t col) {
   switch (c) {
     case 'A': { static const uint8_t v[5]={0x7E,0x11,0x11,0x11,0x7E}; g=v; break; }
     case 'B': { static const uint8_t v[5]={0x7F,0x49,0x49,0x49,0x36}; g=v; break; }
+    case 'C': { static const uint8_t v[5]={0x3E,0x41,0x41,0x41,0x22}; g=v; break; }
     case 'D': { static const uint8_t v[5]={0x7F,0x41,0x41,0x22,0x1C}; g=v; break; }
     case 'E': { static const uint8_t v[5]={0x7F,0x49,0x49,0x49,0x41}; g=v; break; }
+    case 'F': { static const uint8_t v[5]={0x7F,0x09,0x09,0x09,0x01}; g=v; break; }
+    case 'G': { static const uint8_t v[5]={0x3E,0x41,0x49,0x49,0x3A}; g=v; break; }
+    case 'J': { static const uint8_t v[5]={0x20,0x40,0x41,0x3F,0x01}; g=v; break; }
     case 'H': { static const uint8_t v[5]={0x7F,0x08,0x08,0x08,0x7F}; g=v; break; }
     case 'I': { static const uint8_t v[5]={0x00,0x41,0x7F,0x41,0x00}; g=v; break; }
     case 'K': { static const uint8_t v[5]={0x7F,0x08,0x14,0x22,0x41}; g=v; break; }
@@ -1315,6 +1342,43 @@ static bool bleFresh() {
   return g_bleConn && (millis() - g_bleLastRx < 3000);
 }
 
+// ===== Alarme: Grenzwerte pruefen (alle 500ms), Overlay via presentFrame =====
+static void alertTick() {
+  static uint32_t at = 0;
+  if (millis() < at) return;
+  at = millis() + 500;
+  uint8_t m = 0;
+  const bool fresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
+  if (g_alertsOn && fresh) {
+    const bool running = g_rpm >= 250.0f;          // Motor dreht (kein Alarm im Stand/aus; Test-Hub sendet 300)
+    if (running && g_lambdaValid && (g_lambda < g_alLamMin || g_lambda > g_alLamMax)) m |= 1;
+    if (g_rpm > (float)g_alRpmMax)                                                    m |= 2;
+    if (g_g123Valid && g_g123Temp > (float)g_alTempMax)                               m |= 4;
+    if (running && g_g123Valid && g_g123Volt > 1.0f && g_g123Volt < g_alVoltMin)      m |= 8;
+  }
+  if (m != g_alertMask) {
+    g_alertMask = m;
+    g_alertText[0] = 0;
+    if (m & 2) strlcat(g_alertText, "DREHZAHL ", sizeof(g_alertText));
+    if (m & 1) strlcat(g_alertText, "LAMBDA ",   sizeof(g_alertText));
+    if (m & 4) strlcat(g_alertText, "TEMP ",     sizeof(g_alertText));
+    if (m & 8) strlcat(g_alertText, "VOLT ",     sizeof(g_alertText));
+    size_t n = strlen(g_alertText);                 // trailing space weg
+    if (n && g_alertText[n-1] == ' ') g_alertText[n-1] = 0;
+    Serial.printf("ALARM: %s\n", m ? g_alertText : "aus");
+    g_redrawPage = true;                            // Ring sofort an/aus zeichnen
+  }
+}
+
+// Buzzer-Piep bei Alarm: 120ms an, alle 2s, nicht blockierend. Nur wenn Buzzer-Feature an.
+static void alertBuzzTick() {
+  static bool on = false; static uint32_t nextAt = 0, offAt = 0;
+  if (!g_alertMask || !g_featureBuzzer) { if (on) { hal_buzzer(false); on = false; } return; }
+  const uint32_t now = millis();
+  if (!on && now >= nextAt) { hal_buzzer(true); on = true; offAt = now + 120; nextAt = now + 2000; }
+  else if (on && now >= offAt) { hal_buzzer(false); on = false; }
+}
+
 static void drawDataRow(int y, const char* label, const char* value, uint16_t col) {
   drawTextSmall(92,  y, label, RGB565(160, 160, 160), 2);
   drawTextSmall(244, y, value, col, 2);
@@ -1372,9 +1436,10 @@ static const GaugeTheme THEME_123 = {
   RGB565(238,238,236), RGB565(220,44,32), false, RGB565(22,22,26) };
 
 static uint8_t g_motorStyle = 2;   // 0=digital, 1=vdo, 2=123tune+
-static const char* const MOTOR_STYLE_NAMES[] = { "DIGITAL", "VDO", "123TUNE+" };
+static const char* const MOTOR_STYLE_NAMES[] = { "DIGITAL", "VDO", "123TUNE+", "VDO+UHR" };
+#define MOTOR_STYLE_COUNT 4
 static const GaugeTheme& gTheme() {
-  return g_motorStyle == 0 ? THEME_DIGITAL : g_motorStyle == 1 ? THEME_VDO : THEME_123;
+  return g_motorStyle == 0 ? THEME_DIGITAL : g_motorStyle == 2 ? THEME_123 : THEME_VDO;  // 1+3 = VDO-Look
 }
 
 // -------- Graphical gauge primitives (cockpit dashboard) --------
@@ -1440,13 +1505,16 @@ static void drawMiniGauge(int cx, int cy, int r, float value, float vmin, float 
 static const uint16_t TACH_RED = RGB565(220, 44, 32);
 static void drawTach(int cx, int cy, float rpm, bool valid, const GaugeTheme& t, float sc = 1.0f) {
   const float A0 = 150.0f, A1 = 390.0f;
+  const float RMAX = (float)g_rpmScaleMax;          // Skalenende (Dev-Tab)
+  const int   RED  = g_rpmRedline;                  // roter Bereich ab (Dev-Tab)
+  const int   KMAX = g_rpmScaleMax / 1000;
   if (t.bandTach) {                                 // digital: Streifenband
     const int rIn = (int)lroundf(152 * sc), rOut = (int)lroundf(212 * sc);
     drawArcBand(cx, cy, rIn, rOut, A0, A1, RGB565(45, 45, 50));
-    drawArcBand(cx, cy, rIn, rOut, gaugeAngle(6000, 0, 8000, A0, A1), A1, RGB565(150, 30, 28));
-    for (int k = 0; k <= 8; k++) {
-      float a  = gaugeAngle(k * 1000, 0, 8000, A0, A1);
-      uint16_t tc = (k >= 6) ? RGB565(235, 80, 70) : RGB565(190, 190, 190);
+    drawArcBand(cx, cy, rIn, rOut, gaugeAngle((float)RED, 0, RMAX, A0, A1), A1, RGB565(150, 30, 28));
+    for (int k = 0; k <= KMAX; k++) {
+      float a  = gaugeAngle(k * 1000, 0, RMAX, A0, A1);
+      uint16_t tc = (k * 1000 >= RED) ? RGB565(235, 80, 70) : RGB565(190, 190, 190);
       plotRadial(cx, cy, a, rIn, rOut, tc, (k % 2) ? 2 : 3);
       float ar = a * (float)PI / 180.0f;
       int lx = cx + (int)(cosf(ar) * (rIn - (int)lroundf(18 * sc)));
@@ -1454,27 +1522,27 @@ static void drawTach(int cx, int cy, float rpm, bool valid, const GaugeTheme& t,
       char n[3]; snprintf(n, sizeof(n), "%d", k);
       drawTextCentered(lx, ly - 7, n, tc, 2);
     }
-    float pa = gaugeAngle(valid ? rpm : 0, 0, 8000, A0, A1);
+    float pa = gaugeAngle(valid ? rpm : 0, 0, RMAX, A0, A1);
     plotRadial(cx, cy, pa, rIn - 6, rOut + 2, t.needle, 6);
     plotRadial(cx, cy, pa, rOut - (int)lroundf(16 * sc), rOut + 2, TACH_RED, 6);
     return;
   }
   const int rOut = (int)lroundf(208 * sc);          // diskrete Striche
-  for (int v = 0; v <= 8000; v += 200) {
-    float a = gaugeAngle(v, 0, 8000, A0, A1);
+  for (int v = 0; v <= g_rpmScaleMax; v += 200) {
+    float a = gaugeAngle(v, 0, RMAX, A0, A1);
     bool major = (v % 1000) == 0;
-    uint16_t tc = (t.redlineMark && v >= 6000) ? TACH_RED : (major ? t.tickMaj : t.tickMin);
+    uint16_t tc = (t.redlineMark && v >= RED) ? TACH_RED : (major ? t.tickMaj : t.tickMin);
     plotRadial(cx, cy, a, rOut - (int)lroundf((major ? 24 : 12) * sc), rOut, tc, major ? 3 : 2);
   }
-  for (int k = 0; k <= 8; k++) {
-    float a  = gaugeAngle(k * 1000, 0, 8000, A0, A1);
+  for (int k = 0; k <= KMAX; k++) {
+    float a  = gaugeAngle(k * 1000, 0, RMAX, A0, A1);
     float ar = a * (float)PI / 180.0f;
     int lx = cx + (int)(cosf(ar) * (rOut - (int)lroundf(42 * sc)));
     int ly = cy + (int)(sinf(ar) * (rOut - (int)lroundf(42 * sc)));
     char n[3]; snprintf(n, sizeof(n), "%d", k);
-    drawTextCentered(lx, ly - 10, n, (t.redlineMark && k >= 6) ? TACH_RED : t.numCol, 3);
+    drawTextCentered(lx, ly - 10, n, (t.redlineMark && k * 1000 >= RED) ? TACH_RED : t.numCol, 3);
   }
-  float pa = gaugeAngle(valid ? rpm : 0, 0, 8000, A0, A1);
+  float pa = gaugeAngle(valid ? rpm : 0, 0, RMAX, A0, A1);
   plotRadial(cx, cy, pa, (int)lroundf(150 * sc), rOut + 2, t.needle, 6);
   if (t.redTip) plotRadial(cx, cy, pa, rOut - (int)lroundf(16 * sc), rOut + 2, TACH_RED, 6);
 }
@@ -1498,6 +1566,47 @@ static void drawMotorPage() {
   char buf[16];
 
   drawTach(240, 240, g_rpm, fresh, t, M_S);
+
+  if (g_motorStyle == 3) {
+    // ===== VDO+UHR: Tacho aussen (VDO-Look), ANALOGE UHR in der Mitte =====
+    if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_rpm); else strcpy(buf, "----");
+    drawTextCentered(240, M_Y(104), buf, fresh ? t.txt : t.txtDim, M_F(3));
+    // Uhr-Ticks: 12 Striche auf Radius ~100 (3/6/9/12 kraeftiger)
+    for (int k = 0; k < 12; k++) {
+      float a = k * 30.0f - 90.0f;
+      bool major = (k % 3) == 0;
+      plotRadial(240, 240, a, M_R(major ? 88 : 93), M_R(100), major ? t.tickMaj : t.tickMin, major ? 3 : 2);
+    }
+    struct tm cn = {};
+    if (readClockTime(&cn)) {
+      float mh = cn.tm_min + cn.tm_sec / 60.0f;
+      float hh = (cn.tm_hour % 12) + mh / 60.0f;
+      plotRadial(240, 240, hh * 30.0f - 90.0f, 0, M_R(54), t.needle, 5);   // Stunde
+      plotRadial(240, 240, mh * 6.0f  - 90.0f, 0, M_R(82), t.needle, 4);   // Minute
+      plotRadial(240, 240, cn.tm_sec * 6.0f - 90.0f, 0, M_R(90), TACH_RED, 2);  // Sekunde (rot, 2Hz)
+      fillCircleFast(240, 240, M_R(7), t.hub);
+      fillCircleFast(240, 240, M_R(3), t.hubDk);
+    }
+    // Lambda kompakt unter der Uhr + Temp/Volt-Zeile
+    uint16_t lc2 = t.txtDim;
+    if (fresh && g_lambdaValid) {
+      snprintf(buf, sizeof(buf), "%.2f", g_lambda);
+      lc2 = (g_lambda < g_alLamMin || g_lambda > g_alLamMax) ? TACH_RED : t.txt;
+    } else strcpy(buf, "----");
+    drawTextCentered(240, M_Y(352), buf, lc2, M_F(4));
+    drawTextCentered(240, M_Y(336), "LAMBDA", t.txtDim, M_F(1));
+    const bool g123c = fresh && g_g123Valid;
+    char tv[28];
+    if (g123c) snprintf(tv, sizeof(tv), "%dC  %.1fV", (int)g_g123Temp, g_g123Volt);
+    else       strcpy(tv, "--C  --V");
+    drawTextCentered(240, M_Y(396), tv, t.txtDim, M_F(2));
+    char st3[24];
+    const char* src3 = fresh ? g_lastSrc : (g_bleConn ? "WARTE" : (g_canReady ? "CAN WARTE" : "KEIN HUB"));
+    snprintf(st3, sizeof(st3), "%s%s", fresh ? "LIVE " : "", src3);
+    drawTextCentered(240, M_Y(424), st3, fresh ? t.liveCol : t.statusBad, M_F(2));
+    presentFrame();
+    return;
+  }
 
   // RPM digital (oben, innerhalb des Rings)
   if (fresh) snprintf(buf, sizeof(buf), "%d", (int)g_rpm); else strcpy(buf, "----");
@@ -1605,8 +1714,8 @@ static void drawTrendPage() {
   char rb[12]; snprintf(rb, sizeof(rb), "%d", (int)lroundf(g_rpm));
   drawTextCentered(338, 86, rb, RGB565(120, 170, 230), 3);
   drawTextCentered(338, 116, "1/min", RGB565(110, 110, 120), 1);
-  // Soll-Band 0.95..1.05 + Stoechiometrie 1.0
-  int yb0 = trLamY(1.05f), yb1 = trLamY(0.95f);
+  // Soll-Band (Dev-Tab: g_alLamMin..g_alLamMax) + Stoechiometrie 1.0
+  int yb0 = trLamY(g_alLamMax), yb1 = trLamY(g_alLamMin);
   fillRectFast(TR_PX0, yb0, TR_PX1 - TR_PX0, yb1 - yb0, RGB565(18, 58, 34));
   // Gitter + Achsbeschriftung
   const uint16_t grid = RGB565(42, 42, 50), dim = RGB565(120, 120, 130);
@@ -2082,8 +2191,18 @@ static void loadSettings() {
   g_imuOffRoll    = p.getFloat("imu_off_r", 0.0f);
   g_wifiAuto      = p.getBool("wifi_auto", true);      // WLAN-Auto-Fallback default AN
   g_canListenOnly = p.getBool("can_listen", true);     // CAN: listen-only default (NORMAL = ACK)
-  g_motorStyle    = p.getUChar("mstyle", 2);          // 0=digital,1=vdo,2=123tune+
-  if (g_motorStyle > 2) g_motorStyle = 2;
+  g_motorStyle    = p.getUChar("mstyle", 2);          // 0=digital,1=vdo,2=123tune+,3=vdo+uhr
+  if (g_motorStyle > MOTOR_STYLE_COUNT - 1) g_motorStyle = 2;
+  g_alertsOn   = p.getBool("alerts", true);            // Alarme (Dev-Tab)
+  g_alLamMin   = p.getFloat("al_lmin", 0.90f);
+  g_alLamMax   = p.getFloat("al_lmax", 1.10f);
+  g_alRpmMax   = p.getInt("al_rpm", 4500);
+  g_alTempMax  = p.getInt("al_temp", 90);
+  g_alVoltMin  = p.getFloat("al_volt", 11.5f);
+  g_rpmRedline = p.getInt("rl_rpm", 6000);             // Tacho-Konfig (Dev-Tab)
+  g_rpmScaleMax = p.getInt("sc_rpm", 8000);
+  if (g_rpmScaleMax < 3000 || g_rpmScaleMax > 12000) g_rpmScaleMax = 8000;
+  if (g_rpmRedline < 1000 || g_rpmRedline > g_rpmScaleMax) g_rpmRedline = g_rpmScaleMax * 3 / 4;
   g_lambdaStyle   = p.getUChar("lstyle", 0);          // 0=Gauge, 1=Verlauf
   if (g_lambdaStyle > 1) g_lambdaStyle = 0;
   p.end();
@@ -2135,7 +2254,7 @@ static void saveRotation(int deg) {
 
 static void saveMotorStyle(int style) {
   if (style < 0) style = 0;
-  if (style > 2) style = 2;
+  if (style > MOTOR_STYLE_COUNT - 1) style = MOTOR_STYLE_COUNT - 1;
   g_motorStyle = (uint8_t)style;
   Preferences p;
   p.begin("clock", false);
@@ -2321,7 +2440,9 @@ static void handleWebRoot() {
           "</span> &nbsp; AMP: <span id='lv_amp'>" + String(g_g123Coil, 1) + "</span></div>";
   html += "<div style='color:#888'>HTTP rx <span id='lv_http'>" + String((unsigned long)g_httpRx) +
           "</span> &middot; CAN rx <span id='lv_can'>" + String((unsigned long)g_canRx) +
-          "</span> &middot; BLE rx <span id='lv_ble'>" + String((unsigned long)g_bleRxCnt) + "</span></div></div>";
+          "</span> &middot; BLE rx <span id='lv_ble'>" + String((unsigned long)g_bleRxCnt) + "</span></div>";
+  html += "<div id='lv_alarm' style='color:#f55;font-weight:700;margin-top:6px'>" +
+          String(g_alertMask ? (String("&#9888; ALARM: ") + g_alertText) : String("")) + "</div></div>";
   html += F("<div class='card'><h3>Display-Seite</h3>"
     "<a href='/page?p=0'><button>Uhr</button></a>"
     "<a href='/page?p=1'><button>Menu</button></a>"
@@ -2373,7 +2494,7 @@ static void handleWebRoot() {
   // ===== Tab: Anzeige =====
   html += F("<div class='tab' id='t-anz'>");
   html += F("<div class='card'><h3>Motor-Anzeige Stil</h3>");
-  for (uint8_t i = 0; i < 3; i++) {
+  for (uint8_t i = 0; i < MOTOR_STYLE_COUNT; i++) {
     html += "<a href='/set?style=" + String(i) + "'><button" +
             String(i == g_motorStyle ? " style='background:#6c6'" : "") + ">" +
             String(MOTOR_STYLE_NAMES[i]) + "</button></a>";
@@ -2494,13 +2615,45 @@ static void handleWebRoot() {
     "<p>Test-Hub IP: <input name='thubip' value='");
   html += String(g_testHubIp);
   html += F("' style='width:160px;padding:6px;border:0;border-radius:6px'></p>"
+    "<hr style='border-color:#333'>"
+    "<p><label><input type='checkbox' name='alerts' value='1' ");
+  html += g_alertsOn ? "checked" : "";
+  html += F("> <b>Alarme</b> (roter Ring blinkt");
+  if (g_alertMask) html += " &ndash; <span style='color:#f55'>GERADE AKTIV: " + String(g_alertText) + "</span>";
+  html += F(")</label></p>"
+    "<p>&lambda;-Soll-Band <input name='allmin' type='number' step='0.01' min='0.5' max='1.5' value='");
+  html += String(g_alLamMin, 2);
+  html += F("' style='width:70px;padding:6px;border:0;border-radius:6px'> bis "
+    "<input name='allmax' type='number' step='0.01' min='0.5' max='1.5' value='");
+  html += String(g_alLamMax, 2);
+  html += F("' style='width:70px;padding:6px;border:0;border-radius:6px'></p>"
+    "<p>Drehzahl &gt; <input name='alrpm' type='number' min='1000' max='9000' step='100' value='");
+  html += String(g_alRpmMax);
+  html += F("' style='width:80px;padding:6px;border:0;border-radius:6px'> 1/min &nbsp; "
+    "Temp &gt; <input name='altemp' type='number' min='40' max='150' value='");
+  html += String(g_alTempMax);
+  html += F("' style='width:60px;padding:6px;border:0;border-radius:6px'> &deg;C</p>"
+    "<p>Spannung &lt; <input name='alvolt' type='number' step='0.1' min='8' max='14' value='");
+  html += String(g_alVoltMin, 1);
+  html += F("' style='width:70px;padding:6px;border:0;border-radius:6px'> V (Motor l&auml;uft)</p>"
+    "<hr style='border-color:#333'>"
+    "<p>Tacho: rot ab <input name='rlrpm' type='number' min='1000' max='12000' step='500' value='");
+  html += String(g_rpmRedline);
+  html += F("' style='width:80px;padding:6px;border:0;border-radius:6px'> &nbsp; Skala bis "
+    "<input name='scrpm' type='number' min='3000' max='12000' step='1000' value='");
+  html += String(g_rpmScaleMax);
+  html += F("' style='width:80px;padding:6px;border:0;border-radius:6px'> 1/min</p>"
     "<button type='submit'>Speichern</button></form>"
     "<div style='color:#888;text-align:left'>Auto-Cockpit: ab dieser Drehzahl (Hub/CAN/123) springt "
     "das Display automatisch aufs Motor-Cockpit; Motor aus &rarr; zur&uuml;ck zur Uhr. "
     "<br><b>Test-Hub:</b> zieht die Cockpit-Daten von der festen IP statt vom Profil-Hub "
     "(&uuml;bersteuert auch das Hub-AP-Gateway). Quelle hei&szlig;t dann &quot;TEST&quot; "
     "&ndash; auf dem Display und im Live-Tab. F&uuml;r Tests im Heimnetz (z.B. Lambda-Sweep); "
-    "im Bus wieder ausschalten!</div></div></div>");
+    "im Bus wieder ausschalten!"
+    "<br><b>Alarme:</b> bei Verletzung blinkt auf jeder Seite ein roter Ring + Grund oben; "
+    "Buzzer piept alle 2s (wenn Buzzer-Feature an). &lambda;-Band gilt nur bei laufendem Motor "
+    "und f&auml;rbt auch das gr&uuml;ne Band im Lambda-Verlauf."
+    "<br><b>Tacho:</b> roter Bereich + Skalenende wirken auf alle Kombi-Stile.</div></div></div>");
 
   html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p>"
     "<script>function sh(t,b){var x=document.querySelectorAll('.tab');"
@@ -2523,7 +2676,8 @@ static void handleWebRoot() {
     "S('lv_src',d.src);S('lv_fresh',d.fresh?'LIVE':'keine Daten');"
     "S('lv_lam',d.lambda==null?'---':d.lambda.toFixed(2));S('lv_rpm',d.rpm);S('lv_adv',d.adv.toFixed(1));"
     "S('lv_map',d.map);S('lv_temp',d.temp);S('lv_volt',d.volt.toFixed(1));S('lv_amp',d.amp.toFixed(1));"
-    "S('lv_http',d.httpRx);S('lv_can',d.canRx);S('lv_ble',d.bleRx);}).catch(function(){});}"
+    "S('lv_http',d.httpRx);S('lv_can',d.canRx);S('lv_ble',d.bleRx);"
+    "S('lv_alarm',d.alarm?('\\u26a0 ALARM: '+d.alarm):'');}).catch(function(){});}"
     "setInterval(function(){var t=document.getElementById('t-live');"
     "if(t&&t.className.indexOf('on')>=0)updLive();},1000);"
     "</script></body></html>");
@@ -2587,10 +2741,33 @@ static void handleWebSet() {
         p.putString("thub_ip", g_testHubIp);
       }
     }
+    { // Alarme + Tacho-Konfig
+      bool al = webServer.hasArg("alerts");
+      if (al != g_alertsOn) { g_alertsOn = al; p.putBool("alerts", al);
+                              if (!al) { g_alertMask = 0; g_alertText[0] = 0; } }
+      if (webServer.hasArg("allmin")) { float v = webServer.arg("allmin").toFloat();
+        if (v >= 0.5f && v <= 1.5f) { g_alLamMin = v; p.putFloat("al_lmin", v); } }
+      if (webServer.hasArg("allmax")) { float v = webServer.arg("allmax").toFloat();
+        if (v >= 0.5f && v <= 1.5f && v > g_alLamMin) { g_alLamMax = v; p.putFloat("al_lmax", v); } }
+      if (webServer.hasArg("alrpm"))  { int v = webServer.arg("alrpm").toInt();
+        if (v >= 1000 && v <= 9000) { g_alRpmMax = v; p.putInt("al_rpm", v); } }
+      if (webServer.hasArg("altemp")) { int v = webServer.arg("altemp").toInt();
+        if (v >= 40 && v <= 150) { g_alTempMax = v; p.putInt("al_temp", v); } }
+      if (webServer.hasArg("alvolt")) { float v = webServer.arg("alvolt").toFloat();
+        if (v >= 8.0f && v <= 14.0f) { g_alVoltMin = v; p.putFloat("al_volt", v); } }
+      if (webServer.hasArg("scrpm"))  { int v = webServer.arg("scrpm").toInt();
+        if (v >= 3000 && v <= 12000) { g_rpmScaleMax = v; p.putInt("sc_rpm", v); } }
+      if (webServer.hasArg("rlrpm"))  { int v = webServer.arg("rlrpm").toInt();
+        if (v >= 1000 && v <= g_rpmScaleMax) { g_rpmRedline = v; p.putInt("rl_rpm", v); } }
+      g_redrawPage = true;                       // Tacho/Band sofort neu zeichnen
+    }
     p.end();
-    Serial.printf("Web/Dev: Auto-Cockpit %s (Schwelle %d), Test-Hub %s (%s)\n",
+    Serial.printf("Web/Dev: Auto-Cockpit %s (Schwelle %d), Test-Hub %s (%s), Alarme %s "
+                  "(lam %.2f-%.2f rpm>%d temp>%d volt<%.1f), Tacho rot %d / max %d\n",
                   g_autoCockpit ? "an" : "aus", g_autoCockpitRpm,
-                  g_testHub ? "AN" : "aus", g_testHubIp);
+                  g_testHub ? "AN" : "aus", g_testHubIp, g_alertsOn ? "an" : "aus",
+                  g_alLamMin, g_alLamMax, g_alRpmMax, g_alTempMax, g_alVoltMin,
+                  g_rpmRedline, g_rpmScaleMax);
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -2751,7 +2928,8 @@ static void handleWebLive() {
   j += "\"amp\":" + String(g_g123Coil, 1) + ",";
   j += "\"httpRx\":" + String((unsigned long)g_httpRx) + ",";
   j += "\"canRx\":" + String((unsigned long)g_canRx) + ",";
-  j += "\"bleRx\":" + String((unsigned long)g_bleRxCnt) + "}";
+  j += "\"bleRx\":" + String((unsigned long)g_bleRxCnt) + ",";
+  j += "\"alarm\":\"" + String(g_alertMask ? g_alertText : "") + "\"}";
   webServer.sendHeader("Cache-Control", "no-store");
   webServer.send(200, "application/json", j);
 }
@@ -2784,6 +2962,12 @@ static void startWebServer() {
          ",\"auto_cockpit_rpm\":" + String(g_autoCockpitRpm) +
          ",\"test_hub\":" + String(g_testHub ? 1 : 0) +
          ",\"test_hub_ip\":\"" + String(g_testHubIp) + "\"}";
+    j += ",\"alarme\":{\"an\":" + String(g_alertsOn ? 1 : 0) +
+         ",\"aktiv\":\"" + String(g_alertMask ? g_alertText : "") + "\"" +
+         ",\"lam_min\":" + String(g_alLamMin, 2) + ",\"lam_max\":" + String(g_alLamMax, 2) +
+         ",\"rpm_max\":" + String(g_alRpmMax) + ",\"temp_max\":" + String(g_alTempMax) +
+         ",\"volt_min\":" + String(g_alVoltMin, 1) +
+         ",\"tacho_rot\":" + String(g_rpmRedline) + ",\"tacho_max\":" + String(g_rpmScaleMax) + "}";
     j += ",\"anzeige\":{\"motor_stil\":" + String(g_motorStyle) +
          ",\"lambda_stil\":" + String(g_lambdaStyle) +
          ",\"groesse_pct\":" + String(g_dialScalePct) +
@@ -3122,7 +3306,7 @@ void loop() {
         if (dx * dx + dy * dy <= 95 * 95) {
           touchLongHandled = true;
           lastTouch = nowMs;
-          saveMotorStyle((g_motorStyle + 1) % 3);
+          saveMotorStyle((g_motorStyle + 1) % MOTOR_STYLE_COUNT);
           drawMotorPage();
           Serial.printf("motor long-press -> Stil %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
         }
@@ -3269,6 +3453,10 @@ void loop() {
 
   // Auto-Cockpit: bei laufendem Motor automatisch aufs Motor-Display (von Uhr/Menue)
   autoCockpitTick();
+
+  // Alarme pruefen (roter Ring via presentFrame) + Buzzer-Piep
+  alertTick();
+  alertBuzzTick();
 
   // Lambda-Verlauf: immer sampeln (Historie da, egal welche Seite) + Trend-Seite scrollen
   trendSample();
