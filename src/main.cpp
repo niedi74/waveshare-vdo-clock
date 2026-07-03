@@ -1439,13 +1439,14 @@ static const GaugeTheme THEME_DIGITAL = {
   RGB565(60,200,90), RGB565(200,120,50), true, RGB565(28,24,20) };
 
 static const GaugeTheme THEME_VDO = {
-  // Zifferblatt-Grau: an das (ausgeblichene) Original-VDO-Grau im T2b angepasst -
-  // vorher RGB(40,42,46) = fast schwarz, real ist es deutlich heller (Foto 2.7.).
-  RGB565(84,86,90), RGB565(214,218,222), RGB565(110,114,120), true, false, true, true,
-  RGB565(234,230,208), RGB565(150,148,130), RGB565(234,230,208),
-  RGB565(234,230,208), RGB565(166,122,42), RGB565(40,30,16),
-  false, RGB565(234,230,208), RGB565(150,148,130),
-  RGB565(234,230,208), RGB565(220,44,32), false, RGB565(30,32,36) };
+  // Farben DIREKT vom VDO-Quartz-Zeit-Zifferblatt gesampelt (/screen der Uhr-Seite,
+  // Foto-Abgleich 3.7.): Flaeche RGB(16,16,16) fast schwarz, Creme RGB(232,232,224),
+  // Gold-Nabe RGB(208,168,40). Vorher (84,86,90) war deutlich zu hell.
+  RGB565(16,16,16), RGB565(214,218,222), RGB565(110,114,120), true, false, true, true,
+  RGB565(232,232,224), RGB565(150,148,130), RGB565(232,232,224),
+  RGB565(232,232,224), RGB565(208,168,40), RGB565(40,30,16),
+  false, RGB565(232,232,224), RGB565(150,148,130),
+  RGB565(232,232,224), RGB565(220,44,32), false, RGB565(30,32,36) };
 
 static const GaugeTheme THEME_123 = {
   RGB565(12,12,14), RGB565(206,210,214), RGB565(90,94,100), true, false, false, false,
@@ -1559,7 +1560,8 @@ static void drawTach(int cx, int cy, float rpm, bool valid, const GaugeTheme& t,
     int lx = cx + (int)(cosf(ar) * (rOut - (int)lroundf(42 * sc)));
     int ly = cy + (int)(sinf(ar) * (rOut - (int)lroundf(42 * sc)));
     char n[3]; snprintf(n, sizeof(n), "%d", k);
-    drawTextCentered(lx, ly - 10, n, (t.redlineMark && k * 1000 >= RED) ? TACH_RED : t.numCol, 3);
+    // Zahlen bleiben creme (Original-VDO: roter Bereich nur als Striche markiert)
+    drawTextCentered(lx, ly - 10, n, t.numCol, 3);
   }
   float pa = gaugeAngle(valid ? rpm : 0, 0, RMAX, A0, A1);
   plotRadial(cx, cy, pa, (int)lroundf(150 * sc), rOut + 2, t.needle, 6);
@@ -1598,13 +1600,17 @@ static void drawMotorPage() {
     }
     struct tm cn = {};
     if (readClockTime(&cn)) {
+      // Zweilagige VDO-Zeiger wie auf der Uhr-Seite (dunkle Kontur + Creme-Fuellung)
       float mh = cn.tm_min + cn.tm_sec / 60.0f;
       float hh = (cn.tm_hour % 12) + mh / 60.0f;
-      plotRadial(240, 240, hh * 30.0f - 90.0f, 0, M_R(54), t.needle, 5);   // Stunde
-      plotRadial(240, 240, mh * 6.0f  - 90.0f, 0, M_R(82), t.needle, 4);   // Minute
-      plotRadial(240, 240, cn.tm_sec * 6.0f - 90.0f, 0, M_R(90), TACH_RED, 2);  // Sekunde (rot, 2Hz)
-      fillCircleFast(240, 240, M_R(7), t.hub);
-      fillCircleFast(240, 240, M_R(3), t.hubDk);
+      drawHand(hh, 12.0f, M_R(52), 10, RGB565(24, 24, 22));
+      drawHand(hh, 12.0f, M_R(52), 6,  RGB565(232, 232, 224));
+      drawHand(mh, 60.0f, M_R(80), 8,  RGB565(24, 24, 22));
+      drawHand(mh, 60.0f, M_R(80), 4,  RGB565(232, 232, 224));
+      drawHand((float)cn.tm_sec, 60.0f, M_R(86), 2, TACH_RED);
+      fillCircleFast(240, 240, M_R(11), RGB565(205, 205, 198));   // Nabe wie Original:
+      fillCircleFast(240, 240, M_R(7),  RGB565(208, 168, 40));    // silber/gold/dunkel
+      fillCircleFast(240, 240, M_R(3),  RGB565(38, 30, 18));
     }
     // Lambda kompakt unter der Uhr + Temp/Volt-Zeile
     uint16_t lc2 = t.txtDim;
