@@ -1211,11 +1211,17 @@ static void copyVdoDialToFrame() {
   int outSize = (480 * pct) / 100;
   int offset  = (480 - outSize) / 2;
   if (g_rotationDeg == 0) {
-    for (int oy = 0; oy < outSize; oy++) {
+    // WICHTIG: bei pct>100 ist outSize>480 und offset NEGATIV -> ohne Clipping
+    // schreibt fb[dstRow+ox] VOR und HINTER den Framebuffer (Heap-Korruption!
+    // 0x1082-Pixel im lwIP-Heap -> StoreProhibited-Bootloop bei GROESSE=115/rot=0).
+    // Ziel-Fenster auf 0..479 begrenzen, Quelle skaliert sauber mit.
+    int o0 = (offset < 0) ? -offset : 0;                       // erster sichtbarer out-Index
+    int o1 = (offset + outSize > 480) ? 480 - offset : outSize; // hinter letztem sichtbaren
+    for (int oy = o0; oy < o1; oy++) {
       int sy     = (oy * 480) / outSize;
       int dstRow = (offset + oy) * 480 + offset;
       int srcRow = sy * 480;
-      for (int ox = 0; ox < outSize; ox++) {
+      for (int ox = o0; ox < o1; ox++) {
         int sx = (ox * 480) / outSize;
         fb[dstRow + ox] = pgm_read_word(&VDO_DIAL_480_RGB565[srcRow + sx]);
       }
