@@ -778,8 +778,13 @@ static void httpPollTick() {
   http.setReuse(false);
   String url = "http://" + tgt + "/api/status";
   if (!http.begin(url)) { if (failStreak < 200) failStreak++; return; }
-  http.setConnectTimeout(200);     // kurz halten -> Loop/Touch bleibt reaktiv
-  http.setTimeout(350);            // etwas Luft fuer langsamere Hub-Antworten
+  // Timeouts adaptiv: bei schwachem Signal (< -70 dBm) braucht der TCP-Aufbau
+  // laenger als 200ms -> alle Polls scheiterten (httpRx=0 trotz Verbindung).
+  // Bei gutem Signal bleiben die kurzen Timeouts (Touch/Loop reaktiv; Taps
+  // schuetzt ohnehin die Poll-Pause bei Fingerkontakt).
+  const int rssi = WiFi.RSSI();
+  if (rssi < -70) { http.setConnectTimeout(600); http.setTimeout(800); }
+  else            { http.setConnectTimeout(200); http.setTimeout(350); }
   int code = http.GET();
   if (code == 200) {
     String b = http.getString();
@@ -1122,11 +1127,24 @@ static void drawHand(float value, float maxValue, int length, int thickness, uin
   drawLineFast(240, 240, x, y, color, thickness);
 }
 
+// Echte Kleinbuchstaben (klassischer 5x7-Font, bit0 = oberste Zeile) - noetig,
+// damit die Tastatur-Ebenen klein/GROSS unterscheidbar sind (SSIDs case-sensitiv!).
+static const uint8_t GLYPH_LOWER[26][5] = {
+  {0x20,0x54,0x54,0x54,0x78},{0x7F,0x48,0x44,0x44,0x38},{0x38,0x44,0x44,0x44,0x20}, // a b c
+  {0x38,0x44,0x44,0x48,0x7F},{0x38,0x54,0x54,0x54,0x18},{0x08,0x7E,0x09,0x01,0x02}, // d e f
+  {0x0C,0x52,0x52,0x52,0x3E},{0x7F,0x08,0x04,0x04,0x78},{0x00,0x44,0x7D,0x40,0x00}, // g h i
+  {0x20,0x40,0x44,0x3D,0x00},{0x7F,0x10,0x28,0x44,0x00},{0x00,0x41,0x7F,0x40,0x00}, // j k l
+  {0x7C,0x04,0x18,0x04,0x78},{0x7C,0x08,0x04,0x04,0x78},{0x38,0x44,0x44,0x44,0x38}, // m n o
+  {0x7C,0x14,0x14,0x14,0x08},{0x08,0x14,0x14,0x18,0x7C},{0x7C,0x08,0x04,0x04,0x08}, // p q r
+  {0x48,0x54,0x54,0x54,0x20},{0x04,0x3F,0x44,0x40,0x20},{0x3C,0x40,0x40,0x20,0x7C}, // s t u
+  {0x1C,0x20,0x40,0x20,0x1C},{0x3C,0x40,0x30,0x40,0x3C},{0x44,0x28,0x10,0x28,0x44}, // v w x
+  {0x0C,0x50,0x50,0x50,0x3C},{0x44,0x64,0x54,0x4C,0x44},                            // y z
+};
+
 static uint8_t glyphColumn(char c, uint8_t col) {
   static const uint8_t blank[5] = {0,0,0,0,0};
   const uint8_t *g = blank;
-  if (c >= 'a' && c <= 'z') c -= 32;   // Font ist UPPERCASE-only -> Kleinbuchstaben als CAPS rendern
-                                        // (vorher wurden sie zu Leerzeichen: "Passwort" -> "P   ")
+  if (c >= 'a' && c <= 'z') return GLYPH_LOWER[c - 'a'][col];
   switch (c) {
     case 'A': { static const uint8_t v[5]={0x7E,0x11,0x11,0x11,0x7E}; g=v; break; }
     case 'B': { static const uint8_t v[5]={0x7F,0x49,0x49,0x49,0x36}; g=v; break; }
@@ -2148,7 +2166,7 @@ static void drawWlanPage() {
   if      (g_wpsState == WPS_RUN)  drawTextCentered(240, 136, "WPS laeuft - Router-Taste druecken", RGB565(230, 200, 80), 1);
   else if (g_wpsState == WPS_OK)   drawTextCentered(240, 136, "WPS ok", RGB565(120, 220, 140), 1);
   else if (g_wpsState == WPS_FAIL) drawTextCentered(240, 136, "WPS fehlgeschlagen", RGB565(225, 120, 120), 1);
-  const char* lbl[WLAN_BTN_N]  = { "WPS verbinden", "SSID tippen", "Passwort tippen",
+  const char* lbl[WLAN_BTN_N]  = { "Netze scannen", "SSID tippen", "Passwort tippen",
                                    "Profil wechseln", "Zurueck" };
   const uint16_t bg[WLAN_BTN_N] = { RGB565(40,110,60), RGB565(50,95,140), RGB565(55,80,120),
                                     RGB565(70,70,78), RGB565(95,60,55) };
@@ -2159,10 +2177,77 @@ static void drawWlanPage() {
   presentFrame();
 }
 
+// ===== WLAN-Scan (Page 12): einmaliger Scan, SSID antippen -> Profil + PW-Tastatur =====
+// Bewusst EINMALIG auf Knopfdruck (blockiert ~2-3 s), kein Dauerscan. Der fruehere
+// Scan-Crash (StoreProhibited) war sehr wahrscheinlich die FB-Overflow-Heap-Korruption
+// (ba1909b) - falls doch nicht, faellt nur dieser Button aus, nicht der Boot.
+#define SCAN_MAX 7
+static int16_t g_scanN = -1;
+
+static void drawScanPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 214, 3, RGB565(185, 150, 45));
+  drawTextCentered(240, 48, "NETZE", RGB565(230, 190, 70), 3);
+  char l[48];
+  snprintf(l, sizeof(l), "Tippen = SSID in Profil %s", WPROF_LABELS[g_wifiProfile]);
+  drawTextCentered(240, 84, l, RGB565(150, 150, 160), 1);
+  if (g_scanN <= 0) {
+    drawTextCentered(240, 220, g_scanN == 0 ? "keine Netze gefunden" : "Scan-Fehler",
+                     RGB565(225, 150, 120), 2);
+  }
+  int n = (g_scanN > SCAN_MAX) ? SCAN_MAX : g_scanN;
+  for (int i = 0; i < n; i++) {
+    int y = 108 + i * 38;
+    fillRectFast(78, y, 324, 34, RGB565(38, 40, 46));
+    snprintf(l, sizeof(l), "%.18s", WiFi.SSID(i).c_str());
+    drawTextSmall(88, y + 10, l, RGB565(235, 235, 225), 2);
+    snprintf(l, sizeof(l), "%d", (int)WiFi.RSSI(i));
+    drawTextSmall(352, y + 10, l, RGB565(140, 170, 140), 2);
+  }
+  fillRectFast(WLAN_BTN_X, 396, WLAN_BTN_W, 40, RGB565(95, 60, 55));
+  drawTextCentered(240, 408, "Zurueck", RGB565(240, 240, 235), 2);
+  presentFrame();
+}
+
+static void runWlanScan() {
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 214, 3, RGB565(185, 150, 45));
+  drawTextCentered(240, 220, "Scanne...", RGB565(230, 190, 70), 3);
+  presentFrame();
+  WiFi.scanDelete();
+  WiFi.disconnect();                       // laufenden Connect abbrechen (sonst Scan-Fehler)
+  delay(150);
+  g_scanN = WiFi.scanNetworks();           // synchron, ~2-3 s
+  Serial.printf("WLAN-Scan: %d Netze\n", (int)g_scanN);
+  currentPage = 12;
+  drawScanPage();
+}
+
+static void handleScanTap(uint16_t x, uint16_t y) {
+  if ((int)y >= 396) {                     // Zurueck (Reconnect uebernimmt Auto/Tick)
+    WiFi.scanDelete(); g_scanN = -1;
+    reconnectWifiProfile();
+    currentPage = 11; drawWlanPage(); return;
+  }
+  int n = (g_scanN > SCAN_MAX) ? SCAN_MAX : g_scanN;
+  for (int i = 0; i < n; i++) {
+    int ry = 108 + i * 38;
+    if ((int)y < ry || (int)y >= ry + 34) continue;
+    String ss = WiFi.SSID(i);
+    if (!ss.length()) return;
+    saveWprof(g_wifiProfile, ss.c_str(), g_wprof[g_wifiProfile].pass, g_wprof[g_wifiProfile].hubip);
+    Serial.printf("Scan: '%s' -> Profil %s, PW tippen\n", ss.c_str(), WPROF_LABELS[g_wifiProfile]);
+    WiFi.scanDelete(); g_scanN = -1;
+    openKeyboard(g_wifiProfile, 1);        // Passwort tippen (OK verbindet)
+    return;
+  }
+}
+
 static void handleWlanTap(uint16_t x, uint16_t y) {
   for (int i = 0; i < WLAN_BTN_N; i++) {
     if ((int)y < WLAN_BTN_Y[i] || (int)y >= WLAN_BTN_Y[i] + WLAN_BTN_H) continue;
-    if      (i == 0) { startWps();          drawWlanPage(); }            // WPS starten
+    if      (i == 0) { runWlanScan(); }                                  // Netze scannen -> Page 12
     else if (i == 1) { openKeyboard(g_wifiProfile, 0); }                 // SSID (-> danach PW)
     else if (i == 2) { openKeyboard(g_wifiProfile, 1); }                 // nur Passwort
     else if (i == 3) { cycleWifiProfile();  drawWlanPage(); }            // naechstes Profil
@@ -2182,6 +2267,7 @@ static void drawCurrentPage() {
   else if (currentPage == 7) drawAdjustPage();
   else if (currentPage == 10) drawKeyboardPage();
   else if (currentPage == 11) drawWlanPage();
+  else if (currentPage == 12) drawScanPage();
 }
 
 // -------- Preferences --------
@@ -3392,7 +3478,9 @@ void loop() {
       } else if (currentPage == 10) {
         handleKbTap(tapX, tapY);        // On-Screen-Tastatur
       } else if (currentPage == 11) {
-        handleWlanTap(tapX, tapY);      // WLAN-Seite (WPS/Tippen/Profil)
+        handleWlanTap(tapX, tapY);      // WLAN-Seite (Scan/Tippen/Profil)
+      } else if (currentPage == 12) {
+        handleScanTap(tapX, tapY);      // Scan-Ergebnis (SSID antippen)
       } else {
         // Data pages (Motor/Lambda/Hub/IMU): Tap -> naechste, dann zurueck zur Uhr.
         if      (currentPage == 4) currentPage = 6;  // Hub -> IMU
@@ -3433,6 +3521,7 @@ void loop() {
           Serial.printf("WLAN-Auto = %s\n", g_wifiAuto ? "AN (S24>Heim>Hub)" : "AUS");
         }
         else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
+        else if (cmd == "scan")      { runWlanScan(); }   // Test: einmaliger WLAN-Scan + Ergebnisseite
         else if (cmd == "wifi:show") {           // alle Profile dumpen (Debug)
           for (int i = 0; i < WPROF_COUNT; i++)
             Serial.printf("Profil %d (%s): ssid='%s' pass='%s' hubip='%s'\n",
