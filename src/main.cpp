@@ -2127,11 +2127,12 @@ static void handleKbTap(uint16_t x, uint16_t y) {
   }
 }
 
-// ===== WLAN-Seite (Page 11): grosse Buttons WPS / Tippen / Profil / Zurueck =====
+// ===== WLAN-Seite (Page 11): Buttons WPS / SSID / Passwort / Profil / Zurueck =====
 #define WLAN_BTN_X 108
 #define WLAN_BTN_W 264
-#define WLAN_BTN_H 54
-static const int WLAN_BTN_Y[4] = { 150, 212, 274, 336 };
+#define WLAN_BTN_H 48
+#define WLAN_BTN_N 5
+static const int WLAN_BTN_Y[WLAN_BTN_N] = { 146, 200, 254, 308, 362 };
 
 static void drawWlanPage() {
   if (!ensureFrame()) return;
@@ -2147,21 +2148,24 @@ static void drawWlanPage() {
   if      (g_wpsState == WPS_RUN)  drawTextCentered(240, 136, "WPS laeuft - Router-Taste druecken", RGB565(230, 200, 80), 1);
   else if (g_wpsState == WPS_OK)   drawTextCentered(240, 136, "WPS ok", RGB565(120, 220, 140), 1);
   else if (g_wpsState == WPS_FAIL) drawTextCentered(240, 136, "WPS fehlgeschlagen", RGB565(225, 120, 120), 1);
-  const char* lbl[4]  = { "WPS verbinden", "Passwort tippen", "Profil wechseln", "Zurueck" };
-  const uint16_t bg[4] = { RGB565(40,110,60), RGB565(55,80,120), RGB565(70,70,78), RGB565(95,60,55) };
-  for (int i = 0; i < 4; i++) {
+  const char* lbl[WLAN_BTN_N]  = { "WPS verbinden", "SSID tippen", "Passwort tippen",
+                                   "Profil wechseln", "Zurueck" };
+  const uint16_t bg[WLAN_BTN_N] = { RGB565(40,110,60), RGB565(50,95,140), RGB565(55,80,120),
+                                    RGB565(70,70,78), RGB565(95,60,55) };
+  for (int i = 0; i < WLAN_BTN_N; i++) {
     fillRectFast(WLAN_BTN_X, WLAN_BTN_Y[i], WLAN_BTN_W, WLAN_BTN_H, bg[i]);
-    drawTextCentered(240, WLAN_BTN_Y[i] + 18, lbl[i], RGB565(240, 240, 235), 2);
+    drawTextCentered(240, WLAN_BTN_Y[i] + 16, lbl[i], RGB565(240, 240, 235), 2);
   }
   presentFrame();
 }
 
 static void handleWlanTap(uint16_t x, uint16_t y) {
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < WLAN_BTN_N; i++) {
     if ((int)y < WLAN_BTN_Y[i] || (int)y >= WLAN_BTN_Y[i] + WLAN_BTN_H) continue;
     if      (i == 0) { startWps();          drawWlanPage(); }            // WPS starten
-    else if (i == 1) { openKeyboard(g_wifiProfile, 0); }                 // -> Tastatur (Page 10)
-    else if (i == 2) { cycleWifiProfile();  drawWlanPage(); }            // naechstes Profil
+    else if (i == 1) { openKeyboard(g_wifiProfile, 0); }                 // SSID (-> danach PW)
+    else if (i == 2) { openKeyboard(g_wifiProfile, 1); }                 // nur Passwort
+    else if (i == 3) { cycleWifiProfile();  drawWlanPage(); }            // naechstes Profil
     else             { currentPage = 5;     drawSetupPage(); }           // zurueck -> Setup
     return;
   }
