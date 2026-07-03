@@ -125,6 +125,8 @@ static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltb
 static bool      g_feature123    = false;  // 123-Direkt-Fallback: default AUS (sonst Dauer-BLE -> Ruckeln)
 static bool      g_autoCockpit    = true;  // Drehzahl > Schwelle -> automatisch Motor-Seite (von Uhr/Menue)
 static int       g_autoCockpitRpm = 600;   // Schwelle, per WebGUI variabel einstellbar
+static bool      g_testHub        = false; // Dev: Daten vom Test-Hub (feste IP) statt Profil-Hub; Quelle heisst dann "TEST"
+static char      g_testHubIp[40]  = "192.168.0.87";  // Test-Hub im Heimnetz, per Dev-Tab einstellbar
 #define FW_BUILD __DATE__ " " __TIME__     // Firmware-Stand (Compile-Zeit) fuer die WebGUI
 #ifndef GIT_REV
   #define GIT_REV "unknown"                // wird von scripts/inject_time.py injiziert
@@ -710,6 +712,9 @@ static bool hubIsDottedIp() {
 
 // Ziel-Adresse des Hubs: feste IP direkt, sonst per mDNS aufloesen (gecacht).
 static String hubTarget() {
+  // Dev/Test-Modus: feste Test-Hub-IP uebersteuert ALLES (auch das Hub-AP-Gateway).
+  // Bewusst explizit: Quelle heisst dann "TEST" und die WebGUI zeigt ein Banner.
+  if (g_testHub && g_testHubIp[0]) return String(g_testHubIp);
   // Hub-AP-Profil: der Hub ist immer das Gateway des AP -> nutzen, egal welches
   // (zufaellige) Subnetz der Hub-AP gerade vergibt.
   if (g_wifiProfile == 1 && WiFi.status() == WL_CONNECTED) {
@@ -775,7 +780,7 @@ static void httpPollTick() {
     if (jsonNum(bc, "tune_amp", v))  g_g123Coil = v;
     if (jsonNum(bc, "speed_kmh", v)){ g_speedKmh = v; g_speedValid = true; }
     g_g123Valid   = jsonTrue(bc, "tune_connected");
-    g_lastSrc     = "HTTP";
+    g_lastSrc     = g_testHub ? "TEST" : "HTTP";   // Test-Modus ueberall sichtbar machen
     g_httpRx++;
     if (g_httpRx == 1) Serial.printf("HTTP: erste Daten von %s\n", tgt.c_str());
     g_httpLastRxMs = millis();
@@ -2070,6 +2075,9 @@ static void loadSettings() {
   g_autoCockpit    = p.getBool("auto_cock", true);    // Auto-Cockpit default AN
   g_autoCockpitRpm = p.getInt("acock_rpm", 600);      // Schwelle variabel
   if (g_autoCockpitRpm < 100 || g_autoCockpitRpm > 5000) g_autoCockpitRpm = 600;
+  g_testHub        = p.getBool("thub", false);         // Test-Hub-Modus (Dev) default AUS
+  { char tip[40] = ""; p.getString("thub_ip", tip, sizeof(tip));
+    if (tip[0]) snprintf(g_testHubIp, sizeof(g_testHubIp), "%s", tip); }
   g_imuOffPitch   = p.getFloat("imu_off_p", 0.0f);     // IMU-Nullung
   g_imuOffRoll    = p.getFloat("imu_off_r", 0.0f);
   g_wifiAuto      = p.getBool("wifi_auto", true);      // WLAN-Auto-Fallback default AN
@@ -2297,6 +2305,10 @@ static void handleWebRoot() {
 
   // ===== Tab: Live =====
   html += F("<div class='tab on' id='t-live'>");
+  if (g_testHub)   // Test-Modus deutlich markieren (Daten kommen NICHT vom echten Hub!)
+    html += "<div style='background:#a45500;color:#fff;border-radius:10px;padding:10px;margin:10px auto;"
+            "max-width:420px;font-weight:600'>&#9888; TEST-MODUS &ndash; Daten vom Test-Hub " +
+            String(g_testHubIp) + " (Dev-Tab)</div>";
   html += F("<div class='card'><h3>Spartan-Hub Live</h3>");
   bool anyFresh = bleFresh() || canFresh() || httpFresh();
   html += "<div>Quelle: <b id='lv_src'>" + String(anyFresh ? g_lastSrc : "---") + "</b> &middot; " +
@@ -2472,10 +2484,23 @@ static void handleWebRoot() {
     "<p>Drehzahl-Schwelle: <input type='number' name='acockrpm' min='100' max='5000' value='");
   html += String(g_autoCockpitRpm);
   html += F("' style='width:90px;padding:6px;border:0;border-radius:6px'> 1/min</p>"
+    "<hr style='border-color:#333'>"
+    "<p><label><input type='checkbox' name='thub' value='1' ");
+  html += g_testHub ? "checked" : "";
+  html += F("> <b>Test-Hub verwenden</b>");
+  if (g_testHub) html += F(" <span style='background:#a45500;color:#fff;border-radius:6px;"
+                           "padding:2px 8px'>AKTIV</span>");
+  html += F("</label></p>"
+    "<p>Test-Hub IP: <input name='thubip' value='");
+  html += String(g_testHubIp);
+  html += F("' style='width:160px;padding:6px;border:0;border-radius:6px'></p>"
     "<button type='submit'>Speichern</button></form>"
-    "<div style='color:#888;text-align:left'>Ab dieser Drehzahl (Hub/CAN/123) springt das Display "
-    "automatisch aufs Motor-Cockpit; Motor aus &rarr; zur&uuml;ck zur Uhr (nur von Uhr/Men&uuml;). "
-    "Weitere Parameter (redline, Gauge-Bereiche, Soll-Band) kommen hier dazu.</div></div></div>");
+    "<div style='color:#888;text-align:left'>Auto-Cockpit: ab dieser Drehzahl (Hub/CAN/123) springt "
+    "das Display automatisch aufs Motor-Cockpit; Motor aus &rarr; zur&uuml;ck zur Uhr. "
+    "<br><b>Test-Hub:</b> zieht die Cockpit-Daten von der festen IP statt vom Profil-Hub "
+    "(&uuml;bersteuert auch das Hub-AP-Gateway). Quelle hei&szlig;t dann &quot;TEST&quot; "
+    "&ndash; auf dem Display und im Live-Tab. F&uuml;r Tests im Heimnetz (z.B. Lambda-Sweep); "
+    "im Bus wieder ausschalten!</div></div></div>");
 
   html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p>"
     "<script>function sh(t,b){var x=document.querySelectorAll('.tab');"
@@ -2542,17 +2567,30 @@ static void handleWebSet() {
     saveImuNull();
     g_redrawPage = true;
   }
-  if (webServer.hasArg("devsave")) {                 // Dev-Tab: Auto-Cockpit an/aus + Schwelle
+  if (webServer.hasArg("devsave")) {                 // Dev-Tab: Auto-Cockpit + Test-Hub
     bool ac = webServer.hasArg("acock");
+    bool th = webServer.hasArg("thub");
     Preferences p; p.begin("clock", false);
     if (ac != g_autoCockpit) { g_autoCockpit = ac; p.putBool("auto_cock", g_autoCockpit); }
     if (webServer.hasArg("acockrpm")) {
       int v = webServer.arg("acockrpm").toInt();
       if (v >= 100 && v <= 5000) { g_autoCockpitRpm = v; p.putInt("acock_rpm", g_autoCockpitRpm); }
     }
+    if (th != g_testHub) {
+      g_testHub = th; p.putBool("thub", g_testHub);
+      if (!th && g_lastSrc && strcmp(g_lastSrc, "TEST") == 0) g_lastSrc = "HTTP";  // Label sofort zuruecksetzen
+    }
+    if (webServer.hasArg("thubip")) {
+      String v = webServer.arg("thubip"); v.trim();
+      if (v.length() > 0 && v.length() < sizeof(g_testHubIp)) {
+        snprintf(g_testHubIp, sizeof(g_testHubIp), "%s", v.c_str());
+        p.putString("thub_ip", g_testHubIp);
+      }
+    }
     p.end();
-    Serial.printf("Web/Dev: Auto-Cockpit %s, Schwelle %d 1/min\n",
-                  g_autoCockpit ? "an" : "aus", g_autoCockpitRpm);
+    Serial.printf("Web/Dev: Auto-Cockpit %s (Schwelle %d), Test-Hub %s (%s)\n",
+                  g_autoCockpit ? "an" : "aus", g_autoCockpitRpm,
+                  g_testHub ? "AN" : "aus", g_testHubIp);
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -2743,7 +2781,9 @@ static void startWebServer() {
          ",\"buzzer\":" + String(g_featureBuzzer ? 1 : 0) +
          ",\"123\":" + String(g_feature123 ? 1 : 0) +
          ",\"auto_cockpit\":" + String(g_autoCockpit ? 1 : 0) +
-         ",\"auto_cockpit_rpm\":" + String(g_autoCockpitRpm) + "}";
+         ",\"auto_cockpit_rpm\":" + String(g_autoCockpitRpm) +
+         ",\"test_hub\":" + String(g_testHub ? 1 : 0) +
+         ",\"test_hub_ip\":\"" + String(g_testHubIp) + "\"}";
     j += ",\"anzeige\":{\"motor_stil\":" + String(g_motorStyle) +
          ",\"lambda_stil\":" + String(g_lambdaStyle) +
          ",\"groesse_pct\":" + String(g_dialScalePct) +
