@@ -90,6 +90,10 @@ Heimnetz (z. B. Lambda-Sweep des Test-Hubs) — im Bus wieder ausschalten.
 Setup-AP `VDO-Clock-Setup`/`vdoclock` (192.168.4.1) wenn nichts verbindet.
 Profile setzen: WebGUI → WLAN, Serial `wifi:set <slot> <SSID>|<Pass>`, On-Screen-
 Tastatur, oder **`wifi.txt` auf der SD** (`<slot>=<SSID>|<Pass>` je Zeile).
+Profil-Änderungen werden auf die SD zurückgespiegelt (die Datei ist beim Boot
+Master). **Selbstheilung:** Fehlt `SPARTAN3-HUB` nach dem Boot in allen Profilen
+(Scan-Tap, Tastatur, kaputte SD-Datei — egal), wird Slot 1 automatisch
+wiederhergestellt: das Live-Hub-Profil ist immer wählbar.
 
 ## WebGUI (`http://<ip>/`)
 

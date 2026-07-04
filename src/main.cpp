@@ -2555,6 +2555,15 @@ static bool wifiTxtClean(const String& s) {
     if ((uint8_t)s[i] < 32 || (uint8_t)s[i] > 126) return false;
   return true;
 }
+// Lebensader Bus: das Live-Hub-Profil muss IMMER waehlbar bleiben. Egal was
+// Scan/Tastatur/SD-Datei angerichtet haben - fehlt SPARTAN3-HUB in allen
+// Profilen, wird Slot 1 wiederhergestellt (nach dem SD-Import aufrufen!).
+static void ensureHubProfile() {
+  for (uint8_t p = 0; p < WPROF_COUNT; p++)
+    if (!strcmp(g_wprof[p].ssid, "SPARTAN3-HUB")) return;
+  Serial.println("WLAN: Live-Hub-Profil fehlte -> Slot 1 = SPARTAN3-HUB wiederhergestellt");
+  saveWprof(1, "SPARTAN3-HUB", "lambda123", g_wprof[1].hubip);
+}
 // /wifi.txt parsen -> g_wprof + NVS. Anzahl geladener Profile (-2 = keine Datei).
 static int sdApplyWifiTxt() {
   if (!g_sdMounted || !SD_MMC.exists("/wifi.txt")) return -2;
@@ -3415,6 +3424,7 @@ void setup() {
   setupCockpitCan();
 
   setupSdCard();                 // Micro-SD mounten - gibt LCD-SPI frei, liest wifi.txt
+  ensureHubProfile();            // NACH SD-Import: Live-Hub-Profil muss immer waehlbar sein
   sdCheckFirmwareUpdate();       // Recovery: /update.bin von SD flashen (falls vorhanden)
 
   initTimeSource();
