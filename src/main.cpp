@@ -2254,10 +2254,21 @@ static void handleScanTap(uint16_t x, uint16_t y) {
     if ((int)y < ry || (int)y >= ry + 34) continue;
     String ss = WiFi.SSID(i);
     if (!ss.length()) return;
-    saveWprof(g_wifiProfile, ss.c_str(), g_wprof[g_wifiProfile].pass, g_wprof[g_wifiProfile].hubip);
-    Serial.printf("Scan: '%s' -> Profil %s, PW tippen\n", ss.c_str(), WPROF_LABELS[g_wifiProfile]);
+    // Ziel-Slot: kennt ein Profil die SSID schon, DAS nehmen - sonst ueberschreibt
+    // ein Tap auf "Heim-Netz" im Bus versehentlich das aktive Hub-AP-Profil.
+    uint8_t slot = g_wifiProfile;
+    for (uint8_t p = 0; p < WPROF_COUNT; p++)
+      if (!strcmp(g_wprof[p].ssid, ss.c_str())) { slot = p; break; }
     WiFi.scanDelete(); g_scanN = -1;
-    openKeyboard(g_wifiProfile, 1);        // Passwort tippen (OK verbindet)
+    if (!strcmp(g_wprof[slot].ssid, ss.c_str()) && g_wprof[slot].pass[0]) {
+      Serial.printf("Scan: '%s' = Profil %s (PW gespeichert) -> verbinden\n", ss.c_str(), WPROF_LABELS[slot]);
+      selectWprof(slot);                   // Passwort vorhanden -> direkt verbinden
+      currentPage = 11; drawWlanPage();
+      return;
+    }
+    saveWprof(slot, ss.c_str(), g_wprof[slot].pass, g_wprof[slot].hubip);
+    Serial.printf("Scan: '%s' -> Profil %s, PW tippen\n", ss.c_str(), WPROF_LABELS[slot]);
+    openKeyboard(slot, 1);                 // Passwort tippen (OK verbindet)
     return;
   }
 }
@@ -2527,12 +2538,22 @@ static String sdReadWifiTxt() {
 static bool g_sdApplyingWifi = false;
 static void sdSyncWifiTxt() {
   if (!g_sdMounted || g_sdApplyingWifi) return;
-  File w = SD_MMC.open("/wifi.txt", FILE_WRITE);
+  // Erst Temp-Datei, dann Rename: Stromausfall mitten im Schreiben (Zuendung aus)
+  // darf keine halbe wifi.txt hinterlassen - die wuerde beim Boot in NVS importiert.
+  File w = SD_MMC.open("/wifi.tmp", FILE_WRITE);
   if (!w) return;
   w.println("# WLAN-Profile:  <Slot>=<SSID>|<Passwort>   (0=Heim 1=Hub-AP 2=S24)");
   for (int i = 0; i < WPROF_COUNT; i++)
     if (g_wprof[i].ssid[0]) w.printf("%d=%s|%s\n", i, g_wprof[i].ssid, g_wprof[i].pass);
   w.close();
+  SD_MMC.remove("/wifi.txt");
+  SD_MMC.rename("/wifi.tmp", "/wifi.txt");
+}
+// Nur druckbares ASCII zulassen - Muell-Bytes (kaputte Datei) nie in Profile uebernehmen.
+static bool wifiTxtClean(const String& s) {
+  for (size_t i = 0; i < s.length(); i++)
+    if ((uint8_t)s[i] < 32 || (uint8_t)s[i] > 126) return false;
+  return true;
 }
 // /wifi.txt parsen -> g_wprof + NVS. Anzahl geladener Profile (-2 = keine Datei).
 static int sdApplyWifiTxt() {
@@ -2551,6 +2572,10 @@ static int sdApplyWifiTxt() {
     if (slot < 0 || slot >= WPROF_COUNT) continue;
     String ssid = line.substring(eq + 1, bar);
     String pass = line.substring(bar + 1);
+    if (!wifiTxtClean(ssid) || !wifiTxtClean(pass)) {
+      Serial.printf("wifi.txt: Profil %d hat Muell-Zeichen -> Zeile ignoriert\n", slot);
+      continue;
+    }
     saveWprof((uint8_t)slot, ssid.c_str(), pass.c_str(), g_wprof[slot].hubip);
     n++;
     Serial.printf("wifi.txt: Profil %d = '%s' (pw-len %u)\n", slot, ssid.c_str(), (unsigned)pass.length());
