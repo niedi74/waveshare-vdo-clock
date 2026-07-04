@@ -2872,6 +2872,11 @@ static void handleWebSet() {
     g_redrawPage = true;
     Serial.printf("Web: Motor-Stil = %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
   }
+  if (webServer.hasArg("lstyle")) {             // Lambda-Stil (0=Gauge, 1=Verlauf/Kurve) - wie Motor-Stil fernsetzbar
+    saveLambdaStyle(webServer.arg("lstyle").toInt() ? 1 : 0);
+    g_redrawPage = true;
+    Serial.printf("Web: Lambda-Stil = %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
+  }
   if (webServer.hasArg("imunull")) {
     saveImuNull();
     g_redrawPage = true;
@@ -3610,6 +3615,9 @@ void loop() {
         else if (cmd.startsWith("style:")) { saveMotorStyle(cmd.substring(6).toInt());
                                              Serial.printf("Motor-Stil = %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
                                              if (currentPage == 2) drawMotorPage(); }
+        else if (cmd.startsWith("lambda:")) { saveLambdaStyle(cmd.substring(7).toInt() ? 1 : 0);
+                                             Serial.printf("Lambda-Stil = %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
+                                             if (currentPage == 3) drawLambdaPage(); }
         else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0|1|2 | imu:null | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
