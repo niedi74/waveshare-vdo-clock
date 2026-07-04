@@ -2522,11 +2522,24 @@ static String sdReadWifiTxt() {
   f.close();
   return s;
 }
+// Aktuelle Profile -> /wifi.txt spiegeln. Ohne das ueberschreibt eine alte SD-Datei
+// beim naechsten Boot jede per Console/Tastatur/WebGUI gemachte Aenderung.
+static bool g_sdApplyingWifi = false;
+static void sdSyncWifiTxt() {
+  if (!g_sdMounted || g_sdApplyingWifi) return;
+  File w = SD_MMC.open("/wifi.txt", FILE_WRITE);
+  if (!w) return;
+  w.println("# WLAN-Profile:  <Slot>=<SSID>|<Passwort>   (0=Heim 1=Hub-AP 2=S24)");
+  for (int i = 0; i < WPROF_COUNT; i++)
+    if (g_wprof[i].ssid[0]) w.printf("%d=%s|%s\n", i, g_wprof[i].ssid, g_wprof[i].pass);
+  w.close();
+}
 // /wifi.txt parsen -> g_wprof + NVS. Anzahl geladener Profile (-2 = keine Datei).
 static int sdApplyWifiTxt() {
   if (!g_sdMounted || !SD_MMC.exists("/wifi.txt")) return -2;
   File f = SD_MMC.open("/wifi.txt", FILE_READ);
   if (!f) return -2;
+  g_sdApplyingWifi = true;
   int n = 0;
   while (f.available()) {
     String line = f.readStringUntil('\n');
@@ -2543,6 +2556,7 @@ static int sdApplyWifiTxt() {
     Serial.printf("wifi.txt: Profil %d = '%s' (pw-len %u)\n", slot, ssid.c_str(), (unsigned)pass.length());
   }
   f.close();
+  g_sdApplyingWifi = false;
   return n;
 }
 
@@ -3224,6 +3238,7 @@ static void saveWprof(uint8_t idx, const char* ssid, const char* pass, const cha
   snprintf(k, sizeof(k), "wp%u_p", idx); p.putString(k, g_wprof[idx].pass);
   snprintf(k, sizeof(k), "wp%u_h", idx); p.putString(k, g_wprof[idx].hubip);
   p.end();
+  sdSyncWifiTxt();          // SD-wifi.txt mitziehen, sonst gewinnt die alte Datei beim Boot
 }
 
 static void reconnectWifiProfile() {
