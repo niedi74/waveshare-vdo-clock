@@ -65,4 +65,4 @@ Der Hub ist bis zur stabilen RTC-Versorgung der Time-Master.
 
 ## Zugangsdaten
 
-Lokale Zugangsdaten bleiben in `src/wifi_secret.h` und werden nicht committed. Vorlage: `src/wifi_secret.example.h`.
+Lokale Zugangsdaten bleiben in `src/wifi_secret.h` und werden **nicht** committed. Vorlage: `src/wifi_secret.example.h`. `wifi.txt` (Geraete-Profile) ist ebenfalls gitignored. Ablage-/Einspiel-Konzept (privates Repo): siehe [`SECRETS.md`](SECRETS.md).
