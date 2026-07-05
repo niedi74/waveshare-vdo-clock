@@ -14,8 +14,11 @@ debug_web_*.html
 debug_web_*.png
 _patch_*.py
 
-# Lokale WiFi-Zugangsdaten
+# Lokale WiFi-Zugangsdaten (Passwoerter) - NIE ins Git
 src/wifi_secret.h
+wifi.txt
+data/wifi.txt
+**/wifi.txt
 build_err.txt
 
 # Generiert von PlatformIO / ESP-IDF Integration
