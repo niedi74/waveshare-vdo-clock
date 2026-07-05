@@ -138,6 +138,17 @@ curl -F "firmware=@.pio/build/waveshare_s3_28c/firmware.bin" http://<ip>/update 
 `ap:on` · `ble:on|off` · `123:on|off` · `buzzer:on|off` · `style:0..3` · `motor` ·
 `clock` · `rot:±|NN` · `imu:null` · `can:test|ping|rx|normal|listen` · `reboot`
 
+## Backlog
+
+- **Original-Tacho-Drehregler → Display-Helligkeit (ADC).** Der Helligkeits-
+  Drehregler im originalen Cockpit dimmt die Lampen vermutlich per Spannungs-
+  absenkung (12 V → dunkler). Idee: ESP liest diese Spannung per ADC ein und
+  mappt sie auf `hal_backlight` (aktuell binär auf GPIO6 — für echtes Dimmen
+  auf PWM/LEDC umstellen). Freier ADC1-Pin bei aktivem WiFi: **GPIO4**
+  (ADC1_CH3). Offen: Spannungsteiler-Dimensionierung (12 V → ≤3,3 V, Messpunkt
+  an der Tacho-Beleuchtungsschaltung, nicht am Bordnetz), Kalibrierung
+  Rohwert→Helligkeit, Topologie des Original-Dimmers (reines R-Netzwerk?).
+
 ## Lessons Learned (Post-Mortems)
 
 - **Touch hing sporadisch** → der blockierende Hub-GET im Loop fraß Taps (bis
