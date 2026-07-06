@@ -79,12 +79,13 @@ static uint32_t           bleNextScanAt = 0;
 static const char* g_lastSrc = "---";
 
 // -------- CAN cockpit client (TWAI, hoert 0x510 vom Spartan-Test-Hub) --------
-#define COCKPIT_CAN_ID     0x510
 #define COCKPIT_CAN_RX_PIN GPIO_NUM_44
 #define COCKPIT_CAN_TX_PIN GPIO_NUM_43
 
 static bool     g_canReady      = false;
 static bool     g_canListenOnly = true;   // Display hoert nur mit (kein ACK/TX)
+static uint16_t g_canId         = 0x510;  // Cockpit-Frame-ID (Dev-Tab, NVS can_id)
+static uint16_t g_canKbps       = 500;    // Bitrate kbit/s: 125/250/500/1000 (NVS can_kbps)
 static uint32_t g_canRx         = 0;
 static uint32_t g_canIgnored    = 0;
 static uint32_t g_canLastRxMs   = 0;
@@ -617,15 +618,18 @@ static bool setupCockpitCan() {
   twai_mode_t mode = g_canListenOnly ? TWAI_MODE_LISTEN_ONLY : TWAI_MODE_NORMAL;
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(COCKPIT_CAN_TX_PIN, COCKPIT_CAN_RX_PIN, mode);
   twai_timing_config_t  t = TWAI_TIMING_CONFIG_500KBITS();
+  if      (g_canKbps == 125)  { twai_timing_config_t x = TWAI_TIMING_CONFIG_125KBITS(); t = x; }
+  else if (g_canKbps == 250)  { twai_timing_config_t x = TWAI_TIMING_CONFIG_250KBITS(); t = x; }
+  else if (g_canKbps == 1000) { twai_timing_config_t x = TWAI_TIMING_CONFIG_1MBITS();   t = x; }
   twai_filter_config_t  f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
   esp_err_t err = twai_driver_install(&g, &t, &f);
   if (err != ESP_OK) { Serial.printf("CAN: install failed %s\n", esp_err_to_name(err)); return false; }
   err = twai_start();
   if (err != ESP_OK) { Serial.printf("CAN: start failed %s\n", esp_err_to_name(err)); twai_driver_uninstall(); return false; }
   g_canReady = true;
-  Serial.printf("CAN: cockpit RX ready id=0x%03X TX=%d RX=%d mode=%s 500k\n",
-                COCKPIT_CAN_ID, (int)COCKPIT_CAN_TX_PIN, (int)COCKPIT_CAN_RX_PIN,
-                g_canListenOnly ? "listen" : "normal");
+  Serial.printf("CAN: cockpit RX ready id=0x%03X TX=%d RX=%d mode=%s %uk\n",
+                g_canId, (int)COCKPIT_CAN_TX_PIN, (int)COCKPIT_CAN_RX_PIN,
+                g_canListenOnly ? "listen" : "normal", g_canKbps);
   return true;
 }
 
@@ -658,7 +662,7 @@ static void cockpitCanTick() {
   uint8_t drained = 0;
   while (drained < 8 && twai_receive(&msg, 0) == ESP_OK) {
     drained++;
-    if (msg.extd || msg.rtr || msg.identifier != COCKPIT_CAN_ID || msg.data_length_code != 8) { g_canIgnored++; continue; }
+    if (msg.extd || msg.rtr || msg.identifier != g_canId || msg.data_length_code != 8) { g_canIgnored++; continue; }
     applyCockpitCanFrame(msg);
   }
 }
@@ -2400,6 +2404,9 @@ static void loadSettings() {
   g_imuOffRoll    = p.getFloat("imu_off_r", 0.0f);
   g_wifiAuto      = p.getBool("wifi_auto", true);      // WLAN-Auto-Fallback default AN
   g_canListenOnly = p.getBool("can_listen", true);     // CAN: listen-only default (NORMAL = ACK)
+  g_canId         = p.getUShort("can_id", 0x510);      // CAN: Frame-ID (Dev-Tab)
+  g_canKbps       = p.getUShort("can_kbps", 500);      // CAN: Bitrate (Dev-Tab)
+  if (g_canKbps != 125 && g_canKbps != 250 && g_canKbps != 1000) g_canKbps = 500;
   g_motorStyle    = p.getUChar("mstyle", 2);          // 0=digital,1=vdo,2=123tune+,3=vdo+uhr
   if (g_motorStyle > MOTOR_STYLE_COUNT - 1) g_motorStyle = 2;
   g_alertsOn   = p.getBool("alerts", true);            // Alarme (Dev-Tab)
@@ -2831,9 +2838,6 @@ static void handleWebRoot() {
     "<input type='checkbox' name='f123' value='1' ");
   html += g_feature123 ? "checked" : "";
   html += F(" onchange='this.form.submit()'> 123TUNE+ direkt (Fallback bei Hub-Ausfall)</label></p><p><label>"
-    "<input type='checkbox' name='can' value='1' ");
-  html += g_featureCan ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> CAN-Cockpit (0x510, nur mit Transceiver/Bus)</label></p><p><label>"
     "<input type='checkbox' name='wauto' value='1' ");
   html += g_wifiAuto ? "checked" : "";
   html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label></p>"
@@ -2931,6 +2935,35 @@ static void handleWebRoot() {
     "<input name='scrpm' type='number' min='3000' max='12000' step='1000' value='");
   html += String(g_rpmScaleMax);
   html += F("' style='width:80px;padding:6px;border:0;border-radius:6px'> 1/min</p>"
+    "<hr style='border-color:#333'>"
+    "<p><label><input type='checkbox' name='canon' value='1' ");
+  html += g_featureCan ? "checked" : "";
+  html += F("> <b>CAN-Cockpit</b>");
+  if (g_canReady) {
+    char cs[64];
+    snprintf(cs, sizeof(cs), " <span style='color:#6c6'>rx=%lu ign=%lu</span>",
+             (unsigned long)g_canRx, (unsigned long)g_canIgnored);
+    html += cs;
+  }
+  html += F("</label></p>"
+    "<p>Modus: <select name='canmode' style='padding:6px;border:0;border-radius:6px'>"
+    "<option value='1'");
+  html += g_canListenOnly ? " selected" : "";
+  html += F(">listen-only (Bus mit Spartan-ACK)</option><option value='0'");
+  html += g_canListenOnly ? "" : " selected";
+  html += F(">NORMAL/ACK (2-Knoten-Pr&uuml;fstand)</option></select></p>"
+    "<p>ID 0x<input name='canid' value='");
+  { char idb[8]; snprintf(idb, sizeof(idb), "%03X", g_canId); html += idb; }
+  html += F("' style='width:60px;padding:6px;border:0;border-radius:6px'> &nbsp; Bitrate "
+    "<select name='cankbps' style='padding:6px;border:0;border-radius:6px'>");
+  {
+    const uint16_t rates[4] = { 125, 250, 500, 1000 };
+    for (int i = 0; i < 4; i++) {
+      html += "<option value='" + String(rates[i]) + "'" +
+              (g_canKbps == rates[i] ? " selected" : "") + ">" + String(rates[i]) + "k</option>";
+    }
+  }
+  html += F("</select></p>"
     "<button type='submit'>Speichern</button></form>"
     "<div style='color:#888;text-align:left'>Auto-Cockpit: ab dieser Drehzahl (Hub/CAN/123) springt "
     "das Display automatisch aufs Motor-Cockpit; Motor aus &rarr; zur&uuml;ck zur Uhr. "
@@ -3054,6 +3087,33 @@ static void handleWebSet() {
         if (v >= 1000 && v <= g_rpmScaleMax) { g_rpmRedline = v; p.putInt("rl_rpm", v); } }
       g_redrawPage = true;                       // Tacho/Band sofort neu zeichnen
     }
+    { // CAN-Konfig: an/aus, Modus, ID, Bitrate - Aenderung re-initialisiert den Treiber
+      bool canChanged = false;
+      bool con = webServer.hasArg("canon");
+      if (con != g_featureCan) { g_featureCan = con; p.putBool("feat_can", con); canChanged = true; }
+      if (webServer.hasArg("canmode")) {
+        bool listen = webServer.arg("canmode").toInt() == 1;
+        if (listen != g_canListenOnly) { g_canListenOnly = listen; p.putBool("can_listen", listen); canChanged = true; }
+      }
+      if (webServer.hasArg("canid")) {
+        uint32_t id = (uint32_t)strtoul(webServer.arg("canid").c_str(), nullptr, 16);
+        if (id >= 1 && id <= 0x7FF && (uint16_t)id != g_canId) {
+          g_canId = (uint16_t)id; p.putUShort("can_id", g_canId); canChanged = true;
+        }
+      }
+      if (webServer.hasArg("cankbps")) {
+        int k = webServer.arg("cankbps").toInt();
+        if ((k == 125 || k == 250 || k == 500 || k == 1000) && (uint16_t)k != g_canKbps) {
+          g_canKbps = (uint16_t)k; p.putUShort("can_kbps", g_canKbps); canChanged = true;
+        }
+      }
+      if (canChanged) {
+        if (g_featureCan) setupCockpitCan();
+        else { twai_stop(); twai_driver_uninstall(); g_canReady = false; }
+        Serial.printf("Web: CAN %s id=0x%03X %uk %s\n", g_featureCan ? "an" : "aus",
+                      g_canId, g_canKbps, g_canListenOnly ? "listen" : "normal");
+      }
+    }
     p.end();
     Serial.printf("Web/Dev: Auto-Cockpit %s (Schwelle %d), Test-Hub %s (%s), Alarme %s "
                   "(lam %.2f-%.2f rpm>%d temp>%d volt<%.1f), Tacho rot %d / max %d\n",
@@ -3076,16 +3136,11 @@ static void handleWebFeatures() {
   const bool ble    = webServer.hasArg("ble");
   const bool buzzer = webServer.hasArg("buzzer");
   const bool f123   = webServer.hasArg("f123");
-  const bool can    = webServer.hasArg("can");
   const bool wauto  = webServer.hasArg("wauto");
   saveFeatures(wifi, ble, buzzer);
   if (f123 != g_feature123) saveFeature123(f123);
-  if (can != g_featureCan) {
-    g_featureCan = can;
-    Preferences p; p.begin("clock", false); p.putBool("feat_can", g_featureCan); p.end();
-    if (g_featureCan) setupCockpitCan();
-    else { twai_stop(); twai_driver_uninstall(); g_canReady = false; }
-  }
+  // CAN wohnt im Dev-Tab (devsave) - hier NICHT anfassen, sonst schaltet
+  // jedes Speichern des Funktionen-Formulars CAN mangels Checkbox wieder aus.
   if (wauto != g_wifiAuto) {
     g_wifiAuto = wauto;
     Preferences p; p.begin("clock", false); p.putBool("wifi_auto", g_wifiAuto); p.end();
@@ -3286,6 +3341,8 @@ static void startWebServer() {
          ",\"buzzer\":" + String(g_featureBuzzer ? 1 : 0) +
          ",\"123\":" + String(g_feature123 ? 1 : 0) +
          ",\"can\":" + String(g_featureCan ? 1 : 0) +
+         ",\"can_listen\":" + String(g_canListenOnly ? 1 : 0) +
+         ",\"can_id\":\"0x" + String(g_canId, HEX) + "\",\"can_kbps\":" + String(g_canKbps) +
          ",\"auto_cockpit\":" + String(g_autoCockpit ? 1 : 0) +
          ",\"auto_cockpit_rpm\":" + String(g_autoCockpitRpm) +
          ",\"test_hub\":" + String(g_testHub ? 1 : 0) +
