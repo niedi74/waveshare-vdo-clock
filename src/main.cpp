@@ -792,6 +792,7 @@ static void httpPollTick() {
   http.setReuse(false);
   String url = "http://" + tgt + "/api/status";
   if (!http.begin(url)) { if (failStreak < 200) failStreak++; return; }
+  http.addHeader("X-Device", "vdo-clock " GIT_REV);   // Hub-Diagnose zeigt uns namentlich
   // Timeouts adaptiv: bei schwachem Signal (< -70 dBm) braucht der TCP-Aufbau
   // laenger als 200ms -> alle Polls scheiterten (httpRx=0 trotz Verbindung).
   // Bei gutem Signal bleiben die kurzen Timeouts (Touch/Loop reaktiv; Taps
