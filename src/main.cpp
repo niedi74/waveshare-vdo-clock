@@ -65,6 +65,8 @@ static float g_battVolt = 0, g_speedKmh = 0;
 static float g_g123Volt = 0, g_g123Temp = 0, g_g123Coil = 0;
 static bool  g_lambdaValid = false, g_battValid = false;
 static bool  g_speedValid = false, g_g123Valid = false;
+static float g_tripKm = 0.0f;              // Teilstrecke vom Hub (trip_km, Reset via POST /odo)
+static bool  g_tripValid = false;
 static bool  g_bleConn = false;
 static uint32_t g_bleLastRx = 0, g_bleRxCnt = 0;
 
@@ -813,6 +815,7 @@ static void httpPollTick() {
     if (jsonNum(bc, "volt", v))      g_g123Volt = v;
     if (jsonNum(bc, "tune_amp", v))  g_g123Coil = v;
     if (jsonNum(bc, "speed_kmh", v)){ g_speedKmh = v; g_speedValid = true; }
+    if (jsonNum(bc, "trip_km", v)) { g_tripKm = v; g_tripValid = true; }
     g_g123Valid   = jsonTrue(bc, "tune_connected");
     // Quelle kennzeichnen: Dev-Schalter ODER Test-Hub-AP erkannt am Subnetz.
     // Beschluss 3.7.: Live-Hub-AP = 192.168.4.x, Test-Hub-AP = 192.168.5.x.
@@ -825,6 +828,30 @@ static void httpPollTick() {
     if (failStreak < 200) failStreak++;
   }
   http.end();
+}
+
+// Teilstrecke am Hub nullen (gleicher Endpunkt wie das ↺ in der Hub-WebGUI).
+// Blockiert kurz (<1 s) - wird nur durch bewussten langen Druck ausgeloest.
+static bool tripResetOnHub() {
+  String tgt = hubTarget();
+  if (!tgt.length()) return false;
+  HTTPClient http;
+  http.setReuse(false);
+  http.setConnectTimeout(600);
+  http.setTimeout(800);
+  if (!http.begin("http://" + tgt + "/odo")) return false;
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  http.addHeader("X-Device", "vdo-clock " GIT_REV);
+  int code = http.POST("trip=reset");
+  http.end();
+  const bool ok = (code >= 200 && code < 400);   // Hub antwortet 303 (Redirect nach POST)
+  Serial.printf("TRIP-Reset -> %s: HTTP %d\n", tgt.c_str(), code);
+  sdLog(ok ? "TRIP RESET" : "TRIP RESET FEHLER");
+  if (ok) {
+    g_tripKm = 0.0f;                      // sofort anzeigen, naechster Poll bestaetigt
+    if (g_featureBuzzer) { hal_buzzer(true); delay(60); hal_buzzer(false); }
+  }
+  return ok;
 }
 
 // ===================== 123TUNE+ direkter BLE-Fallback =====================
@@ -1500,6 +1527,7 @@ static const GaugeTheme THEME_123 = {
 static uint8_t g_motorStyle = 2;   // 0=digital, 1=vdo, 2=123tune+
 static const char* const MOTOR_STYLE_NAMES[] = { "DIGITAL", "VDO", "123TUNE+", "VDO+UHR" };
 #define MOTOR_STYLE_COUNT 4
+static uint32_t g_tripArmUntil = 0;   // Trip-Reset: 1. Langdruck scharf (5 s), 2. Langdruck nullt
 static const GaugeTheme& gTheme() {
   return g_motorStyle == 0 ? THEME_DIGITAL : g_motorStyle == 2 ? THEME_123 : THEME_VDO;  // 1+3 = VDO-Look
 }
@@ -1668,10 +1696,17 @@ static void drawMotorPage() {
     drawTextCentered(240, M_Y(352), buf, lc2, M_F(4));
     drawTextCentered(240, M_Y(336), "LAMBDA", t.txtDim, M_F(1));
     const bool g123c = fresh && g_g123Valid;
-    char tv[28];
-    if (g123c) snprintf(tv, sizeof(tv), "%dC  %.1fV", (int)g_g123Temp, g_g123Volt);
-    else       strcpy(tv, "--C  --V");
-    drawTextCentered(240, M_Y(396), tv, t.txtDim, M_F(2));
+    char tv[32];
+    if (millis() < g_tripArmUntil) {
+      strcpy(tv, "TRIP NULLEN? UNTEN HALTEN");
+      drawTextCentered(240, M_Y(396), tv, TACH_RED, M_F(2));
+    } else {
+      char tr[12] = "";
+      if (g_tripValid) snprintf(tr, sizeof(tr), "  T%.1f", g_tripKm);
+      if (g123c) snprintf(tv, sizeof(tv), "%dC  %.1fV%s", (int)g_g123Temp, g_g123Volt, tr);
+      else       snprintf(tv, sizeof(tv), "--C  --V%s", tr);
+      drawTextCentered(240, M_Y(396), tv, t.txtDim, M_F(2));
+    }
     char st3[24];
     const char* src3 = fresh ? g_lastSrc : (g_bleConn ? "WARTE" : (g_canReady ? "CAN WARTE" : "KEIN HUB"));
     snprintf(st3, sizeof(st3), "%s%s", fresh ? "LIVE " : "", src3);
@@ -1711,13 +1746,19 @@ static void drawMotorPage() {
   } else { strcpy(buf, "----"); lcol = t.txtDim; }
   drawTextCentered(240, M_Y(216), buf, lcol, M_F(6));
 
-  // AMP (Zuendspulenstrom) + Tempo, dann Status, im unteren Ring-Gap
-  char line[24];
-  char amp[10], spd[10];
-  if (g123)        snprintf(amp, sizeof(amp), "%.1fA", g_g123Coil); else strcpy(amp, "--");
-  if (fresh && g_speedValid) snprintf(spd, sizeof(spd), "%dKMH", (int)g_speedKmh); else strcpy(spd, "--");
-  snprintf(line, sizeof(line), "AMP %s  %s", amp, spd);
-  drawTextCentered(240, M_Y(396), line, t.txtDim, M_F(2));
+  // AMP (Zuendspulenstrom) + Tempo + Trip, dann Status, im unteren Ring-Gap
+  char line[32];
+  if (millis() < g_tripArmUntil) {
+    strcpy(line, "TRIP NULLEN? UNTEN HALTEN");
+    drawTextCentered(240, M_Y(396), line, TACH_RED, M_F(2));
+  } else {
+    char amp[10], spd[10], tr[12] = "";
+    if (g123)        snprintf(amp, sizeof(amp), "%.1fA", g_g123Coil); else strcpy(amp, "--");
+    if (fresh && g_speedValid) snprintf(spd, sizeof(spd), "%dKMH", (int)g_speedKmh); else strcpy(spd, "--");
+    if (g_tripValid) snprintf(tr, sizeof(tr), "  T%.1f", g_tripKm);
+    snprintf(line, sizeof(line), "AMP %s  %s%s", amp, spd, tr);
+    drawTextCentered(240, M_Y(396), line, t.txtDim, M_F(2));
+  }
 
   // Statuszeile unten: Uhrzeit + Datenquelle (Uhr fehlt sonst im Kombi)
   char st[24];
@@ -3614,6 +3655,19 @@ void loop() {
           saveMotorStyle((g_motorStyle + 1) % MOTOR_STYLE_COUNT);
           drawMotorPage();
           Serial.printf("motor long-press -> Stil %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
+        } else if (g_tripValid && touchLastY >= 370 && nowMs - touchStartMs >= 1000) {
+          // Trip-Reset zweistufig (alle Stile): 1. Langdruck unten scharf machen,
+          // 2. Langdruck innerhalb 5 s bestaetigt -> Teilstrecke am Hub nullen
+          touchLongHandled = true;
+          lastTouch = nowMs;
+          if (millis() < g_tripArmUntil) {
+            g_tripArmUntil = 0;
+            tripResetOnHub();
+          } else {
+            g_tripArmUntil = millis() + 5000;
+            Serial.println("Trip-Reset scharf: unten nochmal 1 s halten");
+          }
+          drawMotorPage();
         }
       } else if (currentPage == 3) {
         // LAMBDA: langer Druck in die Mitte -> Gauge <-> Verlauf umschalten
@@ -3759,6 +3813,7 @@ void loop() {
           setupCockpitCan();
           Serial.printf("CAN-Mode = %s\n", g_canListenOnly ? "listen-only" : "NORMAL (ACK)");
         }
+        else if (cmd == "trip:reset") { Serial.println(tripResetOnHub() ? "Trip genullt" : "Trip-Reset FEHLER"); }
         else if (cmd == "can:test"){ runCanTest(); }
         else if (cmd == "can:ping"){ runCanPing(); }
         else if (cmd == "can:rx")  { Serial.printf("CAN: ready=%d rx=%lu ignored=%lu age=%lums src=%s\n",
@@ -3771,7 +3826,7 @@ void loop() {
         else if (cmd.startsWith("lambda:")) { saveLambdaStyle(cmd.substring(7).toInt() ? 1 : 0);
                                              Serial.printf("Lambda-Stil = %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
                                              if (currentPage == 3) drawLambdaPage(); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0|1|2 | imu:null | can:on|off | can:test | can:rx | can:normal|listen"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..3 | trip:reset | imu:null | can:on|off | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
