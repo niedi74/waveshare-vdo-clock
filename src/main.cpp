@@ -27,6 +27,7 @@
 #include "SD_MMC.h"                // Micro-SD am 2.8C (SDMMC 1-bit: CLK=2/CMD=1/D0=42, D3=EXIO4)
 #include <sys/time.h>
 #include <time.h>
+#include "esp_system.h"             // esp_reset_reason() fuers SD-Bootlog
 
 #define FEATURE_TOUCH 1
 
@@ -125,6 +126,7 @@ static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
 static bool      g_feature123    = false;  // 123-Direkt-Fallback: default AUS (sonst Dauer-BLE -> Ruckeln)
+static bool      g_featureCan    = false;  // CAN-Cockpit-RX: default AUS (kein Transceiver/Bus verbunden)
 static bool      g_autoCockpit    = true;  // Drehzahl > Schwelle -> automatisch Motor-Seite (von Uhr/Menue)
 static int       g_autoCockpitRpm = 600;   // Schwelle, per WebGUI variabel einstellbar
 static bool      g_testHub        = false; // Dev: Daten vom Test-Hub (feste IP) statt Profil-Hub; Quelle heisst dann "TEST"
@@ -164,6 +166,7 @@ static uint32_t    g_sdSizeMB  = 0;
 static const char* g_sdType    = "-";
 static int         g_sdWifiLoaded = -2;   // -2=keine SD/Datei, -1=Vorlage angelegt, >=0=Profile geladen
 static const char* g_sdOtaResult   = "-"; // SD-OTA-Recovery: "-", "OK", "FEHLER"
+static void sdLog(const char* msg);       // fwd - Ereignis-Log auf SD (siehe Definition weiter unten)
 static void reconnectWifiProfile();
 static void cycleWifiProfile();
 static void updateRotationCache();
@@ -346,6 +349,9 @@ static bool wifiNtpTick() {
     strcpy(lastIp, g_ipStr);
     Serial.printf("WiFi verbunden, IP: %s (Profil %s)\n", g_ipStr, WPROF_LABELS[g_wifiProfile]);
     Preferences pp; pp.begin("clock", false); pp.putUChar("wifi_prof", g_wifiProfile); pp.end();  // verbundenes Profil merken
+    char logMsg[64];
+    snprintf(logMsg, sizeof(logMsg), "WIFI %s ip=%s", WPROF_LABELS[g_wifiProfile], g_ipStr);
+    sdLog(logMsg);
   }
   if (!g_webStarted) {
     startWebServer();
@@ -1416,6 +1422,9 @@ static void alertTick() {
     size_t n = strlen(g_alertText);                 // trailing space weg
     if (n && g_alertText[n-1] == ' ') g_alertText[n-1] = 0;
     Serial.printf("ALARM: %s\n", m ? g_alertText : "aus");
+    char logMsg[48];
+    snprintf(logMsg, sizeof(logMsg), "ALARM %s", m ? g_alertText : "aus");
+    sdLog(logMsg);
     g_redrawPage = true;                            // Ring sofort an/aus zeichnen
   }
 }
@@ -2338,6 +2347,7 @@ static void loadSettings() {
   g_featureBle    = p.getBool("feat_ble",  false);
   g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
   g_feature123    = p.getBool("feat_123", false);     // 123-Fallback default OFF
+  g_featureCan    = p.getBool("feat_can", false);     // CAN default OFF (kein Bus/Transceiver noetig)
   g_autoCockpit    = p.getBool("auto_cock", true);    // Auto-Cockpit default AN
   g_autoCockpitRpm = p.getInt("acock_rpm", 600);      // Schwelle variabel
   if (g_autoCockpitRpm < 100 || g_autoCockpitRpm > 5000) g_autoCockpitRpm = 600;
@@ -2536,6 +2546,24 @@ static String sdReadWifiTxt() {
   f.close();
   return s;
 }
+// ===== SD-Systemlog: Ereignisse (Boot/WLAN/Alarm/OTA) fuer spaetere Auswertung =====
+// Eine Datei pro Tag (/log/YYYYMMDD.txt), Zeile "HH:MM:SS  Ereignis". Bewusst nur
+// Ereignisse (Kanten), keine Telemetrie - Lambda/RPM jede Sekunde waere Datenflut
+// und witzlos (dafuer gibt es /live). Fehlschlag ist still: das Log darf den
+// eigentlichen Betrieb nie stoeren, auch nicht durch g_sdMounted=false-Flapping.
+static void sdLog(const char* msg) {
+  if (!g_sdMounted) return;
+  struct tm now = {};
+  readClockTime(&now);
+  char path[24];
+  snprintf(path, sizeof(path), "/log/%04d%02d%02d.txt",
+           now.tm_year + 1900, now.tm_mon + 1, now.tm_mday);
+  File f = SD_MMC.open(path, FILE_APPEND);
+  if (!f) return;
+  f.printf("%02d:%02d:%02d  %s\n", now.tm_hour, now.tm_min, now.tm_sec, msg);
+  f.close();
+}
+
 // Aktuelle Profile -> /wifi.txt spiegeln. Ohne das ueberschreibt eine alte SD-Datei
 // beim naechsten Boot jede per Console/Tastatur/WebGUI gemachte Aenderung.
 static bool g_sdApplyingWifi = false;
@@ -2761,6 +2789,9 @@ static void handleWebRoot() {
     "<input type='checkbox' name='f123' value='1' ");
   html += g_feature123 ? "checked" : "";
   html += F(" onchange='this.form.submit()'> 123TUNE+ direkt (Fallback bei Hub-Ausfall)</label></p><p><label>"
+    "<input type='checkbox' name='can' value='1' ");
+  html += g_featureCan ? "checked" : "";
+  html += F(" onchange='this.form.submit()'> CAN-Cockpit (0x510, nur mit Transceiver/Bus)</label></p><p><label>"
     "<input type='checkbox' name='wauto' value='1' ");
   html += g_wifiAuto ? "checked" : "";
   html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label></p>"
@@ -2803,6 +2834,9 @@ static void handleWebRoot() {
     if (SD_MMC.exists("/update.done")) html += F(" &middot; update.done da");
     if (SD_MMC.exists("/update.bad"))  html += F(" &middot; update.bad da");
     html += F("</div></div>");
+    html += F("<div class='card'><h3>System-Log</h3>"
+      "<div style='color:#888;text-align:left'>Ereignisse (Boot/WLAN/Alarm/OTA) je Tag als "
+      "<b>/log/JJJJMMTT.txt</b>. <a href='/log'>Heutiges Log ansehen</a></div></div>");
   } else {
     html += F("<div>Status: <b style='color:#c66'>nicht gemountet</b> &ndash; keine Karte erkannt.</div></div>");
   }
@@ -3000,16 +3034,23 @@ static void handleWebFeatures() {
   const bool ble    = webServer.hasArg("ble");
   const bool buzzer = webServer.hasArg("buzzer");
   const bool f123   = webServer.hasArg("f123");
+  const bool can    = webServer.hasArg("can");
   const bool wauto  = webServer.hasArg("wauto");
   saveFeatures(wifi, ble, buzzer);
   if (f123 != g_feature123) saveFeature123(f123);
+  if (can != g_featureCan) {
+    g_featureCan = can;
+    Preferences p; p.begin("clock", false); p.putBool("feat_can", g_featureCan); p.end();
+    if (g_featureCan) setupCockpitCan();
+    else { twai_stop(); twai_driver_uninstall(); g_canReady = false; }
+  }
   if (wauto != g_wifiAuto) {
     g_wifiAuto = wauto;
     Preferences p; p.begin("clock", false); p.putBool("wifi_auto", g_wifiAuto); p.end();
   }
-  Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s 123=%s\n",
+  Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s 123=%s can=%s\n",
                 g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off",
-                g_featureBuzzer ? "on" : "off", g_feature123 ? "on" : "off");
+                g_featureBuzzer ? "on" : "off", g_feature123 ? "on" : "off", g_featureCan ? "on" : "off");
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -3077,12 +3118,20 @@ static void handleOtaUpload() {
     }
   } else if (up.status == UPLOAD_FILE_END) {
     if (g_otaBusy) {
-      if (Update.end(true)) Serial.printf("OTA: Erfolg, %u Bytes\n", (unsigned)g_otaRxBytes);
-      else                  Update.printError(Serial);
+      char logMsg[48];
+      if (Update.end(true)) {
+        Serial.printf("OTA: Erfolg, %u Bytes\n", (unsigned)g_otaRxBytes);
+        snprintf(logMsg, sizeof(logMsg), "OTA-Web OK %u Bytes", (unsigned)g_otaRxBytes);
+      } else {
+        Update.printError(Serial);
+        snprintf(logMsg, sizeof(logMsg), "OTA-Web FEHLER");
+      }
+      sdLog(logMsg);
     }
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     Update.abort(); g_otaBusy = false; hal_pause_for_ota(false);
     Serial.println("OTA: abgebrochen");
+    sdLog("OTA-Web abgebrochen");
   }
 }
 
@@ -3170,6 +3219,21 @@ static void startWebServer() {
     webServer.send(200, "text/plain", b);
   });
   webServer.on("/sdwifi", HTTP_POST, handleWebSdWifi);
+  webServer.on("/log", []() {              // ?d=JJJJMMTT waehlt einen Tag, sonst heute
+    if (!g_sdMounted) { webServer.send(503, "text/plain", "SD nicht gemountet"); return; }
+    struct tm now = {};
+    char path[24];
+    if (webServer.hasArg("d") && webServer.arg("d").length() == 8) {
+      snprintf(path, sizeof(path), "/log/%s.txt", webServer.arg("d").c_str());
+    } else {
+      readClockTime(&now);
+      snprintf(path, sizeof(path), "/log/%04d%02d%02d.txt", now.tm_year + 1900, now.tm_mon + 1, now.tm_mday);
+    }
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) { webServer.send(404, "text/plain", String(path) + " nicht gefunden"); return; }
+    webServer.streamFile(f, "text/plain");
+    f.close();
+  });
   webServer.on("/version", []() {          // Maschinenlesbarer Stand: Build/Git/Features (JSON)
     String j = F("{\"fw\":\"" FW_BUILD "\",\"git\":\"" GIT_REV "\",\"github\":\"" GITHUB_URL "\"");
     j += ",\"up_s\":" + String(millis() / 1000);
@@ -3179,6 +3243,7 @@ static void startWebServer() {
          ",\"ble\":" + String(g_featureBle ? 1 : 0) +
          ",\"buzzer\":" + String(g_featureBuzzer ? 1 : 0) +
          ",\"123\":" + String(g_feature123 ? 1 : 0) +
+         ",\"can\":" + String(g_featureCan ? 1 : 0) +
          ",\"auto_cockpit\":" + String(g_autoCockpit ? 1 : 0) +
          ",\"auto_cockpit_rpm\":" + String(g_autoCockpitRpm) +
          ",\"test_hub\":" + String(g_testHub ? 1 : 0) +
@@ -3349,7 +3414,11 @@ static void setupSdCard() {
   g_sdMounted = true;
   Serial.printf("SD: OK %s %luMB (frei %lluMB)\n", g_sdType, (unsigned long)g_sdSizeMB,
                 (unsigned long long)((SD_MMC.totalBytes() - SD_MMC.usedBytes()) / (1024ULL * 1024ULL)));
+  if (!SD_MMC.exists("/log")) SD_MMC.mkdir("/log");
   loadWifiFromSd();
+  char bootMsg[64];
+  snprintf(bootMsg, sizeof(bootMsg), "BOOT fw=%s git=%s reset=%d", FW_BUILD, GIT_REV, (int)esp_reset_reason());
+  sdLog(bootMsg);
 }
 
 // ===== OTA-Recovery von SD: /update.bin beim Boot flashen (ohne WLAN/COM13) =====
@@ -3387,6 +3456,7 @@ static void sdCheckFirmwareUpdate() {
     SD_MMC.remove("/update.run");                       // Rename kaputt -> loeschen statt Flash-Loop
   g_sdOtaResult = ok ? "OK" : "FEHLER";
   Serial.printf("SD-OTA: %s\n", ok ? "OK -> Neustart" : "FEHLER");
+  sdLog(ok ? "OTA-SD OK" : "OTA-SD FEHLER");
   if (ok) { delay(300); ESP.restart(); }
   hal_pause_for_ota(false);                              // bei Fehler Panel zurueck
 }
@@ -3443,7 +3513,9 @@ void setup() {
   }
 
   // CAN-Cockpit-Empfaenger (TWAI, listen-only) starten: hoert 0x510 vom Test-Hub
-  setupCockpitCan();
+  // Nur wenn bewusst aktiviert - sonst zeigt der Fallback-Text ueberall "CAN WARTE",
+  // obwohl gar kein Transceiver/Bus verbunden ist.
+  if (g_featureCan) setupCockpitCan();
 
   setupSdCard();                 // Micro-SD mounten - gibt LCD-SPI frei, liest wifi.txt
   ensureHubProfile();            // NACH SD-Import: Live-Hub-Profil muss immer waehlbar sein
@@ -3672,6 +3744,14 @@ void loop() {
         else if (cmd.startsWith("rot:")) { saveRotation(cmd.substring(4).toInt()); g_redrawPage = true; }
         else if (cmd == "clock")   { currentPage = 0; drawVdoClock(); }
         else if (cmd == "reboot")  { Serial.println("Reboot..."); delay(50); ESP.restart(); }
+        else if (cmd == "can:on" || cmd == "can:off") {
+          g_featureCan = (cmd == "can:on");
+          Preferences pc; pc.begin("clock", false); pc.putBool("feat_can", g_featureCan); pc.end();
+          if (g_featureCan) setupCockpitCan();
+          else { twai_stop(); twai_driver_uninstall(); g_canReady = false; }
+          Serial.printf("CAN-Feature = %s\n", g_featureCan ? "an" : "aus");
+          sdLog(g_featureCan ? "CAN an" : "CAN aus");
+        }
         else if (cmd == "can:normal" || cmd == "can:listen") {
           g_canListenOnly = (cmd == "can:listen");
           Preferences pc; pc.begin("clock", false); pc.putBool("can_listen", g_canListenOnly); pc.end();
@@ -3690,7 +3770,7 @@ void loop() {
         else if (cmd.startsWith("lambda:")) { saveLambdaStyle(cmd.substring(7).toInt() ? 1 : 0);
                                              Serial.printf("Lambda-Stil = %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
                                              if (currentPage == 3) drawLambdaPage(); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0|1|2 | imu:null | can:test | can:rx | can:normal|listen"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0|1|2 | imu:null | can:on|off | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
