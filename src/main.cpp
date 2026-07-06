@@ -66,7 +66,6 @@ static bool  g_lambdaValid = false, g_battValid = false;
 static bool  g_speedValid = false, g_g123Valid = false;
 static bool  g_bleConn = false;
 static uint32_t g_bleLastRx = 0, g_bleRxCnt = 0;
-static String g_bleHubName = "---";
 
 static NimBLEClient*      bleClient    = nullptr;
 static NimBLEAddress      bleTarget;
@@ -139,7 +138,7 @@ static int       g_alRpmMax  = 4500;       // Drehzahl-Alarm (T2b Typ4)
 static int       g_alTempMax = 90;         // 123TUNE-Temp-Alarm (Grad C)
 static float     g_alVoltMin = 11.5f;      // Unterspannung bei laufendem Motor
 static uint8_t   g_alertMask = 0;          // Bits: 1=Lambda 2=Drehzahl 4=Temp 8=Volt
-static char      g_alertText[24] = "";     // z.B. "DREHZAHL LAMBDA"
+static char      g_alertText[32] = "";     // muss "DREHZAHL LAMBDA TEMP VOLT" (26) fassen
 // ---- Tacho-Konfiguration (Dev-Tab): roter Bereich + Skalenende
 static int       g_rpmRedline = 6000;      // Tacho: rot ab hier
 static int       g_rpmScaleMax = 8000;     // Tacho: Skalenende
@@ -375,6 +374,7 @@ static bool wifiNtpTick() {
 
 // ---- WLAN per WPS (PBC = Tastendruck am Router), wie im M5 Dial ----
 static void saveWprof(uint8_t, const char*, const char*, const char*);   // fwd
+static uint32_t g_manualWifiUntil = 0;   // selectWprof: Schonfrist gegen Auto-Fallback
 enum WpsState : uint8_t { WPS_IDLE = 0, WPS_RUN = 1, WPS_OK = 2, WPS_FAIL = 3 };
 static volatile WpsState g_wpsState       = WPS_IDLE;
 static volatile bool     g_wpsActive      = false;  // WPS laeuft -> normalen Reconnect aussetzen
@@ -405,6 +405,8 @@ static void wifiAutoTick() {
   }
   if (!g_featureWifi || !g_wifiAuto) return;
   if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() < g_manualWifiUntil) return;        // manuell gewaehltem Profil Zeit lassen -
+                                                   // sonst schiesst Auto jede S24-Wahl sofort ab
   // Nur Hub-AP > Heim automatisch. S24 NICHT auto (sonst landet das Display bei
   // einem Hub-AP-Abriss am Handy-Hotspot, wo es keine Hub-Daten gibt). S24 bleibt
   // manuell waehlbar (kurzer Tap auf WIFI). -> im Auto haelt es immer den Hub-AP.
@@ -525,7 +527,6 @@ class SpartanClientCB : public NimBLEClientCallbacks {
   }
   void onDisconnect(NimBLEClient*, int reason) override {
     g_bleConn = false;
-    g_bleHubName = "---";
     Serial.printf("BLE: getrennt (reason=%d), neuer Scan\n", reason);
     bleNextScanAt = millis() + 15000;
   }
@@ -539,7 +540,6 @@ class SpartanScanCB : public NimBLEScanCallbacks {
     String addr = dev->getAddress().toString().c_str();
     addr.toLowerCase();
     String name = dev->getName().c_str();
-    g_bleHubName = name.length() > 0 ? name : "---";
     if (addr == SPARTAN_MAC ||
         dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC))) {
       bleTarget    = dev->getAddress();
@@ -572,6 +572,7 @@ static void bleConnect() {
   if (!bleClient) {
     bleClient = NimBLEDevice::createClient();
     bleClient->setClientCallbacks(&spartanClientCB, false);
+    bleClient->setConnectTimeout(3000);   // Default waere bis 30 s - blockiert Loop+Touch
   }
   if (!bleClient->connect(bleTarget, true, false, false)) {
     Serial.println("BLE: Connect fehlgeschlagen");
@@ -646,7 +647,7 @@ static void cockpitCanTick() {
   uint8_t drained = 0;
   while (drained < 8 && twai_receive(&msg, 0) == ESP_OK) {
     drained++;
-    if (msg.extd || msg.identifier != COCKPIT_CAN_ID || msg.data_length_code != 8) { g_canIgnored++; continue; }
+    if (msg.extd || msg.rtr || msg.identifier != COCKPIT_CAN_ID || msg.data_length_code != 8) { g_canIgnored++; continue; }
     applyCockpitCanFrame(msg);
   }
 }
@@ -900,6 +901,7 @@ static void tune123Connect() {
   if (!tune123Client) {
     tune123Client = NimBLEDevice::createClient();
     tune123Client->setClientCallbacks(&tune123ClientCB, false);
+    tune123Client->setConnectTimeout(3000);   // Default waere bis 30 s - blockiert Loop+Touch
   }
   if (!tune123Client->connect(tune123Target, true, false, false)) {
     Serial.println("123: Connect fehlgeschlagen");
@@ -1916,8 +1918,7 @@ static void drawImuPage() {
   const uint16_t mark  = t.needle;                    // Fahrzeug/Roll-Zeiger
   const uint16_t lower = t.ground;                    // Boden (untere Haelfte)
 
-  fillFrame(t.face);
-  fillCircleFast(cx, cy, 216, t.face);                // Zifferblatt
+  fillFrame(t.face);                                  // fuellt schon alles in t.face
   for (int y = cy; y <= cy + 204; y++)                // untere Haelfte abgesetzt
     for (int x = cx - 204; x <= cx + 204; x++) {
       int dx = x - cx, dy = y - cy;
@@ -2473,7 +2474,6 @@ static void saveFeatures(bool wifi, bool ble, bool buzzer) {
   if (!g_featureBle) {
     if (bleClient && bleClient->isConnected()) bleClient->disconnect();
     g_bleConn    = false;
-    g_bleHubName = "---";
     bleDoConnect = false;
     bleNextScanAt = 0;
     Serial.println("BLE: AUS");
@@ -2541,7 +2541,11 @@ static void sdSyncWifiTxt() {
   // Erst Temp-Datei, dann Rename: Stromausfall mitten im Schreiben (Zuendung aus)
   // darf keine halbe wifi.txt hinterlassen - die wuerde beim Boot in NVS importiert.
   File w = SD_MMC.open("/wifi.tmp", FILE_WRITE);
-  if (!w) return;
+  if (!w) {                       // Karte gezogen/Kontaktproblem: nicht weiter dagegen anrennen,
+    g_sdMounted = false;          // jeder SDMMC-Zugriff auf tote Karte blockiert den Loop spuerbar
+    Serial.println("SD: Schreiben fehlgeschlagen -> als nicht gemountet markiert");
+    return;
+  }
   w.println("# WLAN-Profile:  <Slot>=<SSID>|<Passwort>   (0=Heim 1=Hub-AP 2=S24)");
   for (int i = 0; i < WPROF_COUNT; i++)
     if (g_wprof[i].ssid[0]) w.printf("%d=%s|%s\n", i, g_wprof[i].ssid, g_wprof[i].pass);
@@ -2600,7 +2604,9 @@ static void handleWebRoot() {
   char timeStr[16];
   snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
 
-  String html = F("<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
+  String html;
+  html.reserve(16384);     // ~14 KB HTML: ohne reserve ~150 reallocs -> Heap-Fragmentierung
+  html += F("<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>VDO Uhr</title><style>"
     "body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:16px;text-align:center}"
@@ -2632,7 +2638,7 @@ static void handleWebRoot() {
             "max-width:420px;font-weight:600'>&#9888; TEST-MODUS &ndash; Daten vom Test-Hub " +
             String(g_testHubIp) + " (Dev-Tab)</div>";
   html += F("<div class='card'><h3>Spartan-Hub Live</h3>");
-  bool anyFresh = bleFresh() || canFresh() || httpFresh();
+  bool anyFresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
   html += "<div>Quelle: <b id='lv_src'>" + String(anyFresh ? g_lastSrc : "---") + "</b> &middot; " +
           "<span id='lv_fresh'>" + String(anyFresh ? "LIVE" : "keine Daten") + "</span></div>";
   html += "<div>Lambda: <span id='lv_lam'>" + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) +
@@ -3008,11 +3014,13 @@ static void handleWebFeatures() {
 static void handleWebPage() {
   if (webServer.hasArg("p")) {
     int page = webServer.arg("p").toInt();
-    if (page < 0) page = 0;
-    if (page > 11) page = 11;
-    currentPage  = static_cast<uint8_t>(page);
-    g_redrawPage = true;
-    Serial.printf("Web: page=%u\n", currentPage);
+    // Nur echte Seiten: 8/9 existieren nicht (Display friert ein), 10 (Tastatur)
+    // braucht openKeyboard-Kontext, 12 (Scan) einen vorherigen Scan-Lauf.
+    if ((page >= 0 && page <= 7) || page == 11) {
+      currentPage  = static_cast<uint8_t>(page);
+      g_redrawPage = true;
+      Serial.printf("Web: page=%u\n", currentPage);
+    }
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -3031,11 +3039,13 @@ static void handleWebWifi() {
   } else if (webServer.hasArg("slot")) {
     uint8_t idx = (uint8_t)webServer.arg("slot").toInt();
     if (idx < WPROF_COUNT) {
-      // leeres Passwort = bestehendes behalten (wird im Formular nie zurueckgegeben)
-      const char* pw = webServer.arg("pass").length() ? webServer.arg("pass").c_str()
-                                                       : g_wprof[idx].pass;
-      saveWprof(idx, webServer.arg("ssid").c_str(), pw,
-                webServer.hasArg("hubip") ? webServer.arg("hubip").c_str() : g_wprof[idx].hubip);
+      // leeres Passwort = bestehendes behalten (wird im Formular nie zurueckgegeben).
+      // Benannte Strings: arg() liefert Temporaries, deren c_str() nach der Anweisung
+      // in freigegebenen Heap zeigt - das hat korrupte Passwoerter in NVS+SD geschrieben.
+      String ssid  = webServer.arg("ssid");
+      String pass  = webServer.arg("pass").length() ? webServer.arg("pass") : String(g_wprof[idx].pass);
+      String hubip = webServer.hasArg("hubip") ? webServer.arg("hubip") : String(g_wprof[idx].hubip);
+      saveWprof(idx, ssid.c_str(), pass.c_str(), hubip.c_str());
       selectWprof(idx);
       Serial.printf("Web: WLAN-Profil %u gesetzt -> '%s'\n", idx, g_wprof[idx].ssid);
     }
@@ -3123,7 +3133,7 @@ static void handleWebScreen() {
 // Live-Cockpitwerte als JSON fuer den Live-Tab (pollt im Sekundentakt statt Reload).
 // Klein (~200 B) -> blockiert den Loop kaum, laeuft nur solange der Live-Tab offen ist.
 static void handleWebLive() {
-  const bool anyFresh = bleFresh() || canFresh() || httpFresh();
+  const bool anyFresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
   String j = "{";
   j += "\"src\":\"" + String(anyFresh ? g_lastSrc : "---") + "\",";
   j += "\"fresh\":" + String(anyFresh ? "true" : "false") + ",";
@@ -3290,6 +3300,7 @@ static void selectWprof(uint8_t idx) {
   if (idx >= WPROF_COUNT) idx = 0;
   g_wifiProfile = idx;
   g_featureWifi = true;
+  g_manualWifiUntil = millis() + 20000;   // 20 s Schonfrist, bevor Auto-Fallback eingreift
   Preferences p;
   p.begin("clock", false);
   p.putUChar("wifi_prof", g_wifiProfile);
@@ -3311,15 +3322,9 @@ static void cycleWifiProfile() {                 // zum naechsten belegten Profi
 static void loadWifiFromSd() {
   if (!g_sdMounted) return;
   if (!SD_MMC.exists("/wifi.txt")) {                 // noch keine Datei -> Vorlage mit aktuellen Profilen
-    File w = SD_MMC.open("/wifi.txt", FILE_WRITE);
-    if (w) {
-      w.println("# WLAN-Profile:  <Slot>=<SSID>|<Passwort>   (0=Heim 1=Hub-AP 2=S24)");
-      for (int i = 0; i < WPROF_COUNT; i++)
-        if (g_wprof[i].ssid[0]) w.printf("%d=%s|%s\n", i, g_wprof[i].ssid, g_wprof[i].pass);
-      w.close();
-      g_sdWifiLoaded = -1;
-      Serial.println("SD: /wifi.txt Vorlage angelegt (aktuelle Profile)");
-    }
+    sdSyncWifiTxt();                                 // gleicher crashsicherer Pfad (tmp+rename)
+    g_sdWifiLoaded = -1;
+    Serial.println("SD: /wifi.txt Vorlage angelegt (aktuelle Profile)");
     return;
   }
   g_sdWifiLoaded = sdApplyWifiTxt();                 // vorhandene Datei anwenden
@@ -3347,13 +3352,26 @@ static void setupSdCard() {
 // ===== OTA-Recovery von SD: /update.bin beim Boot flashen (ohne WLAN/COM13) =====
 // Robust: nur wenn Datei plausibel gross ist; Datei wird IMMER umbenannt (kein Boot-Loop).
 static void sdCheckFirmwareUpdate() {
-  if (!g_sdMounted || !SD_MMC.exists("/update.bin")) return;
-  File f = SD_MMC.open("/update.bin", FILE_READ);
+  if (!g_sdMounted) return;
+  // Erst /update.bin -> /update.run umbenennen, DANN flashen: schlaegt schon das
+  // Rename fehl (FAT krank), wird gar nicht geflasht - kein Endlos-Flash-Loop.
+  // Ein liegengebliebenes /update.run (Zuendung aus mitten im Flash) wird beim
+  // naechsten Boot erneut geflasht - die App-Partition war dann eh halbfertig.
+  if (SD_MMC.exists("/update.bin")) {
+    SD_MMC.remove("/update.run");
+    if (!SD_MMC.rename("/update.bin", "/update.run")) {
+      Serial.println("SD-OTA: rename update.bin->update.run FEHLER -> abgebrochen");
+      g_sdOtaResult = "FEHLER";
+      return;
+    }
+  }
+  if (!SD_MMC.exists("/update.run")) return;
+  File f = SD_MMC.open("/update.run", FILE_READ);
   if (!f) return;
   size_t sz = f.size();
-  if (sz < 100000) { f.close(); SD_MMC.remove("/update.bad"); SD_MMC.rename("/update.bin", "/update.bad");
-                     Serial.println("SD-OTA: /update.bin zu klein -> .bad"); g_sdOtaResult = "FEHLER"; return; }
-  Serial.printf("SD-OTA: /update.bin %u Bytes -> flashe...\n", (unsigned)sz);
+  if (sz < 100000) { f.close(); SD_MMC.remove("/update.bad"); SD_MMC.rename("/update.run", "/update.bad");
+                     Serial.println("SD-OTA: update.bin zu klein -> .bad"); g_sdOtaResult = "FEHLER"; return; }
+  Serial.printf("SD-OTA: update %u Bytes -> flashe...\n", (unsigned)sz);
   hal_pause_for_ota(true);                              // RGB-Panel anhalten (Flash-Cache)
   bool ok = false;
   if (Update.begin(sz)) {
@@ -3362,7 +3380,8 @@ static void sdCheckFirmwareUpdate() {
   }
   f.close();
   SD_MMC.remove(ok ? "/update.done" : "/update.bad");   // alt weg
-  SD_MMC.rename("/update.bin", ok ? "/update.done" : "/update.bad");  // nie erneut flashen
+  if (!SD_MMC.rename("/update.run", ok ? "/update.done" : "/update.bad"))
+    SD_MMC.remove("/update.run");                       // Rename kaputt -> loeschen statt Flash-Loop
   g_sdOtaResult = ok ? "OK" : "FEHLER";
   Serial.printf("SD-OTA: %s\n", ok ? "OK -> Neustart" : "FEHLER");
   if (ok) { delay(300); ESP.restart(); }
@@ -3739,6 +3758,11 @@ void loop() {
     qmi8658Read();
     drawCurrentPage();
   }
+  // Shake-Buzzer der IMU-Seite darf beim Wegnavigieren nicht gelatcht anbleiben
+  // (drawImuPage schaltet ihn nur aus, solange die Seite selbst noch zeichnet)
+  static uint8_t buzzGuardPage = 0;
+  if (buzzGuardPage == 6 && currentPage != 6 && !g_alertMask) hal_buzzer(false);
+  buzzGuardPage = currentPage;
 
   // RGB-DMA periodisch resyncen - auf ALLEN Seiten (WiFi/BLE koennen das Bild
   // schwarz/verschoben machen; bisher resynct nur die Uhr-Seite -> Setup/Daten
