@@ -1932,38 +1932,100 @@ static void drawHubPage() {
   presentFrame();
 }
 
+// Setup-Zeilen: EINE Tabelle fuer Zeichnung UND Touch-Zonen (handleSetupLongPress
+// liest dieselben Y-Werte) - eine verschobene Zeile kann den Touch nicht mehr brechen.
+// 0=UHR 1=HELL 2=ROT 3=WIFI 4=BLE 5=CAN 6=BUZZER 7=IMU0
+static const int SETUP_ROW_Y[8] = { 104, 136, 168, 200, 232, 264, 296, 328 };
 static void drawSetupPage() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
-  drawTextCentered(240, 54, "SETUP", RGB565(230, 190, 70), 5);
+  drawTextCentered(240, 50, "SETUP", RGB565(230, 190, 70), 5);
   char buf[28];
   snprintf(buf, sizeof(buf), "%d %%", g_dialScalePct);
-  drawDataRow(110, "UHR",   buf, RGB565(235, 235, 225));
+  drawDataRow(SETUP_ROW_Y[0], "UHR",   buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d %%", g_brightnessPct);
-  drawDataRow(146, "HELL",  buf, RGB565(235, 235, 225));
+  drawDataRow(SETUP_ROW_Y[1], "HELL",  buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d DEG", g_rotationDeg);
-  drawDataRow(182, "ROT",   buf, RGB565(235, 235, 225));
+  drawDataRow(SETUP_ROW_Y[2], "ROT",   buf, RGB565(235, 235, 225));
   if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
     snprintf(buf, sizeof(buf), "%s", WPROF_LABELS[g_wifiProfile]);
-    drawDataRow(218, "WIFI", buf,
+    drawDataRow(SETUP_ROW_Y[3], "WIFI", buf,
                 WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   } else {
-    drawDataRow(218, "WIFI", "AUS", RGB565(220, 130, 50));
+    drawDataRow(SETUP_ROW_Y[3], "WIFI", "AUS", RGB565(220, 130, 50));
   }
-  drawDataRow(254, "BLE",    g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
+  drawDataRow(SETUP_ROW_Y[4], "BLE",    g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
               g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawDataRow(290, "BUZZER", g_featureBuzzer ? "AN" : "AUS",
+  // CAN: TIP zyklisch AUS -> AN (listen) -> ACK (normal) -> AUS
+  drawDataRow(SETUP_ROW_Y[5], "CAN",
+              !g_featureCan ? "AUS" : canFresh() ? (g_canListenOnly ? "OK" : "OK·ACK")
+                                                 : (g_canListenOnly ? "AN" : "ACK"),
+              !g_featureCan ? RGB565(150, 150, 150)
+                            : canFresh() ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(SETUP_ROW_Y[6], "BUZZER", g_featureBuzzer ? "AN" : "AUS",
               g_featureBuzzer ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
   if (g_imuPresent) {
     qmi8658Read();
     snprintf(buf, sizeof(buf), "%+.1f DEG", g_imuPitch - g_imuOffPitch);
-    drawDataRow(326, "IMU 0", buf, RGB565(235, 235, 225));   // TIP = aktuelle Lage nullen
+    drawDataRow(SETUP_ROW_Y[7], "IMU 0", buf, RGB565(235, 235, 225));   // TIP = aktuelle Lage nullen
   } else {
-    drawDataRow(326, "IMU 0", "---", RGB565(150, 150, 150));
+    drawDataRow(SETUP_ROW_Y[7], "IMU 0", "---", RGB565(150, 150, 150));
   }
-  drawTextCentered(240, 372, "TIP MENU", RGB565(180, 180, 170), 2);
+  drawTextCentered(240, 368, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
+}
+
+// CAN-Seite (Page 13): Status + Schalter, aus dem Setup ueber die CAN-Zeile.
+// AKTIV/MODUS per Tap schaltbar; ID + Bitrate zeigen (aendern: WebGUI Dev-Tab).
+static const int CAN_ROW_Y[6] = { 120, 158, 196, 234, 272, 310 };
+static void drawCanPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(80, 170, 220));
+  drawTextCentered(240, 56, "CAN", RGB565(120, 200, 240), 5);
+  char buf[28];
+  drawDataRow(CAN_ROW_Y[0], "AKTIV",   g_featureCan ? "AN" : "AUS",
+              g_featureCan ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
+  drawDataRow(CAN_ROW_Y[1], "MODUS",   g_canListenOnly ? "LISTEN" : "ACK",
+              RGB565(235, 235, 225));
+  snprintf(buf, sizeof(buf), "0x%03X", g_canId);
+  drawDataRow(CAN_ROW_Y[2], "ID",      buf, RGB565(235, 235, 225));
+  snprintf(buf, sizeof(buf), "%uk", g_canKbps);
+  drawDataRow(CAN_ROW_Y[3], "BITRATE", buf, RGB565(235, 235, 225));
+  snprintf(buf, sizeof(buf), "%lu/%lu", (unsigned long)g_canRx, (unsigned long)g_canIgnored);
+  drawDataRow(CAN_ROW_Y[4], "RX/IGN",  buf,
+              canFresh() ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
+  twai_status_info_t cs = {};
+  if (g_canReady && twai_get_status_info(&cs) == ESP_OK)
+    snprintf(buf, sizeof(buf), "%u/%u", (unsigned)cs.rx_error_counter, (unsigned)cs.bus_error_count);
+  else strcpy(buf, "---");
+  drawDataRow(CAN_ROW_Y[5], "FEHLER",  buf, RGB565(235, 235, 225));
+  drawTextCentered(240, 352, canFresh() ? "LIVE" : (g_featureCan ? "KEINE FRAMES" : "AUS"),
+                   canFresh() ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
+  drawTextCentered(240, 384, "TIP AKTIV/MODUS SCHALTET", RGB565(120, 120, 120), 1);
+  drawTextCentered(240, 414, "TIP UNTEN ZURUECK", RGB565(180, 180, 170), 2);
+  presentFrame();
+}
+
+static void handleCanTap(uint16_t, uint16_t y) {
+  if (y >= 398) { currentPage = 5; drawSetupPage(); return; }   // unten -> Setup
+  Preferences p;
+  if ((int)y >= CAN_ROW_Y[0] - 18 && (int)y < CAN_ROW_Y[0] + 18) {        // AKTIV an/aus
+    g_featureCan = !g_featureCan;
+    if (g_featureCan) setupCockpitCan();
+    else { twai_stop(); twai_driver_uninstall(); g_canReady = false; }
+    p.begin("clock", false); p.putBool("feat_can", g_featureCan); p.end();
+    sdLog(g_featureCan ? "CAN an" : "CAN aus");
+    Serial.printf("CAN-Seite: aktiv=%s\n", g_featureCan ? "an" : "aus");
+  } else if ((int)y >= CAN_ROW_Y[1] - 18 && (int)y < CAN_ROW_Y[1] + 18) { // MODUS listen/ACK
+    g_canListenOnly = !g_canListenOnly;
+    p.begin("clock", false); p.putBool("can_listen", g_canListenOnly); p.end();
+    if (g_featureCan) setupCockpitCan();
+    sdLog(g_canListenOnly ? "CAN modus listen" : "CAN modus ACK");
+    Serial.printf("CAN-Seite: modus=%s\n", g_canListenOnly ? "listen" : "ACK");
+  }
+  drawCanPage();
 }
 
 // IMU-Seite: Seitenansicht/Neigungsmesser mit Steigung (Pitch) + Roll.
@@ -2356,6 +2418,7 @@ static void drawCurrentPage() {
   else if (currentPage == 10) drawKeyboardPage();
   else if (currentPage == 11) drawWlanPage();
   else if (currentPage == 12) drawScanPage();
+  else if (currentPage == 13) drawCanPage();
 }
 
 // -------- Preferences --------
@@ -3157,7 +3220,7 @@ static void handleWebPage() {
     int page = webServer.arg("p").toInt();
     // Nur echte Seiten: 8/9 existieren nicht (Display friert ein), 10 (Tastatur)
     // braucht openKeyboard-Kontext, 12 (Scan) einen vorherigen Scan-Lauf.
-    if ((page >= 0 && page <= 7) || page == 11) {
+    if ((page >= 0 && page <= 7) || page == 11 || page == 13) {
       currentPage  = static_cast<uint8_t>(page);
       g_redrawPage = true;
       Serial.printf("Web: page=%u\n", currentPage);
@@ -3393,46 +3456,59 @@ static void manageWifiAp() {
 static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
   Serial.printf("setup tap y=%u dur=%lu long=%d\n", y, (unsigned long)durMs, isLong);
 
-  // Zonen passend zu drawSetupPage (Zeilen-Mitte = Zonenstart + 18, Hoehe 36)
-  if (y >= 345) {                       // unten -> zurueck ins Menue
+  if (y >= 346) {                       // unten -> zurueck ins Menue
     currentPage = 1;
     drawMenuOverview();
     Serial.println("setup tap: menu");
     return;
   }
+  // Zeile aus derselben Tabelle bestimmen, mit der drawSetupPage zeichnet
+  int row = -1;
+  for (int i = 0; i < 8; i++)
+    if ((int)y >= SETUP_ROW_Y[i] - 16 && (int)y < SETUP_ROW_Y[i] + 16) { row = i; break; }
 
-  if (y >= 92 && y < 128) {             // UHR (Zeile 110) -> Justage-Seite (Groesse/Rotation fein)
-    currentPage = 7;
-    drawAdjustPage();
-    Serial.println("setup tap: -> Justage");
-  } else if (y >= 128 && y < 164) {     // HELL (Zeile 146)
-    int next = (g_brightnessPct < 63) ? 75 : (g_brightnessPct < 88 ? 100 : 50);
-    saveBrightness(next);
-    drawSetupPage();
-    Serial.printf("setup tap: brightness=%d%%\n", g_brightnessPct);
-  } else if (y >= 164 && y < 200) {     // ROT (Zeile 182) -> Justage-Seite
-    currentPage = 7;
-    drawAdjustPage();
-    Serial.println("setup tap: -> Justage");
-  } else if (y >= 200 && y < 236) {     // WIFI (Zeile 218) -> WLAN-Seite (WPS / Tippen / Profil)
-    currentPage = 11;
-    drawWlanPage();
-    Serial.println("setup tap: -> WLAN-Seite");
-  } else if (y >= 236 && y < 272) {     // BLE (Zeile 254)
-    saveFeatures(g_featureWifi, !g_featureBle, g_featureBuzzer);
-    drawSetupPage();
-    Serial.printf("setup tap: ble=%s\n", g_featureBle ? "on" : "off");
-  } else if (y >= 272 && y < 308) {     // BUZZER (Zeile 290)
-    saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
-    drawSetupPage();
-    Serial.printf("setup tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
-  } else if (y >= 308 && y < 345) {     // IMU 0 (Zeile 326) -> Einbaulage nullen
-    saveImuNull();
-    drawSetupPage();
-    Serial.println("setup tap: IMU NULL");
-  } else {
-    drawSetupPage();
-    Serial.println("setup tap: no action");
+  switch (row) {
+    case 0:                             // UHR -> Justage-Seite (Groesse/Rotation fein)
+    case 2:                             // ROT -> Justage-Seite
+      currentPage = 7;
+      drawAdjustPage();
+      Serial.println("setup tap: -> Justage");
+      break;
+    case 1: {                           // HELL
+      int next = (g_brightnessPct < 63) ? 75 : (g_brightnessPct < 88 ? 100 : 50);
+      saveBrightness(next);
+      drawSetupPage();
+      Serial.printf("setup tap: brightness=%d%%\n", g_brightnessPct);
+      break;
+    }
+    case 3:                             // WIFI -> WLAN-Seite (Scan / Tippen / Profil)
+      currentPage = 11;
+      drawWlanPage();
+      Serial.println("setup tap: -> WLAN-Seite");
+      break;
+    case 4:                             // BLE an/aus
+      saveFeatures(g_featureWifi, !g_featureBle, g_featureBuzzer);
+      drawSetupPage();
+      Serial.printf("setup tap: ble=%s\n", g_featureBle ? "on" : "off");
+      break;
+    case 5:                             // CAN -> CAN-Seite (Status + Schalter)
+      currentPage = 13;
+      drawCanPage();
+      Serial.println("setup tap: -> CAN-Seite");
+      break;
+    case 6:                             // BUZZER an/aus
+      saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
+      drawSetupPage();
+      Serial.printf("setup tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
+      break;
+    case 7:                             // IMU 0 -> Einbaulage nullen
+      saveImuNull();
+      drawSetupPage();
+      Serial.println("setup tap: IMU NULL");
+      break;
+    default:
+      drawSetupPage();
+      Serial.println("setup tap: no action");
   }
 }
 
@@ -3773,6 +3849,8 @@ void loop() {
         handleWlanTap(tapX, tapY);      // WLAN-Seite (Scan/Tippen/Profil)
       } else if (currentPage == 12) {
         handleScanTap(tapX, tapY);      // Scan-Ergebnis (SSID antippen)
+      } else if (currentPage == 13) {
+        handleCanTap(tapX, tapY);       // CAN-Seite (aktiv/Modus schalten)
       } else {
         // Data pages (Motor/Lambda/Hub/IMU): Tap -> naechste, dann zurueck zur Uhr.
         if      (currentPage == 4) currentPage = 6;  // Hub -> IMU
@@ -3896,6 +3974,10 @@ void loop() {
   // WLAN-Seite live halten (WPS-Status / IP aktualisieren)
   { static uint32_t wlanRedrawAt = 0;
     if (currentPage == 11 && millis() > wlanRedrawAt) { wlanRedrawAt = millis() + 1200; drawWlanPage(); } }
+
+  // CAN-Seite live halten (RX-Zaehler / Fehler / LIVE-Status)
+  { static uint32_t canRedrawAt = 0;
+    if (currentPage == 13 && millis() > canRedrawAt) { canRedrawAt = millis() + 1000; drawCanPage(); } }
 
   // Auto-Cockpit: bei laufendem Motor automatisch aufs Motor-Display (von Uhr/Menue)
   autoCockpitTick();
