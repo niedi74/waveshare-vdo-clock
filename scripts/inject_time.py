@@ -27,11 +27,13 @@ print(f"[inject_time] RTC build time = {now.isoformat()} (id {build_id})")
 # "+"-Suffix = Working Tree hatte beim Build uncommittete Aenderungen.
 try:
     _cwd = env.subst("$PROJECT_DIR")
-    rev = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
-                                  cwd=_cwd, text=True).strip()
+    rev_url = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                      cwd=_cwd, text=True).strip()
+    rev = rev_url
     if subprocess.call(["git", "diff", "--quiet"], cwd=_cwd) != 0:
-        rev += "+"
+        rev += "+"                      # Anzeige-Marker "dirty" - NICHT in die URL!
 except Exception:
-    rev = "unknown"
-env.Append(CPPDEFINES=[("GIT_REV", env.StringifyMacro(rev))])
+    rev = rev_url = "unknown"
+env.Append(CPPDEFINES=[("GIT_REV", env.StringifyMacro(rev)),
+                       ("GIT_REV_URL", env.StringifyMacro(rev_url))])
 print(f"[inject_time] GIT_REV = {rev}")

@@ -146,7 +146,10 @@ static int       g_rpmScaleMax = 8000;     // Tacho: Skalenende
 #ifndef GIT_REV
   #define GIT_REV "unknown"                // wird von scripts/inject_time.py injiziert
 #endif
-#define GITHUB_URL "https://github.com/niedi74/waveshare-vdo-clock/commit/" GIT_REV
+#ifndef GIT_REV_URL
+  #define GIT_REV_URL GIT_REV              // Hash ohne "+"-Dirty-Marker (fuer den Link)
+#endif
+#define GITHUB_URL "https://github.com/niedi74/waveshare-vdo-clock/commit/" GIT_REV_URL
 static float     g_imuOffPitch   = 0.0f;   // IMU-Nullung (Einbaulage) - Pitch/Roll-Offset
 static float     g_imuOffRoll    = 0.0f;
 static bool      g_wifiAuto      = true;   // WLAN-Auto-Fallback: S24 > Heim > Hub-AP (verfuegbares Netz)
