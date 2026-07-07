@@ -1969,18 +1969,13 @@ static void drawHubPage() {
   if (g_sdMounted) snprintf(sdb, sizeof(sdb), "%s %luG", g_sdType, (unsigned long)((g_sdSizeMB + 512) / 1024));
   else             strcpy(sdb, "---");
   drawDataRow(362, "SD", sdb, g_sdMounted ? gr : dk);
-  boardBattRead();
-  char bb[20];
-  if (g_boardBattPresent) snprintf(bb, sizeof(bb), "%.2fV ~%d%%", g_boardBattVolt, boardBattPct());
-  else                    strcpy(bb, "kein Akku");
-  drawDataRow(396, "AKKU", bb, g_boardBattPresent ? gr : dk);
   presentFrame();
 }
 
 // Setup-Zeilen: EINE Tabelle fuer Zeichnung UND Touch-Zonen (handleSetupLongPress
 // liest dieselben Y-Werte) - eine verschobene Zeile kann den Touch nicht mehr brechen.
-// 0=UHR 1=HELL 2=ROT 3=WIFI 4=BLE 5=CAN 6=BUZZER 7=IMU0
-static const int SETUP_ROW_Y[8] = { 104, 136, 168, 200, 232, 264, 296, 328 };
+// 0=UHR 1=HELL 2=ROT 3=WIFI 4=BLE 5=CAN 6=BUZZER 7=IMU0 8=AKKU
+static const int SETUP_ROW_Y[9] = { 104, 136, 168, 200, 232, 264, 296, 328, 360 };
 static void drawSetupPage() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
@@ -2017,7 +2012,12 @@ static void drawSetupPage() {
   } else {
     drawDataRow(SETUP_ROW_Y[7], "IMU 0", "---", RGB565(150, 150, 150));
   }
-  drawTextCentered(240, 368, "TIP MENU", RGB565(180, 180, 170), 2);
+  boardBattRead();
+  char bb[20];
+  if (g_boardBattPresent) snprintf(bb, sizeof(bb), "%.2fV ~%d%%", g_boardBattVolt, boardBattPct());
+  else                    strcpy(bb, "kein Akku");
+  drawDataRow(SETUP_ROW_Y[8], "AKKU", bb, g_boardBattPresent ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
+  drawTextCentered(240, 402, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
 
@@ -3527,7 +3527,7 @@ static void manageWifiAp() {
 static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
   Serial.printf("setup tap y=%u dur=%lu long=%d\n", y, (unsigned long)durMs, isLong);
 
-  if (y >= 346) {                       // unten -> zurueck ins Menue
+  if (y >= 380) {                       // unten -> zurueck ins Menue
     currentPage = 1;
     drawMenuOverview();
     Serial.println("setup tap: menu");
@@ -3535,7 +3535,7 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
   }
   // Zeile aus derselben Tabelle bestimmen, mit der drawSetupPage zeichnet
   int row = -1;
-  for (int i = 0; i < 8; i++)
+  for (int i = 0; i < 9; i++)
     if ((int)y >= SETUP_ROW_Y[i] - 16 && (int)y < SETUP_ROW_Y[i] + 16) { row = i; break; }
 
   switch (row) {
@@ -3576,6 +3576,10 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
       saveImuNull();
       drawSetupPage();
       Serial.println("setup tap: IMU NULL");
+      break;
+    case 8:                             // AKKU - nur Info, keine Aktion
+      drawSetupPage();
+      Serial.println("setup tap: akku (info only)");
       break;
     default:
       drawSetupPage();
