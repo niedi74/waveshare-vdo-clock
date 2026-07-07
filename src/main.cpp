@@ -68,20 +68,15 @@ static bool  g_speedValid = false, g_g123Valid = false;
 
 // -------- Board-Akku (MX1.25-LiPo, separat vom Motor-g_battVolt oben) --------
 // GPIO4 = BAT_ADC, Teiler R5=200k(BAT)/R9=100k(GND) laut Schaltplan -> Vadc=Vbat/3.
+// WICHTIG (empirisch bestaetigt 7.7.): der Ladechip haelt diesen Pin bei USB-Strom
+// nahe Ladespannung (~4.2V), AUCH OHNE eingesteckten Akku - es gibt keine separate
+// Praesenzerkennung. "Akku vorhanden"/Prozent waeren also Kaffeesatzleserei bei
+// USB-Betrieb; wir zeigen deshalb nur die rohe Spannung, ohne Interpretation.
 #define BOARD_BAT_ADC_PIN 4
 static float g_boardBattVolt = 0.0f;
-static bool  g_boardBattPresent = false;   // Spannung plausibel (>2.5V) -> Akku dran+Strom
 static void boardBattRead() {
   uint32_t mv = analogReadMilliVolts(BOARD_BAT_ADC_PIN);   // kalibriert (eFuse), genauer als raw*3.3/4095
   g_boardBattVolt = (mv / 1000.0f) * 3.0f;                 // Teiler-Kehrwert (R5+R9)/R9 = 3
-  g_boardBattPresent = g_boardBattVolt > 2.5f;
-}
-// Grobe LiPo-Prozent-Schaetzung aus der Spannung (KEINE echte Ladestandsmessung -
-// der Chip hat kein Coulomb-Counting; unter Last/beim Laden weicht das ab).
-static int boardBattPct() {
-  if (!g_boardBattPresent) return -1;
-  float v = constrain(g_boardBattVolt, 3.0f, 4.2f);
-  return (int)((v - 3.0f) / (4.2f - 3.0f) * 100.0f);
 }
 static float g_tripKm = 0.0f;              // Teilstrecke vom Hub (trip_km, Reset via POST /odo)
 static bool  g_tripValid = false;
@@ -2058,9 +2053,12 @@ static void drawSetupPage() {
   }
   boardBattRead();
   char bb[20];
-  if (g_boardBattPresent) snprintf(bb, sizeof(bb), "%.2fV ~%d%%", g_boardBattVolt, boardBattPct());
-  else                    strcpy(bb, "kein Akku");
-  drawDataRow(SETUP_ROW_Y[8], "AKKU", bb, g_boardBattPresent ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
+  // Kein "vorhanden"-Anspruch mehr: der Ladechip haelt BAT_ADC bei USB-Strom
+  // nahe Ladespannung, AUCH OHNE eingesteckten Akku (empirisch bestaetigt,
+  // 7.7.: 4.19V trotz abgezogenem Akku). Nur bei reinem Akkubetrieb (USB ab)
+  // ist der Wert die echte Zellenspannung. Deshalb neutral: nur Spannung zeigen.
+  snprintf(bb, sizeof(bb), "%.2fV", g_boardBattVolt);
+  drawDataRow(SETUP_ROW_Y[8], "BAT/USB", bb, RGB565(180, 180, 170));
   drawTextCentered(240, 402, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
@@ -3005,15 +3003,14 @@ static void handleWebRoot() {
   html += F("</b><br>Git: <a href='" GITHUB_URL "' target='_blank'>" GIT_REV "</a>"
     " &middot; <a href='/version'>/version</a></div>");
   boardBattRead();
-  html += F("<div class='card' style='color:#888'>Board-Akku (MX1.25): ");
-  if (g_boardBattPresent) {
-    char bb[48];
-    snprintf(bb, sizeof(bb), "<b style='color:#e0c040'>%.2f V</b> (~%d %%)", g_boardBattVolt, boardBattPct());
-    html += bb;
-  } else {
-    html += F("<b>kein Akku / nur USB</b>");
+  { char bb[48];
+    snprintf(bb, sizeof(bb), "<b style='color:#e0c040'>%.2f V</b>", g_boardBattVolt);
+    html += "<div class='card' style='color:#888'>BAT_ADC (MX1.25): " + String(bb) +
+      "<br><span style='font-size:0.85em'>Zeigt bei USB-Strom die Ladespannung des Chips, "
+      "AUCH OHNE eingesteckten Akku (Ladechip haelt den Pin nahe 4.2V, egal ob eine Zelle "
+      "dranhaengt). Nur bei reinem Akkubetrieb (USB ab) ist der Wert die echte "
+      "Zellenspannung.</span></div>";
   }
-  html += F("</div>");
   html += F("</div>");
 
   // ===== Tab: SD =====
@@ -3539,8 +3536,11 @@ static void startWebServer() {
          ",\"canRx\":" + String((unsigned long)g_canRx) + "}";
     j += ",\"heap\":" + String(ESP.getFreeHeap());
     boardBattRead();
-    j += ",\"board_batt\":{\"present\":" + String(g_boardBattPresent ? 1 : 0) +
-         ",\"volt\":" + String(g_boardBattVolt, 2) + ",\"pct\":" + String(boardBattPct()) + "}}";
+    // "present" bewusst entfernt: bei USB-Strom haelt der Ladechip BAT_ADC nahe
+    // 4.2V, AUCH ohne eingesteckten Akku (7.7. empirisch bestaetigt) - nur bei
+    // reinem Akkubetrieb (kein USB) ist volt die echte Zellenspannung.
+    j += ",\"board_batt\":{\"volt\":" + String(g_boardBattVolt, 2) +
+         ",\"note\":\"nur ohne USB verlaesslich\"}}";
     webServer.send(200, "application/json", j);
   });
   webServer.begin();
@@ -4071,9 +4071,9 @@ void loop() {
         else if (cmd == "hubtime") { g_hubTimeSyncDone = false;
           Serial.printf("Hub-Zeit-Push erzwungen: %s\n", hubTimeSyncPush(time(nullptr)) ? "OK" : "FEHLER"); }
         else if (cmd == "batt") { boardBattRead();
-          Serial.printf("Board-Akku: %s %.2fV (~%d%%)\n",
-                        g_boardBattPresent ? "vorhanden" : "kein Akku/nur USB",
-                        g_boardBattVolt, boardBattPct()); }
+          Serial.printf("BAT_ADC: %.2fV (bei USB-Strom nur der Ladechip-Pegel, "
+                        "nicht zwingend echter Akku - nur ohne USB verlaesslich)\n",
+                        g_boardBattVolt); }
         else if (cmd == "can:test"){ runCanTest(); }
         else if (cmd == "can:ping"){ runCanPing(); }
         else if (cmd == "can:rx")  { Serial.printf("CAN: ready=%d rx=%lu ignored=%lu age=%lums src=%s\n",
