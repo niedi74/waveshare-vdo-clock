@@ -1969,6 +1969,11 @@ static void drawHubPage() {
   if (g_sdMounted) snprintf(sdb, sizeof(sdb), "%s %luG", g_sdType, (unsigned long)((g_sdSizeMB + 512) / 1024));
   else             strcpy(sdb, "---");
   drawDataRow(362, "SD", sdb, g_sdMounted ? gr : dk);
+  boardBattRead();
+  char bb[20];
+  if (g_boardBattPresent) snprintf(bb, sizeof(bb), "%.2fV ~%d%%", g_boardBattVolt, boardBattPct());
+  else                    strcpy(bb, "kein Akku");
+  drawDataRow(396, "AKKU", bb, g_boardBattPresent ? gr : dk);
   presentFrame();
 }
 
