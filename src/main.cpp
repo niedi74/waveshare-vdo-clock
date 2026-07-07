@@ -65,6 +65,24 @@ static float g_battVolt = 0, g_speedKmh = 0;
 static float g_g123Volt = 0, g_g123Temp = 0, g_g123Coil = 0;
 static bool  g_lambdaValid = false, g_battValid = false;
 static bool  g_speedValid = false, g_g123Valid = false;
+
+// -------- Board-Akku (MX1.25-LiPo, separat vom Motor-g_battVolt oben) --------
+// GPIO4 = BAT_ADC, Teiler R5=200k(BAT)/R9=100k(GND) laut Schaltplan -> Vadc=Vbat/3.
+#define BOARD_BAT_ADC_PIN 4
+static float g_boardBattVolt = 0.0f;
+static bool  g_boardBattPresent = false;   // Spannung plausibel (>2.5V) -> Akku dran+Strom
+static void boardBattRead() {
+  uint32_t mv = analogReadMilliVolts(BOARD_BAT_ADC_PIN);   // kalibriert (eFuse), genauer als raw*3.3/4095
+  g_boardBattVolt = (mv / 1000.0f) * 3.0f;                 // Teiler-Kehrwert (R5+R9)/R9 = 3
+  g_boardBattPresent = g_boardBattVolt > 2.5f;
+}
+// Grobe LiPo-Prozent-Schaetzung aus der Spannung (KEINE echte Ladestandsmessung -
+// der Chip hat kein Coulomb-Counting; unter Last/beim Laden weicht das ab).
+static int boardBattPct() {
+  if (!g_boardBattPresent) return -1;
+  float v = constrain(g_boardBattVolt, 3.0f, 4.2f);
+  return (int)((v - 3.0f) / (4.2f - 3.0f) * 100.0f);
+}
 static float g_tripKm = 0.0f;              // Teilstrecke vom Hub (trip_km, Reset via POST /odo)
 static bool  g_tripValid = false;
 static bool  g_bleConn = false;
@@ -2937,6 +2955,16 @@ static void handleWebRoot() {
   html += F(FW_BUILD);
   html += F("</b><br>Git: <a href='" GITHUB_URL "' target='_blank'>" GIT_REV "</a>"
     " &middot; <a href='/version'>/version</a></div>");
+  boardBattRead();
+  html += F("<div class='card' style='color:#888'>Board-Akku (MX1.25): ");
+  if (g_boardBattPresent) {
+    char bb[48];
+    snprintf(bb, sizeof(bb), "<b style='color:#e0c040'>%.2f V</b> (~%d %%)", g_boardBattVolt, boardBattPct());
+    html += bb;
+  } else {
+    html += F("<b>kein Akku / nur USB</b>");
+  }
+  html += F("</div>");
   html += F("</div>");
 
   // ===== Tab: SD =====
@@ -3460,7 +3488,10 @@ static void startWebServer() {
          ",\"wifitxt\":" + String(g_sdWifiLoaded) + ",\"ota\":\"" + String(g_sdOtaResult) + "\"}";
     j += ",\"daten\":{\"quelle\":\"" + String(g_lastSrc) + "\",\"httpRx\":" + String((unsigned long)g_httpRx) +
          ",\"canRx\":" + String((unsigned long)g_canRx) + "}";
-    j += ",\"heap\":" + String(ESP.getFreeHeap()) + "}";
+    j += ",\"heap\":" + String(ESP.getFreeHeap());
+    boardBattRead();
+    j += ",\"board_batt\":{\"present\":" + String(g_boardBattPresent ? 1 : 0) +
+         ",\"volt\":" + String(g_boardBattVolt, 2) + ",\"pct\":" + String(boardBattPct()) + "}}";
     webServer.send(200, "application/json", j);
   });
   webServer.begin();
@@ -3984,6 +4015,10 @@ void loop() {
           Serial.printf("CAN-Mode = %s\n", g_canListenOnly ? "listen-only" : "NORMAL (ACK)");
         }
         else if (cmd == "trip:reset") { Serial.println(tripResetOnHub() ? "Trip genullt" : "Trip-Reset FEHLER"); }
+        else if (cmd == "batt") { boardBattRead();
+          Serial.printf("Board-Akku: %s %.2fV (~%d%%)\n",
+                        g_boardBattPresent ? "vorhanden" : "kein Akku/nur USB",
+                        g_boardBattVolt, boardBattPct()); }
         else if (cmd == "can:test"){ runCanTest(); }
         else if (cmd == "can:ping"){ runCanPing(); }
         else if (cmd == "can:rx")  { Serial.printf("CAN: ready=%d rx=%lu ignored=%lu age=%lums src=%s\n",
@@ -3996,7 +4031,7 @@ void loop() {
         else if (cmd.startsWith("lambda:")) { saveLambdaStyle(cmd.substring(7).toInt() ? 1 : 0);
                                              Serial.printf("Lambda-Stil = %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
                                              if (currentPage == 3) drawLambdaPage(); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..3 | trip:reset | imu:null | can:on|off | can:test | can:rx | can:normal|listen"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..3 | trip:reset | batt | imu:null | can:on|off | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
