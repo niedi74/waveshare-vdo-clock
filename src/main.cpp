@@ -712,6 +712,28 @@ static void runCanPing() {
   if (wasListen) { g_canListenOnly = true; setupCockpitCan(); }
 }
 
+// IMU-Werte periodisch aufs CAN senden, damit der Hub sie mitloggen kann. Nur im
+// NORMAL-Modus moeglich: TWAI_MODE_LISTEN_ONLY verbietet jede eigene Uebertragung
+// (ESP-IDF-Doku). ID = Cockpit-ID+1 - wandert automatisch mit, falls g_canId je
+// umgestellt wird. Fire-and-forget (Timeout 0): blockiert den Loop nie.
+static void imuCanTxTick() {
+  static uint32_t at = 0;
+  if (!g_featureCan || !g_canReady || g_canListenOnly || !g_imuPresent) return;
+  if (millis() < at) return;
+  at = millis() + 200;                      // 5 Hz
+  qmi8658Read();
+  int16_t  pitchX10 = (int16_t)lroundf((g_imuPitch - g_imuOffPitch) * 10.0f);
+  int16_t  rollX10  = (int16_t)lroundf((g_imuRoll  - g_imuOffRoll)  * 10.0f);
+  uint16_t gX100    = (uint16_t)constrain((int)lroundf(g_imuGForce * 100.0f), 0, 65535);
+  twai_message_t m = {};
+  m.identifier = (g_canId < 0x7FF) ? (uint32_t)(g_canId + 1) : g_canId;
+  m.data_length_code = 6;
+  m.data[0] = (uint8_t)(pitchX10 >> 8); m.data[1] = (uint8_t)pitchX10;
+  m.data[2] = (uint8_t)(rollX10  >> 8); m.data[3] = (uint8_t)rollX10;
+  m.data[4] = (uint8_t)(gX100    >> 8); m.data[5] = (uint8_t)gX100;
+  twai_transmit(&m, 0);
+}
+
 // -------- HTTP-Poll-Client --------
 static bool httpFresh() { return g_httpLastRxMs != 0 && millis() - g_httpLastRxMs < 3000; }
 
@@ -3394,6 +3416,19 @@ static void startWebServer() {
     webServer.streamFile(f, "text/plain");
     f.close();
   });
+  webServer.on("/imu", []() {              // IMU-Werte als JSON - fuer Hub-Polling/Logging
+    char j[160];
+    if (!g_imuPresent) {
+      snprintf(j, sizeof(j), "{\"present\":false}");
+    } else {
+      qmi8658Read();
+      snprintf(j, sizeof(j),
+        "{\"present\":true,\"pitch\":%.2f,\"roll\":%.2f,\"gforce\":%.3f,\"shake\":%s}",
+        g_imuPitch - g_imuOffPitch, g_imuRoll - g_imuOffRoll, g_imuGForce,
+        qmi8658ShakeDetected(1.5f) ? "true" : "false");
+    }
+    webServer.send(200, "application/json", j);
+  });
   webServer.on("/version", []() {          // Maschinenlesbarer Stand: Build/Git/Features (JSON)
     String j = F("{\"fw\":\"" FW_BUILD "\",\"git\":\"" GIT_REV "\",\"github\":\"" GITHUB_URL "\"");
     j += ",\"up_s\":" + String(millis() / 1000);
@@ -4002,6 +4037,7 @@ void loop() {
 
   // CAN cockpit tick (0x510)
   cockpitCanTick();
+  imuCanTxTick();     // IMU-Werte auf ID+1 senden (nur im NORMAL/ACK-Modus)
 
   // HTTP-Poll vom Hub (/api/status)
   httpPollTick();
