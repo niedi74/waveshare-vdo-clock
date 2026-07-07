@@ -116,6 +116,8 @@ static uint32_t g_httpRx          = 0;
 static uint32_t g_httpLastRxMs    = 0;
 static String   g_hubResolvedIp   = "";        // mDNS-Cache (bei Hostname-Ziel)
 static bool     g_mdnsStarted     = false;
+static bool     g_hubNtpSynced    = true;      // aus /api/status - default true = kein Push, bis wir's besser wissen
+static bool     g_hubTimeSyncDone = false;      // pro Boot/Reconnect nur einmal versuchen (hubTimeSyncTick)
 
 // -------- OTA (Firmware-Update per WLAN/Web) --------
 static volatile bool   g_otaBusy    = false;
@@ -373,6 +375,7 @@ static bool wifiNtpTick() {
     char logMsg[64];
     snprintf(logMsg, sizeof(logMsg), "WIFI %s ip=%s", WPROF_LABELS[g_wifiProfile], g_ipStr);
     sdLog(logMsg);
+    g_hubTimeSyncDone = false;   // neue Verbindung -> Hub-Zeit-Push einmal neu versuchen
   }
   if (!g_webStarted) {
     startWebServer();
@@ -860,6 +863,7 @@ static void httpPollTick() {
     if (jsonNum(bc, "tune_amp", v))  g_g123Coil = v;
     if (jsonNum(bc, "speed_kmh", v)){ g_speedKmh = v; g_speedValid = true; }
     if (jsonNum(bc, "trip_km", v)) { g_tripKm = v; g_tripValid = true; }
+    g_hubNtpSynced = jsonTrue(bc, "ntp_synced");   // fuer hubTimeSyncTick(): Hub braucht Zeit-Push?
     g_g123Valid   = jsonTrue(bc, "tune_connected");
     // Quelle kennzeichnen: Dev-Schalter ODER Test-Hub-AP erkannt am Subnetz.
     // Beschluss 3.7.: Live-Hub-AP = 192.168.4.x, Test-Hub-AP = 192.168.5.x.
@@ -896,6 +900,46 @@ static bool tripResetOnHub() {
     if (g_featureBuzzer) { hal_buzzer(true); delay(60); hal_buzzer(false); }
   }
   return ok;
+}
+
+// Eigene (per NTP synchronisierte) Uhrzeit an den Hub pushen - fuer Hubs ohne
+// Internet (Bus-Hub, nur eigener AP fuer die Displays). Contract laut Hub-Team
+// (Branch test-hub-s3, unveroeffentlicht): POST /api/time_sync, Formular-Feld
+// "epoch" = Unix-Sekunden. Hub lehnt selbst ab wenn er schon synchron ist
+// (200 applied:false) - idempotent, mehrfaches Senden schadet nicht.
+static bool hubTimeSyncPush(time_t epoch) {
+  String tgt = hubTarget();
+  if (!tgt.length()) return false;
+  HTTPClient http;
+  http.setReuse(false);
+  http.setConnectTimeout(600);
+  http.setTimeout(800);
+  if (!http.begin("http://" + tgt + "/api/time_sync")) return false;
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  http.addHeader("X-Device", "vdo-clock " GIT_REV);
+  char body[24];
+  snprintf(body, sizeof(body), "epoch=%ld", (long)epoch);
+  int code = http.POST(body);
+  String resp = http.getString();
+  http.end();
+  const bool ok = (code == 200);
+  Serial.printf("Hub-Zeit-Push -> %s: HTTP %d %s\n", tgt.c_str(), code, resp.c_str());
+  sdLog(ok ? "HUB-ZEIT gesendet" : "HUB-ZEIT FEHLER");
+  return ok;
+}
+
+// Einmal pro Boot/Reconnect: wenn der Hub laut /api/status noch nicht NTP-
+// synchron ist UND wir selbst eine plausible Zeit haben (eigener NTP-Sync
+// oder gueltige RTC), die Zeit pushen. Kein Dauerpolling - der Hub blockt
+// Doppel-Sync selbst ab, haeufiges Senden waere nur unnoetiger Traffic.
+static void hubTimeSyncTick() {
+  if (g_hubTimeSyncDone) return;
+  if (!httpFresh()) return;              // erst warten bis /api/status frisch geparst wurde
+  if (g_hubNtpSynced) { g_hubTimeSyncDone = true; return; }   // Hub schon gut - nichts zu tun
+  time_t t = time(nullptr);
+  if (t < 1700000000) return;            // eigene Zeit noch nicht plausibel (kein NTP/RTC-Sync)
+  g_hubTimeSyncDone = true;              // nur EIN Versuch pro Boot/Reconnect (Erfolg oder nicht)
+  hubTimeSyncPush(t);
 }
 
 // ===================== 123TUNE+ direkter BLE-Fallback =====================
@@ -4024,6 +4068,8 @@ void loop() {
           Serial.printf("CAN-Mode = %s\n", g_canListenOnly ? "listen-only" : "NORMAL (ACK)");
         }
         else if (cmd == "trip:reset") { Serial.println(tripResetOnHub() ? "Trip genullt" : "Trip-Reset FEHLER"); }
+        else if (cmd == "hubtime") { g_hubTimeSyncDone = false;
+          Serial.printf("Hub-Zeit-Push erzwungen: %s\n", hubTimeSyncPush(time(nullptr)) ? "OK" : "FEHLER"); }
         else if (cmd == "batt") { boardBattRead();
           Serial.printf("Board-Akku: %s %.2fV (~%d%%)\n",
                         g_boardBattPresent ? "vorhanden" : "kein Akku/nur USB",
@@ -4040,7 +4086,7 @@ void loop() {
         else if (cmd.startsWith("lambda:")) { saveLambdaStyle(cmd.substring(7).toInt() ? 1 : 0);
                                              Serial.printf("Lambda-Stil = %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
                                              if (currentPage == 3) drawLambdaPage(); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..3 | trip:reset | batt | imu:null | can:on|off | can:test | can:rx | can:normal|listen"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..3 | trip:reset | hubtime | batt | imu:null | can:on|off | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
@@ -4085,6 +4131,7 @@ void loop() {
 
   // HTTP-Poll vom Hub (/api/status)
   httpPollTick();
+  hubTimeSyncTick();   // einmal pro Boot/Reconnect: Hub-Zeit pushen falls noetig
 
   // 123TUNE+ direkter Fallback (nur wenn HTTP/CAN tot + Hub-BLE aus)
   tune123ScanTick();
