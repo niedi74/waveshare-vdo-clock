@@ -113,6 +113,9 @@ static String   g_hubResolvedIp   = "";        // mDNS-Cache (bei Hostname-Ziel)
 static bool     g_mdnsStarted     = false;
 static bool     g_hubNtpSynced    = true;      // aus /api/status - default true = kein Push, bis wir's besser wissen
 static bool     g_hubTimeSyncDone = false;      // pro Boot/Reconnect nur einmal versuchen (hubTimeSyncTick)
+static bool     g_hubTimeValid    = false;      // aus /api/status: hat der Hub selbst (jetzt DS3231!) eine gueltige Zeit?
+static long     g_hubTimeEpoch    = 0;          // aus /api/status: time_epoch vom Hub
+static bool     g_hubTimePullDone = false;      // pro Boot/Reconnect nur einmal versuchen (hubTimePullTick)
 
 // -------- OTA (Firmware-Update per WLAN/Web) --------
 static volatile bool   g_otaBusy    = false;
@@ -371,6 +374,7 @@ static bool wifiNtpTick() {
     snprintf(logMsg, sizeof(logMsg), "WIFI %s ip=%s", WPROF_LABELS[g_wifiProfile], g_ipStr);
     sdLog(logMsg);
     g_hubTimeSyncDone = false;   // neue Verbindung -> Hub-Zeit-Push einmal neu versuchen
+    g_hubTimePullDone = false;   // neue Verbindung -> Hub-Zeit-Pull einmal neu versuchen
   }
   if (!g_webStarted) {
     startWebServer();
@@ -772,6 +776,18 @@ static bool jsonTrue(const char* s, const char* key) {
   if (n <= 0 || n >= (int)sizeof(pat)) return false;
   return strstr(s, pat) != nullptr;
 }
+// Wie jsonNum, aber strtol statt strtof: Unix-Epoch hat 10 Stellen, float32
+// verliert da schon einstellige Sekunden - fuer den Zeit-Pull vom Hub egal
+// (Uhr driftet eh leicht), aber sauberer ist sauberer.
+static bool jsonLong(const char* s, const char* key, long& out) {
+  char pat[24];
+  int n = snprintf(pat, sizeof(pat), "\"%s\":", key);
+  if (n <= 0 || n >= (int)sizeof(pat)) return false;
+  const char* p = strstr(s, pat);
+  if (!p) return false;
+  out = strtol(p + n, nullptr, 10);
+  return true;
+}
 
 static bool hubIsDottedIp() {
   if (g_hubIp.length() == 0) return false;
@@ -859,6 +875,9 @@ static void httpPollTick() {
     if (jsonNum(bc, "speed_kmh", v)){ g_speedKmh = v; g_speedValid = true; }
     if (jsonNum(bc, "trip_km", v)) { g_tripKm = v; g_tripValid = true; }
     g_hubNtpSynced = jsonTrue(bc, "ntp_synced");   // fuer hubTimeSyncTick(): Hub braucht Zeit-Push?
+    g_hubTimeValid = jsonTrue(bc, "time_valid");   // fuer hubTimePullTick(): Hub hat selbst gute Zeit (DS3231)?
+    long ep;
+    if (jsonLong(bc, "time_epoch", ep)) g_hubTimeEpoch = ep;
     g_g123Valid   = jsonTrue(bc, "tune_connected");
     // Quelle kennzeichnen: Dev-Schalter ODER Test-Hub-AP erkannt am Subnetz.
     // Beschluss 3.7.: Live-Hub-AP = 192.168.4.x, Test-Hub-AP = 192.168.5.x.
@@ -935,6 +954,38 @@ static void hubTimeSyncTick() {
   if (t < 1700000000) return;            // eigene Zeit noch nicht plausibel (kein NTP/RTC-Sync)
   g_hubTimeSyncDone = true;              // nur EIN Versuch pro Boot/Reconnect (Erfolg oder nicht)
   hubTimeSyncPush(t);
+}
+
+// Wendet einen Unix-Epoch (UTC) auf System-Uhr + eigene RTC an. Getrennt von
+// hubTimePullTick() damit der Serial-Testbefehl 'hubpull' das auch OHNE die
+// Automatik-Bedingungen (eigene Zeit schon plausibel?) direkt ausloesen kann.
+static void hubTimeApply(long epochLong, const char* quelle) {
+  struct timeval tv = { (time_t)epochLong, 0 };
+  settimeofday(&tv, nullptr);
+  struct tm now = {};
+  time_t epoch = (time_t)epochLong;
+  localtime_r(&epoch, &now);
+  rtcWrite(&now);
+  Serial.printf("Zeit-Pull (%s): %04d-%02d-%02d %02d:%02d:%02d uebernommen\n", quelle,
+                now.tm_year + 1900, now.tm_mon + 1, now.tm_mday,
+                now.tm_hour, now.tm_min, now.tm_sec);
+  sdLog("HUB-ZEIT uebernommen");
+}
+
+// Umgekehrte Richtung: wenn WIR selbst keine plausible Zeit haben (z.B. reiner
+// Hub-AP-Betrieb ohne Internet -> eigenes NTP schlaegt fehl) UND der Hub laut
+// /api/status selbst eine gueltige Zeit hat (DS3231-Hardware-RTC, praezise
+// auch ohne Internet), die Zeit VON DORT uebernehmen. Einmal pro Boot/Reconnect,
+// kein extra HTTP-Request - time_epoch/time_valid kommen im ohnehin laufenden
+// /api/status-Poll mit.
+static void hubTimePullTick() {
+  if (g_hubTimePullDone) return;
+  if (!httpFresh()) return;
+  time_t t = time(nullptr);
+  if (t > 1700000000) { g_hubTimePullDone = true; return; }   // eigene Zeit schon plausibel
+  if (!g_hubTimeValid || g_hubTimeEpoch < 1700000000) return; // Hub hat selbst noch keine gute Zeit
+  g_hubTimePullDone = true;
+  hubTimeApply(g_hubTimeEpoch, "Hub");
 }
 
 // ===================== 123TUNE+ direkter BLE-Fallback =====================
@@ -4070,6 +4121,10 @@ void loop() {
         else if (cmd == "trip:reset") { Serial.println(tripResetOnHub() ? "Trip genullt" : "Trip-Reset FEHLER"); }
         else if (cmd == "hubtime") { g_hubTimeSyncDone = false;
           Serial.printf("Hub-Zeit-Push erzwungen: %s\n", hubTimeSyncPush(time(nullptr)) ? "OK" : "FEHLER"); }
+        else if (cmd == "hubpull") {
+          Serial.printf("Hub-Status: valid=%d epoch=%ld\n", g_hubTimeValid ? 1 : 0, g_hubTimeEpoch);
+          if (g_hubTimeValid && g_hubTimeEpoch > 1700000000) hubTimeApply(g_hubTimeEpoch, "Hub, erzwungen");
+          else Serial.println("Hub hat noch keine plausible Zeit - nichts uebernommen"); }
         else if (cmd == "batt") { boardBattRead();
           Serial.printf("BAT_ADC: %.2fV (bei USB-Strom nur der Ladechip-Pegel, "
                         "nicht zwingend echter Akku - nur ohne USB verlaesslich)\n",
@@ -4086,7 +4141,7 @@ void loop() {
         else if (cmd.startsWith("lambda:")) { saveLambdaStyle(cmd.substring(7).toInt() ? 1 : 0);
                                              Serial.printf("Lambda-Stil = %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
                                              if (currentPage == 3) drawLambdaPage(); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..3 | trip:reset | hubtime | batt | imu:null | can:on|off | can:test | can:rx | can:normal|listen"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..3 | trip:reset | hubtime | hubpull | batt | imu:null | can:on|off | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
@@ -4132,6 +4187,7 @@ void loop() {
   // HTTP-Poll vom Hub (/api/status)
   httpPollTick();
   hubTimeSyncTick();   // einmal pro Boot/Reconnect: Hub-Zeit pushen falls noetig
+  hubTimePullTick();   // einmal pro Boot/Reconnect: Hub-Zeit ziehen falls WIR keine haben
 
   // 123TUNE+ direkter Fallback (nur wenn HTTP/CAN tot + Hub-BLE aus)
   tune123ScanTick();
