@@ -1912,12 +1912,17 @@ static void drawMotorPage() {
 #undef M_F
 
 // ===== Lambda-Verlauf (Trend ueber Zeit): Ringpuffer, alle 500ms ein Sample =====
-#define TR_N 120                         // 120 * 500ms = 60 s Fenster
+#define TR_N 600                         // 600 * 500ms = 300 s max. Fenster
 static uint8_t  g_trLam[TR_N];           // λ*100 (0 = ungueltig/Luecke)
 static uint16_t g_trRpm[TR_N];           // 1/min (Kontextlinie)
+static uint8_t  g_trMap[TR_N];           // Saugrohrdruck kPa (0..250, Kontextlinie)
 static uint16_t g_trHead  = 0;           // naechster Schreibindex
 static uint16_t g_trCount = 0;
 static uint8_t  g_lambdaStyle = 0;       // 0 = Gauge, 1 = Verlauf
+// Konfigurierbar (Dev-Tab / Serial / Tap oben auf dem Trend):
+static uint16_t g_trendWindowS = 60;     // sichtbares Fenster in s: 60/120/180/300 (NVS tr_win)
+static bool     g_trendShowMap = false;  // Saugrohrdruck-Linie mit einblenden (NVS tr_map)
+static bool     g_trendShowRpm = true;   // Drehzahl-Kontextlinie zeigen (NVS tr_rpm)
 
 static void trendSample() {              // jeden Loop aufrufen; sampelt selbst getaktet
   static uint32_t at = 0;
@@ -1927,6 +1932,7 @@ static void trendSample() {              // jeden Loop aufrufen; sampelt selbst 
   int lx = (fresh && g_lambdaValid) ? (int)lroundf(g_lambda * 100.0f) : 0;
   g_trLam[g_trHead] = (uint8_t)constrain(lx, 0, 255);
   g_trRpm[g_trHead] = (uint16_t)constrain((int)lroundf(g_rpm), 0, 9999);
+  g_trMap[g_trHead] = (uint8_t)constrain((int)lroundf(g_map), 0, 250);
   g_trHead = (g_trHead + 1) % TR_N;
   if (g_trCount < TR_N) g_trCount++;
 }
@@ -1943,6 +1949,10 @@ static inline int trRpmY(float rpm) {    // 0..6000 1/min auf dieselbe Hoehe
   float t = rpm / 6000.0f; if (t < 0) t = 0; if (t > 1) t = 1;
   return TR_PY1 - (int)lroundf(t * (TR_PY1 - TR_PY0));
 }
+static inline int trMapY(float kpa) {    // 0..120 kPa Saugrohrdruck auf dieselbe Hoehe
+  float t = kpa / 120.0f; if (t < 0) t = 0; if (t > 1) t = 1;
+  return TR_PY1 - (int)lroundf(t * (TR_PY1 - TR_PY0));
+}
 
 static void drawTrendPage() {
   if (!ensureFrame()) return;
@@ -1950,17 +1960,19 @@ static void drawTrendPage() {
   drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
   bool live  = httpFresh() || canFresh() || bleFresh() || tune123Fresh();
   bool fresh = live && g_lambdaValid;
-  // Kopf: aktueller Lambda-Wert (farbcodiert) + Drehzahl
+  // Kopf: aktueller Lambda-Wert (farbcodiert) + Drehzahl. Fensterbreite im Titel.
   char hb[12];
   if (fresh) snprintf(hb, sizeof(hb), "%.2f", g_lambda); else strcpy(hb, "--");
   uint16_t lc = RGB565(70, 210, 100);
   if (fresh) { if (g_lambda < 0.97f) lc = RGB565(235, 120, 40); else if (g_lambda > 1.03f) lc = RGB565(80, 160, 240); }
   else lc = RGB565(120, 90, 60);
-  drawTextCentered(240, 48, "LAMBDA  60s", RGB565(200, 200, 205), 2);
+  char tt[20]; snprintf(tt, sizeof(tt), "LAMBDA  %ds", g_trendWindowS);
+  drawTextCentered(240, 44, tt, RGB565(200, 200, 205), 2);
+  drawTextSmall(TR_PX0, 62, "TIP OBEN = ZEIT", RGB565(90, 90, 100), 1);
   drawTextCentered(168, 92, hb, lc, 5);
   char rb[12]; snprintf(rb, sizeof(rb), "%d", (int)lroundf(g_rpm));
   drawTextCentered(338, 86, rb, RGB565(120, 170, 230), 3);
-  drawTextCentered(338, 116, "1/min", RGB565(110, 110, 120), 1);
+  drawTextCentered(338, 116, g_trendShowMap ? "1/min kPa" : "1/min", RGB565(110, 110, 120), 1);
   // Soll-Band (Dev-Tab: g_alLamMin..g_alLamMax) + Stoechiometrie 1.0
   int yb0 = trLamY(g_alLamMax), yb1 = trLamY(g_alLamMin);
   fillRectFast(TR_PX0, yb0, TR_PX1 - TR_PX0, yb1 - yb0, RGB565(18, 58, 34));
@@ -1974,16 +1986,25 @@ static void drawTrendPage() {
   drawTextSmall(44, yg10 - 4, "1.0", dim, 1);
   drawTextSmall(44, yg08 - 4, "0.8", dim, 1);
   drawLineFast(TR_PX0, TR_PY1, TR_PX1, TR_PY1, RGB565(60, 60, 70), 1);
-  // Verlauf zeichnen (Drehzahl blass, dann Lambda kraeftig)
-  int n = g_trCount;
+  // Nur das gewaehlte Fenster zeigen (Puffer haelt bis 300s bei 500ms = 2 Samples/s)
+  int wantN = g_trendWindowS * 2;
+  int n = g_trCount; if (n > wantN) n = wantN;
   if (n >= 2) {
-    int px = -1, pyR = 0, pyL = 0; bool pv = false;
+    const uint16_t mapCol = RGB565(180, 90, 200);   // Saugrohrdruck: violett
+    int px = -1, pyR = 0, pyL = 0, pyM = 0; bool pv = false;
     for (int i = 0; i < n; i++) {
       int idx = (g_trHead - n + i + 2 * TR_N) % TR_N;
       int x = TR_PX0 + (int)lroundf((float)i / (n - 1) * (TR_PX1 - TR_PX0));
-      int yR = trRpmY(g_trRpm[idx]);
-      if (px >= 0) drawLineFast(px, pyR, x, yR, RGB565(55, 95, 165), 1);
-      pyR = yR;
+      if (g_trendShowRpm) {
+        int yR = trRpmY(g_trRpm[idx]);
+        if (px >= 0) drawLineFast(px, pyR, x, yR, RGB565(55, 95, 165), 1);
+        pyR = yR;
+      }
+      if (g_trendShowMap) {
+        int yM = trMapY(g_trMap[idx]);
+        if (px >= 0) drawLineFast(px, pyM, x, yM, mapCol, 1);
+        pyM = yM;
+      }
       uint8_t lv = g_trLam[idx];
       if (lv > 0) {
         int yL = trLamY(lv / 100.0f);
@@ -1993,9 +2014,14 @@ static void drawTrendPage() {
       px = x;
     }
   }
-  drawTextSmall(TR_PX0, 358, "-60s", dim, 1);
+  char ax[12]; snprintf(ax, sizeof(ax), "-%ds", g_trendWindowS);
+  drawTextSmall(TR_PX0, 358, ax, dim, 1);
   drawTextSmall(388, 358, "jetzt", dim, 1);
-  drawTextCentered(240, 392, live ? "lang Mitte: Anzeige" : "kein Hub", live ? RGB565(150, 150, 160) : RGB565(200, 120, 50), 1);
+  // Legende: aktive Kurven
+  char leg[28]; strcpy(leg, "L");
+  if (g_trendShowRpm) strcat(leg, " +RPM");
+  if (g_trendShowMap) strcat(leg, " +kPa");
+  drawTextCentered(240, 392, live ? leg : "kein Hub", live ? RGB565(150, 150, 160) : RGB565(200, 120, 50), 1);
   presentFrame();
 }
 
@@ -2622,6 +2648,10 @@ static void loadSettings() {
   if (g_rpmRedline < 1000 || g_rpmRedline > g_rpmScaleMax) g_rpmRedline = g_rpmScaleMax * 3 / 4;
   g_lambdaStyle   = p.getUChar("lstyle", 0);          // 0=Gauge, 1=Verlauf
   if (g_lambdaStyle > 1) g_lambdaStyle = 0;
+  g_trendWindowS  = p.getUShort("tr_win", 60);        // Lambda-Verlauf: Fensterbreite
+  if (g_trendWindowS != 60 && g_trendWindowS != 120 && g_trendWindowS != 180 && g_trendWindowS != 300) g_trendWindowS = 60;
+  g_trendShowMap  = p.getBool("tr_map", false);       // Saugrohrdruck mit anzeigen
+  g_trendShowRpm  = p.getBool("tr_rpm", true);        // Drehzahl-Linie zeigen
   p.end();
   // Einmalige Migration: falsch getippte/veraltete Hub-AP-Namen (Tastatur konnte nur
   // eine Schreibung darstellen, SSIDs sind case-sensitiv) auf den echten AP-Namen
@@ -2698,6 +2728,25 @@ static void saveLambdaStyle(int s) {       // 0=Gauge, 1=Verlauf
   p.begin("clock", false);
   p.putUChar("lstyle", g_lambdaStyle);
   p.end();
+}
+
+// Lambda-Verlauf-Konfig speichern (Fenster/MAP/RPM). win==0 laesst das Fenster unveraendert.
+static void saveTrendCfg(uint16_t win, bool showMap, bool showRpm) {
+  if (win == 60 || win == 120 || win == 180 || win == 300) g_trendWindowS = win;
+  g_trendShowMap = showMap;
+  g_trendShowRpm = showRpm;
+  Preferences p;
+  p.begin("clock", false);
+  p.putUShort("tr_win", g_trendWindowS);
+  p.putBool("tr_map", g_trendShowMap);
+  p.putBool("tr_rpm", g_trendShowRpm);
+  p.end();
+}
+// Fenster zyklisch 60->120->180->300->60 (Tap oben auf dem Trend)
+static void cycleTrendWindow() {
+  uint16_t next = (g_trendWindowS == 60) ? 120 : (g_trendWindowS == 120) ? 180 :
+                  (g_trendWindowS == 180) ? 300 : 60;
+  saveTrendCfg(next, g_trendShowMap, g_trendShowRpm);
 }
 
 // IMU nullen: aktuelle Lage als Referenz speichern (Einbaulage ausgleichen).
@@ -3146,6 +3195,20 @@ static void handleWebRoot() {
   html += String(g_rpmScaleMax);
   html += F("' style='width:80px;padding:6px;border:0;border-radius:6px'> 1/min</p>"
     "<hr style='border-color:#333'>"
+    "<p><b>Lambda-Verlauf</b> &nbsp; Fenster "
+    "<select name='trwin' style='padding:6px;border:0;border-radius:6px'>");
+  { const uint16_t ws[4] = { 60, 120, 180, 300 };
+    for (int i = 0; i < 4; i++)
+      html += "<option value='" + String(ws[i]) + "'" +
+              (g_trendWindowS == ws[i] ? " selected" : "") + ">" + String(ws[i]) + "s</option>"; }
+  html += F("</select></p>"
+    "<p><label><input type='checkbox' name='trmap' value='1' ");
+  html += g_trendShowMap ? "checked" : "";
+  html += F("> Saugrohrdruck (kPa) mit anzeigen</label> &nbsp; "
+    "<label><input type='checkbox' name='trrpm' value='1' ");
+  html += g_trendShowRpm ? "checked" : "";
+  html += F("> Drehzahl-Linie</label></p>"
+    "<hr style='border-color:#333'>"
     "<p><label><input type='checkbox' name='canon' value='1' ");
   html += g_featureCan ? "checked" : "";
   html += F("> <b>CAN-Cockpit</b>");
@@ -3295,7 +3358,12 @@ static void handleWebSet() {
         if (v >= 3000 && v <= 12000) { g_rpmScaleMax = v; p.putInt("sc_rpm", v); } }
       if (webServer.hasArg("rlrpm"))  { int v = webServer.arg("rlrpm").toInt();
         if (v >= 1000 && v <= g_rpmScaleMax) { g_rpmRedline = v; p.putInt("rl_rpm", v); } }
-      g_redrawPage = true;                       // Tacho/Band sofort neu zeichnen
+      // Lambda-Verlauf (Fenster/MAP/RPM). Checkboxen: fehlt = aus.
+      if (webServer.hasArg("trwin")) { int v = webServer.arg("trwin").toInt();
+        if (v == 60 || v == 120 || v == 180 || v == 300) { g_trendWindowS = (uint16_t)v; p.putUShort("tr_win", g_trendWindowS); } }
+      g_trendShowMap = webServer.hasArg("trmap"); p.putBool("tr_map", g_trendShowMap);
+      g_trendShowRpm = webServer.hasArg("trrpm"); p.putBool("tr_rpm", g_trendShowRpm);
+      g_redrawPage = true;                       // Tacho/Band/Trend sofort neu zeichnen
     }
     { // CAN-Konfig: an/aus, Modus, ID, Bitrate - Aenderung re-initialisiert den Treiber
       bool canChanged = false;
@@ -4021,6 +4089,11 @@ void loop() {
         handleScanTap(tapX, tapY);      // Scan-Ergebnis (SSID antippen)
       } else if (currentPage == 13) {
         handleCanTap(tapX, tapY);       // CAN-Seite (aktiv/Modus schalten)
+      } else if (currentPage == 3 && g_lambdaStyle == 1 && tapY < 132) {
+        // Verlauf: Tap in den Kopfbereich -> Zeitfenster 60/120/180/300s zyklen
+        cycleTrendWindow();
+        drawLambdaPage();
+        Serial.printf("trend window -> %ds\n", g_trendWindowS);
       } else {
         // Data pages (Motor/Lambda/Hub/IMU): Tap -> naechste, dann zurueck zur Uhr.
         if      (currentPage == 4) currentPage = 6;  // Hub -> IMU
@@ -4141,7 +4214,16 @@ void loop() {
         else if (cmd.startsWith("lambda:")) { saveLambdaStyle(cmd.substring(7).toInt() ? 1 : 0);
                                              Serial.printf("Lambda-Stil = %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
                                              if (currentPage == 3) drawLambdaPage(); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..3 | trip:reset | hubtime | hubpull | batt | imu:null | can:on|off | can:test | can:rx | can:normal|listen"); }
+        else if (cmd.startsWith("trend:win ")) { saveTrendCfg((uint16_t)cmd.substring(10).toInt(), g_trendShowMap, g_trendShowRpm);
+                                             Serial.printf("Trend-Fenster = %ds\n", g_trendWindowS);
+                                             if (currentPage == 3) drawLambdaPage(); }
+        else if (cmd == "trend:map on" || cmd == "trend:map off") { saveTrendCfg(0, cmd.endsWith("on"), g_trendShowRpm);
+                                             Serial.printf("Trend-MAP = %s\n", g_trendShowMap ? "an" : "aus");
+                                             if (currentPage == 3) drawLambdaPage(); }
+        else if (cmd == "trend:rpm on" || cmd == "trend:rpm off") { saveTrendCfg(0, g_trendShowMap, cmd.endsWith("on"));
+                                             Serial.printf("Trend-RPM = %s\n", g_trendShowRpm ? "an" : "aus");
+                                             if (currentPage == 3) drawLambdaPage(); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..3 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
