@@ -50,7 +50,9 @@ runden Touch-Display im Cockpit — plus **Live-Motordaten** vom Spartan3-Hub
 | 11 | WLAN (WPS/Tippen/Profil) | |
 
 **Kombi-Stile:** `DIGITAL` (bunt, Streifenband) · `VDO` (70er-Look, creme auf grau) ·
-`123TUNE+` (schwarz/orange) · `VDO+UHR` (Tacho außen, **Analoguhr** innen).
+`123TUNE+` (schwarz/orange) · `VDO+UHR` (Tacho außen, **Analoguhr** innen) ·
+`DIGIFIZ` (Golf-2-Digitaltacho der 80er: Segment-Drehzahlbogen, 7-Segment-Speed,
+Temp-Balken, **Ganganzeige** aus Drehzahl÷Speed — Grenzen im Dev-Tab kalibrierbar).
 
 **Auto-Cockpit:** Drehzahl > Schwelle (default 600, Dev-Tab) → springt einmal pro
 Motorstart automatisch auf die Kombi; Motor 5 s aus → zurück zur Uhr.
