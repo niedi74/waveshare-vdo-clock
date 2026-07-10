@@ -1246,20 +1246,26 @@ static void drawTextCentered(int cx, int y, const char *text, uint16_t color, in
 // presentFrame auf ALLE Seiten; rote Zeiger werden dunkel (authentisch bei Gruenlicht).
 // Trigger vorerst manuell (Dev-Tab/Serial) - Licht-Draht an GPIO0 kommt spaeter.
 static bool     g_nightMode = false;      // NVS "night"
+static uint8_t  g_nightFloorPct = 40;     // Grundhelligkeit oben in % (NVS night_min, Dev-Tab-Regler).
+                                          // Spaeter live vom echten Dimmer-Drehregler (ADS1115-Projekt).
 static uint8_t* g_nightMask = nullptr;    // 480x480 Helligkeitsfaktor der Birne (PSRAM, lazy)
+static uint8_t  g_nightMaskFor = 255;     // Floor-Wert, fuer den die Maske gebaut wurde
 static void nightMaskEnsure() {
-  if (g_nightMask) return;
-  g_nightMask = (uint8_t*)ps_malloc(480 * 480);
+  if (g_nightMask && g_nightMaskFor == g_nightFloorPct) return;
+  if (!g_nightMask) g_nightMask = (uint8_t*)ps_malloc(480 * 480);
   if (!g_nightMask) return;
-  for (int y = 0; y < 480; y++)
+  float fl = g_nightFloorPct / 100.0f;                 // Karsten 8.7.: fest 16% war zu dunkel -
+  for (int y = 0; y < 480; y++)                        // Grundhelligkeit jetzt einstellbar
     for (int x = 0; x < 480; x++) {
       float dx = x - 240.0f, dy = y - 500.0f;          // Birne knapp unterhalb des Glasrands
       float d  = sqrtf(dx * dx + dy * dy);
-      float f  = 1.06f - d / 430.0f;                   // Lichtkegel: unten ~voll, oben ~dunkel
-      if (f > 1.0f) f = 1.0f;
-      if (f < 0.16f) f = 0.16f;
+      float k  = 1.06f - d / 430.0f;                   // Lichtkegel: unten ~voll, oben ~dunkel
+      if (k > 1.0f) k = 1.0f;
+      if (k < 0.0f) k = 0.0f;
+      float f = fl + (1.0f - fl) * k;                  // Floor hebt die dunklen Zonen an
       g_nightMask[y * 480 + x] = (uint8_t)(f * 255.0f);
     }
+  g_nightMaskFor = g_nightFloorPct;
 }
 static void nightApply(uint16_t* fb) {
   if (!fb || !g_nightMask) return;
@@ -1848,46 +1854,54 @@ static void drawDigifizPage() {
   const uint16_t REDD = RGB565(66, 20, 16);      // roter Bereich, aus
   const uint16_t DIMT = RGB565(105, 115, 105);
 
-  // --- Drehzahl: Segmentbogen, steigt von links unten weit ueber die Mitte oben ---
-  // "Der Hochlaufbalken kann mehr sein" (8.7.): 96 Grad Sweep, 48 Segmente, 34px lang.
+  // --- Drehzahl: DURCHGEHENDER Leucht-Wurm (Karsten 8.7.: "holt mich noch nicht ab" -
+  // das Original hat einen satten zusammenhaengenden LCD-Balken, keine duennen Striche).
   const float cxA = 330.0f, cyA = 330.0f, rA = 240.0f;   // Kreisbogen 180..276 Grad
-  const int SEGS = 48;
+  const int SEGS = 64;                                   // eng gestellt -> Segmente beruehren sich
   float frac = fresh ? constrain(g_rpm / (float)g_rpmScaleMax, 0.0f, 1.0f) : 0.0f;
   int lit = (int)lroundf(frac * SEGS);
   float redFrac = (float)g_rpmRedline / (float)g_rpmScaleMax;
   for (int i = 0; i < SEGS; i++) {
     float a = (180.0f + (96.0f * i) / (SEGS - 1)) * PI / 180.0f;
     float ca = cosf(a), sa = sinf(a);
-    int x0 = (int)lroundf(cxA + ca * (rA - 16)), y0 = (int)lroundf(cyA + sa * (rA - 16));
-    int x1 = (int)lroundf(cxA + ca * (rA + 18)), y1 = (int)lroundf(cyA + sa * (rA + 18));
+    int x0 = (int)lroundf(cxA + ca * (rA - 14)), y0 = (int)lroundf(cyA + sa * (rA - 14));
+    int x1 = (int)lroundf(cxA + ca * (rA + 16)), y1 = (int)lroundf(cyA + sa * (rA + 16));
     bool red = ((float)i / SEGS) >= redFrac;
-    uint16_t col = (i < lit) ? (red ? REDL : GRN) : (red ? REDD : GRND);
-    drawLineFast(x0, y0, x1, y1, col, (i < lit) ? 5 : 3);
+    uint16_t col = (i < lit) ? (red ? REDL : GRN) : (red ? RGB565(46, 12, 9) : RGB565(13, 34, 18));
+    drawLineFast(x0, y0, x1, y1, col, 6);              // 6px breit bei ~6.4px Abstand = solide
   }
-  // Skalenzahlen (1..kmax = x1000) innen unter dem Bogen
+  // Ticks + Skalenzahlen unter dem Balken
   int kmax = g_rpmScaleMax / 1000;
   for (int k = 1; k <= kmax; k++) {
     float a = (180.0f + 96.0f * ((float)(k * 1000) / g_rpmScaleMax)) * PI / 180.0f;
-    int lx = (int)lroundf(cxA + cosf(a) * (rA - 34)) - 3;
-    int ly = (int)lroundf(cyA + sinf(a) * (rA - 34)) - 3;
+    float ca = cosf(a), sa = sinf(a);
+    drawLineFast((int)lroundf(cxA + ca * (rA - 26)), (int)lroundf(cyA + sa * (rA - 26)),
+                 (int)lroundf(cxA + ca * (rA - 18)), (int)lroundf(cyA + sa * (rA - 18)), GRN, 2);
+    int lx = (int)lroundf(cxA + ca * (rA - 38)) - 3;
+    int ly = (int)lroundf(cyA + sa * (rA - 38)) - 3;
     char nb[3]; snprintf(nb, sizeof(nb), "%d", k);
     drawTextSmall(lx, ly, nb, GRN, 1);
   }
   drawTextSmall(126, 336, "1/MIN x1000", DIMT, 1);   // unterhalb des Bogen-Endes (Bogen endet y=330)
   drawTextSmall(140, 116, "VDO", AMB, 1);            // oben links wie das Logo im Original
 
-  // --- Geschwindigkeit: 3-stellige 7-Segment-Anzeige ---
+  // --- Geschwindigkeit: DUNKLE Ziffern auf LEUCHTEND GRUENER Box (das ikonische
+  // --- DigiFIZ-Element aus dem GTI-Foto) ---
+  const uint16_t GBOX  = RGB565(75, 215, 95);        // leuchtende Box
+  const uint16_t GBOXG = RGB565(60, 180, 78);        // Geister-Segmente (kaum sichtbar)
+  const uint16_t GDIG  = RGB565(7, 22, 11);          // Ziffern fast schwarz
+  fillRectFast(168, 178, 204, 108, GBOX);
   int spd = (fresh && g_speedValid) ? (int)lroundf(g_speedKmh) : 0;
   if (spd > 999) spd = 999;
-  const int DW = 52, DH = 96, DT = 10, DGAP = 12;
-  int dx0 = 182, dy0 = 182;                          // Ecke bleibt innerhalb des Bogen-Innenradius
+  const int DW = 50, DH = 86, DT = 11, DGAP = 11;
+  int dx0 = 176, dy0 = 189;
   int d100 = spd / 100, d10 = (spd / 10) % 10, d1 = spd % 10;
-  draw7segDigit(dx0,                 dy0, DW, DH, DT, (spd >= 100) ? d100 : -1, GRN, GRND);
-  draw7segDigit(dx0 + DW + DGAP,     dy0, DW, DH, DT, (spd >= 10)  ? d10  : -1, GRN, GRND);
-  draw7segDigit(dx0 + 2 * (DW+DGAP), dy0, DW, DH, DT, d1, GRN, GRND);
-  drawTextSmall(318, 284, "KM/H", DIMT, 1);
+  draw7segDigit(dx0,                 dy0, DW, DH, DT, (spd >= 100) ? d100 : -1, GDIG, GBOXG);
+  draw7segDigit(dx0 + DW + DGAP,     dy0, DW, DH, DT, (spd >= 10)  ? d10  : -1, GDIG, GBOXG);
+  draw7segDigit(dx0 + 2 * (DW+DGAP), dy0, DW, DH, DT, d1, GDIG, GBOXG);
+  drawTextSmall(348, 262, "KM/H", GDIG, 1);          // dunkel IN der Box, wie im Original
 
-  // --- Temperatur-Balken rechts (senkrecht, oben rot) ---
+  // --- Temperatur-Balken rechts (senkrecht, klobig, oben rot) ---
   const bool g123 = fresh && g_g123Valid;
   int tSegs = 12;
   float tFrac = g123 ? constrain((g_g123Temp - 40.0f) / 80.0f, 0.0f, 1.0f) : 0.0f;  // 40..120 C
@@ -1897,7 +1911,7 @@ static void drawDigifizPage() {
     int y = 320 - j * 15;
     bool red = ((float)(j + 1) / tSegs) > tRed;
     uint16_t col = (j < tLit) ? (red ? REDL : GRN) : (red ? REDD : GRND);
-    fillRectFast(396, y, 22, 11, col);
+    fillRectFast(394, y, 26, 12, col);
   }
   drawTextSmall(392, 333, "TEMP", DIMT, 1);
 
@@ -1916,16 +1930,25 @@ static void drawDigifizPage() {
     if (gearShown) { char gb[2] = { gearShown, 0 }; drawTextSmall(398, 346, gb, AMB, 3); }
   } else { gearShown = 0; gearCand = 0; gearStable = 0; }
 
-  // --- untere Anzeigezeile (Bernstein): Trip, Uhr, Bordspannung ---
+  // --- untere Anzeigezeile (Bernstein): Trip, Uhr als klobige 7-Segment, Bordspannung ---
+  const uint16_t AMBG = RGB565(52, 42, 16);          // Bernstein-Geistersegmente
   char bb[16];
   if (g_tripValid) snprintf(bb, sizeof(bb), "T%.1f", g_tripKm); else strcpy(bb, "T --");
-  drawTextSmall(64, 352, bb, AMB, 2);
+  drawTextSmall(58, 352, bb, AMB, 2);
   struct tm dfNow = {};
-  if (readClockTime(&dfNow)) snprintf(bb, sizeof(bb), "%d:%02d", dfNow.tm_hour, dfNow.tm_min);
-  else strcpy(bb, "-:--");
-  drawTextCentered(240, 348, bb, AMB, 3);
+  int hh = -1, mi = 0;
+  if (readClockTime(&dfNow)) { hh = dfNow.tm_hour; mi = dfNow.tm_min; }
+  { const int CW = 22, CH = 36, CT = 5, CG = 5;      // Uhr: 7-Segment wie das Original
+    int cx0 = 184, cy0 = 340;
+    draw7segDigit(cx0,                cy0, CW, CH, CT, (hh >= 10) ? hh / 10 : -1, AMB, AMBG);
+    draw7segDigit(cx0 + CW + CG,      cy0, CW, CH, CT, (hh >= 0) ? hh % 10 : -1, AMB, AMBG);
+    fillRectFast(cx0 + 2*(CW+CG) + 1, cy0 + 8,  5, 5, AMB);   // Doppelpunkt
+    fillRectFast(cx0 + 2*(CW+CG) + 1, cy0 + 23, 5, 5, AMB);
+    draw7segDigit(cx0 + 2*(CW+CG) + 10,      cy0, CW, CH, CT, (hh >= 0) ? mi / 10 : -1, AMB, AMBG);
+    draw7segDigit(cx0 + 3*(CW+CG) + 10,      cy0, CW, CH, CT, (hh >= 0) ? mi % 10 : -1, AMB, AMBG);
+  }
   if (g123) snprintf(bb, sizeof(bb), "%.1fV", g_g123Volt); else strcpy(bb, "--V");
-  drawTextSmall(346, 352, bb, AMB, 2);
+  drawTextSmall(340, 352, bb, AMB, 2);
 
   // --- Lambda + Quelle als Statuszeile ---
   char st[26], lb[8];
@@ -2817,6 +2840,8 @@ static void loadSettings() {
   g_gearR12       = p.getFloat("gr12", 90.0f);        // Ganganzeige: Grenze 1./2. Gang
   g_gearR23       = p.getFloat("gr23", 46.0f);        // Ganganzeige: Grenze 2./3. Gang
   g_nightMode     = p.getBool("night", false);        // gruene Nachtbeleuchtung
+  g_nightFloorPct = p.getUChar("night_min", 40);      // Grundhelligkeit (Dev-Tab-Regler)
+  if (g_nightFloorPct < 10 || g_nightFloorPct > 85) g_nightFloorPct = 40;
   if (g_nightMode) nightMaskEnsure();
   p.end();
   // Einmalige Migration: falsch getippte/veraltete Hub-AP-Namen (Tastatur konnte nur
@@ -3378,6 +3403,14 @@ static void handleWebRoot() {
     "<p><label><input type='checkbox' name='nightm' value='1' ");
   html += g_nightMode ? "checked" : "";
   html += F("> <b>Nachtmodus</b> (gr&uuml;ne Birne unten, wie Original-Instrumentenlicht)</label></p>"
+    "<p>Grundhelligkeit oben: <input type='range' name='nfloor' min='10' max='85' value='");
+  html += String((int)g_nightFloorPct);
+  html += F("' style='width:200px;vertical-align:middle' "
+    "oninput='this.nextElementSibling.textContent=this.value+\" %\"'> <span>");
+  html += String((int)g_nightFloorPct);
+  html += F(" %</span><br><span style='color:#888;font-size:0.85em'>Birne unten bleibt voll - "
+    "der Regler hebt nur die dunklen Zonen an. Sp&auml;ter live vom echten Dimmer-Drehregler "
+    "(ADS1115-Projekt) steuerbar.</span></p>"
     "<hr style='border-color:#333'>"
     "<p><b>Ganganzeige</b> (DIGIFIZ, 3 G&auml;nge, Drehzahl je km/h): "
     "1&rarr;2 ab <input name='gr12' type='number' step='1' min='40' max='250' value='");
@@ -3544,7 +3577,9 @@ static void handleWebSet() {
       g_trendShowMap = webServer.hasArg("trmap"); p.putBool("tr_map", g_trendShowMap);
       g_trendShowRpm = webServer.hasArg("trrpm"); p.putBool("tr_rpm", g_trendShowRpm);
       g_nightMode = webServer.hasArg("nightm"); p.putBool("night", g_nightMode);
-      if (g_nightMode) nightMaskEnsure();
+      if (webServer.hasArg("nfloor")) { int v = webServer.arg("nfloor").toInt();
+        if (v >= 10 && v <= 85) { g_nightFloorPct = (uint8_t)v; p.putUChar("night_min", g_nightFloorPct); } }
+      if (g_nightMode) nightMaskEnsure();   // baut die Maske bei geaendertem Floor neu
       // Ganganzeige-Grenzen (rpm pro km/h); 1->2 muss ueber 2->3 liegen
       if (webServer.hasArg("gr12")) { float v = webServer.arg("gr12").toFloat();
         if (v >= 40.0f && v <= 250.0f) { g_gearR12 = v; p.putFloat("gr12", v); } }
@@ -4416,6 +4451,14 @@ void loop() {
           Preferences pn; pn.begin("clock", false); pn.putBool("night", g_nightMode); pn.end();
           g_redrawPage = true;
           Serial.printf("Nachtmodus = %s\n", g_nightMode ? "an (gruene Birne)" : "aus"); }
+        else if (cmd.startsWith("night:")) {           // night:NN = Grundhelligkeit in %
+          int v = cmd.substring(6).toInt();
+          if (v >= 10 && v <= 85) {
+            g_nightFloorPct = (uint8_t)v;
+            Preferences pn; pn.begin("clock", false); pn.putUChar("night_min", g_nightFloorPct); pn.end();
+            nightMaskEnsure(); g_redrawPage = true;
+            Serial.printf("Nachtmodus-Grundhelligkeit = %d%%\n", v);
+          } else Serial.println("night:10..85 (Grundhelligkeit %)"); }
         else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..4 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
