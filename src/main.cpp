@@ -1702,8 +1702,8 @@ static const GaugeTheme THEME_123 = {
   RGB565(238,238,236), RGB565(220,44,32), false, RGB565(22,22,26) };
 
 static uint8_t g_motorStyle = 2;   // 0=digital, 1=vdo, 2=123tune+
-static const char* const MOTOR_STYLE_NAMES[] = { "DIGITAL", "VDO", "123TUNE+", "VDO+UHR", "DIGIFIZ" };
-#define MOTOR_STYLE_COUNT 5
+static const char* const MOTOR_STYLE_NAMES[] = { "DIGITAL", "VDO", "123TUNE+", "VDO+UHR", "DIGIFIZ", "OPEL GSI" };
+#define MOTOR_STYLE_COUNT 6
 static uint32_t g_tripArmUntil = 0;   // Trip-Reset: 1. Langdruck scharf (5 s), 2. Langdruck nullt
 static const GaugeTheme& gTheme() {
   return g_motorStyle == 0 ? THEME_DIGITAL : g_motorStyle == 2 ? THEME_123 : THEME_VDO;  // 1+3 = VDO-Look
@@ -1854,66 +1854,81 @@ static void drawDigifizPage() {
   const uint16_t REDD = RGB565(66, 20, 16);      // roter Bereich, aus
   const uint16_t DIMT = RGB565(105, 115, 105);
 
-  // --- Drehzahl: DURCHGEHENDER Leucht-Wurm (Karsten 8.7.: "holt mich noch nicht ab" -
-  // das Original hat einen satten zusammenhaengenden LCD-Balken, keine duennen Striche).
-  const float cxA = 330.0f, cyA = 330.0f, rA = 240.0f;   // Kreisbogen 180..276 Grad
-  const int SEGS = 64;                                   // eng gestellt -> Segmente beruehren sich
+  // --- Drehzahl-"Swoosh" quer ueber die obere Haelfte, wie im Original-Foto.
+  // Karsten 8.7.: v1/v2 holten ihn nicht ab - der Bogen am Displayrand las sich als
+  // Rundinstrument. Jetzt: flache ansteigende Kurve (Bezier) UEBER der Speed-Box,
+  // Leuchtband waechst auf der Kurve, Ticks+Zahlen darunter - das DigiFIZ-Profil.
+  const float P0x = 70, P0y = 255, P1x = 190, P1y = 105, P2x = 405, P2y = 95;
+  const int SEGS = 56;
   float frac = fresh ? constrain(g_rpm / (float)g_rpmScaleMax, 0.0f, 1.0f) : 0.0f;
   int lit = (int)lroundf(frac * SEGS);
   float redFrac = (float)g_rpmRedline / (float)g_rpmScaleMax;
+  float pbx = 0, pby = 0;
   for (int i = 0; i < SEGS; i++) {
-    float a = (180.0f + (96.0f * i) / (SEGS - 1)) * PI / 180.0f;
-    float ca = cosf(a), sa = sinf(a);
-    int x0 = (int)lroundf(cxA + ca * (rA - 14)), y0 = (int)lroundf(cyA + sa * (rA - 14));
-    int x1 = (int)lroundf(cxA + ca * (rA + 16)), y1 = (int)lroundf(cyA + sa * (rA + 16));
+    float t = (float)i / (SEGS - 1), u = 1.0f - t;
+    float bx = u*u*P0x + 2*u*t*P1x + t*t*P2x;
+    float by = u*u*P0y + 2*u*t*P1y + t*t*P2y;
+    float dxT = 2*u*(P1x - P0x) + 2*t*(P2x - P1x);
+    float dyT = 2*u*(P1y - P0y) + 2*t*(P2y - P1y);
+    float nl = sqrtf(dxT*dxT + dyT*dyT); if (nl < 1) nl = 1;
+    float nx = dyT / nl, ny = -dxT / nl;               // Normale nach OBEN
+    if (ny > 0) { nx = -nx; ny = -ny; }
     bool red = ((float)i / SEGS) >= redFrac;
     uint16_t col = (i < lit) ? (red ? REDL : GRN) : (red ? RGB565(46, 12, 9) : RGB565(13, 34, 18));
-    drawLineFast(x0, y0, x1, y1, col, 6);              // 6px breit bei ~6.4px Abstand = solide
+    drawLineFast((int)bx, (int)by, (int)(bx + nx*24), (int)(by + ny*24), col, 5);
+    if (i > 0) drawLineFast((int)pbx, (int)pby, (int)bx, (int)by, RGB565(60, 140, 70), 2);
+    pbx = bx; pby = by;
   }
-  // Ticks + Skalenzahlen unter dem Balken
+  // Ticks + Skalenzahlen UNTER der Kurve
   int kmax = g_rpmScaleMax / 1000;
   for (int k = 1; k <= kmax; k++) {
-    float a = (180.0f + 96.0f * ((float)(k * 1000) / g_rpmScaleMax)) * PI / 180.0f;
-    float ca = cosf(a), sa = sinf(a);
-    drawLineFast((int)lroundf(cxA + ca * (rA - 26)), (int)lroundf(cyA + sa * (rA - 26)),
-                 (int)lroundf(cxA + ca * (rA - 18)), (int)lroundf(cyA + sa * (rA - 18)), GRN, 2);
-    int lx = (int)lroundf(cxA + ca * (rA - 38)) - 3;
-    int ly = (int)lroundf(cyA + sa * (rA - 38)) - 3;
+    float t = (float)(k * 1000) / g_rpmScaleMax, u = 1.0f - t;
+    float bx = u*u*P0x + 2*u*t*P1x + t*t*P2x;
+    float by = u*u*P0y + 2*u*t*P1y + t*t*P2y;
+    float dxT = 2*u*(P1x - P0x) + 2*t*(P2x - P1x);
+    float dyT = 2*u*(P1y - P0y) + 2*t*(P2y - P1y);
+    float nl = sqrtf(dxT*dxT + dyT*dyT); if (nl < 1) nl = 1;
+    float nx = dyT / nl, ny = -dxT / nl;
+    if (ny < 0) { nx = -nx; ny = -ny; }                // Normale nach UNTEN
+    drawLineFast((int)bx, (int)by, (int)(bx + nx*8), (int)(by + ny*8), GRN, 2);
     char nb[3]; snprintf(nb, sizeof(nb), "%d", k);
-    drawTextSmall(lx, ly, nb, GRN, 1);
+    drawTextSmall((int)(bx + nx*18) - 3, (int)(by + ny*18) - 3, nb, GRN, 1);
   }
-  drawTextSmall(126, 336, "1/MIN x1000", DIMT, 1);   // unterhalb des Bogen-Endes (Bogen endet y=330)
-  drawTextSmall(140, 116, "VDO", AMB, 1);            // oben links wie das Logo im Original
+  drawTextSmall(130, 296, "1/MIN x1000", DIMT, 1);
+  drawTextSmall(348, 74, "VDO", AMB, 1);
+  // VW-Emblem links wie im Original
+  drawCircleLine(92, 268, 24, 3, RGB565(140, 150, 145));
+  drawTextCentered(92, 261, "VW", RGB565(140, 150, 145), 2);
 
-  // --- Geschwindigkeit: DUNKLE Ziffern auf LEUCHTEND GRUENER Box (das ikonische
-  // --- DigiFIZ-Element aus dem GTI-Foto) ---
+  // --- Geschwindigkeit: DUNKLE Ziffern auf LEUCHTEND GRUENER Box, rechts der Mitte
+  // --- unter dem flachen Teil der Kurve (Position wie im GTI-Foto) ---
   const uint16_t GBOX  = RGB565(75, 215, 95);        // leuchtende Box
   const uint16_t GBOXG = RGB565(60, 180, 78);        // Geister-Segmente (kaum sichtbar)
   const uint16_t GDIG  = RGB565(7, 22, 11);          // Ziffern fast schwarz
-  fillRectFast(168, 178, 204, 108, GBOX);
+  fillRectFast(190, 170, 212, 112, GBOX);
   int spd = (fresh && g_speedValid) ? (int)lroundf(g_speedKmh) : 0;
   if (spd > 999) spd = 999;
-  const int DW = 50, DH = 86, DT = 11, DGAP = 11;
-  int dx0 = 176, dy0 = 189;
+  const int DW = 48, DH = 86, DT = 10, DGAP = 10;
+  int dx0 = 200, dy0 = 183;
   int d100 = spd / 100, d10 = (spd / 10) % 10, d1 = spd % 10;
   draw7segDigit(dx0,                 dy0, DW, DH, DT, (spd >= 100) ? d100 : -1, GDIG, GBOXG);
   draw7segDigit(dx0 + DW + DGAP,     dy0, DW, DH, DT, (spd >= 10)  ? d10  : -1, GDIG, GBOXG);
   draw7segDigit(dx0 + 2 * (DW+DGAP), dy0, DW, DH, DT, d1, GDIG, GBOXG);
-  drawTextSmall(348, 262, "KM/H", GDIG, 1);          // dunkel IN der Box, wie im Original
+  drawTextSmall(366, 258, "KM/H", GDIG, 1);          // dunkel IN der Box, wie im Original
 
-  // --- Temperatur-Balken rechts (senkrecht, klobig, oben rot) ---
+  // --- Temperatur-Balken ganz rechts (senkrecht, oben rot) ---
   const bool g123 = fresh && g_g123Valid;
-  int tSegs = 12;
+  int tSegs = 10;
   float tFrac = g123 ? constrain((g_g123Temp - 40.0f) / 80.0f, 0.0f, 1.0f) : 0.0f;  // 40..120 C
   int tLit = (int)lroundf(tFrac * tSegs);
   float tRed = constrain(((float)g_alTempMax - 40.0f) / 80.0f, 0.0f, 1.0f);
   for (int j = 0; j < tSegs; j++) {                    // j=0 unten
-    int y = 320 - j * 15;
+    int y = 298 - j * 13;
     bool red = ((float)(j + 1) / tSegs) > tRed;
     uint16_t col = (j < tLit) ? (red ? REDL : GRN) : (red ? REDD : GRND);
-    fillRectFast(394, y, 26, 12, col);
+    fillRectFast(418, y, 22, 11, col);
   }
-  drawTextSmall(392, 333, "TEMP", DIMT, 1);
+  drawTextSmall(414, 304, "TEMP", DIMT, 1);
 
   // --- Ganganzeige unten rechts (wie im Original-DigiFIZ) ---
   // T2b: 3-Gang-AUTOMATIK. Anker (Karsten, 8.7.): 100 km/h = ~3750/min im 3. = 37.5 rpm/kmh;
@@ -1927,28 +1942,33 @@ static void drawDigifizPage() {
     if (g == gearCand) { if (gearStable < 3) gearStable++; }
     else               { gearCand = g; gearStable = 1; }
     if (gearStable >= 3) gearShown = gearCand;
-    if (gearShown) { char gb[2] = { gearShown, 0 }; drawTextSmall(398, 346, gb, AMB, 3); }
   } else { gearShown = 0; gearCand = 0; gearStable = 0; }
 
-  // --- untere Anzeigezeile (Bernstein): Trip, Uhr als klobige 7-Segment, Bordspannung ---
+  // --- untere MFA-Fensterchen wie im Original: Trip | Uhr (7seg) | Volt | Gang ---
+  const uint16_t WBG  = RGB565(24, 24, 20);          // dunkle Fenster-Kaesten
   const uint16_t AMBG = RGB565(52, 42, 16);          // Bernstein-Geistersegmente
+  fillRectFast( 74, 322, 122, 46, WBG);
+  fillRectFast(202, 322,  98, 46, WBG);
+  fillRectFast(306, 322,  62, 46, WBG);
+  fillRectFast(374, 322,  40, 46, WBG);
   char bb[16];
   if (g_tripValid) snprintf(bb, sizeof(bb), "T%.1f", g_tripKm); else strcpy(bb, "T --");
-  drawTextSmall(58, 352, bb, AMB, 2);
+  drawTextSmall(82, 338, bb, AMB, 2);
   struct tm dfNow = {};
   int hh = -1, mi = 0;
   if (readClockTime(&dfNow)) { hh = dfNow.tm_hour; mi = dfNow.tm_min; }
-  { const int CW = 22, CH = 36, CT = 5, CG = 5;      // Uhr: 7-Segment wie das Original
-    int cx0 = 184, cy0 = 340;
-    draw7segDigit(cx0,                cy0, CW, CH, CT, (hh >= 10) ? hh / 10 : -1, AMB, AMBG);
-    draw7segDigit(cx0 + CW + CG,      cy0, CW, CH, CT, (hh >= 0) ? hh % 10 : -1, AMB, AMBG);
-    fillRectFast(cx0 + 2*(CW+CG) + 1, cy0 + 8,  5, 5, AMB);   // Doppelpunkt
-    fillRectFast(cx0 + 2*(CW+CG) + 1, cy0 + 23, 5, 5, AMB);
-    draw7segDigit(cx0 + 2*(CW+CG) + 10,      cy0, CW, CH, CT, (hh >= 0) ? mi / 10 : -1, AMB, AMBG);
-    draw7segDigit(cx0 + 3*(CW+CG) + 10,      cy0, CW, CH, CT, (hh >= 0) ? mi % 10 : -1, AMB, AMBG);
+  { const int CW = 18, CH = 32, CT = 4, CG = 4;      // Uhr: 7-Segment wie das Original
+    int cx0 = 208, cy0 = 329;
+    draw7segDigit(cx0,           cy0, CW, CH, CT, (hh >= 10) ? hh / 10 : -1, AMB, AMBG);
+    draw7segDigit(cx0 + CW + CG, cy0, CW, CH, CT, (hh >= 0) ? hh % 10 : -1, AMB, AMBG);
+    fillRectFast(cx0 + 2*(CW+CG) + 1, cy0 + 7,  4, 4, AMB);   // Doppelpunkt
+    fillRectFast(cx0 + 2*(CW+CG) + 1, cy0 + 21, 4, 4, AMB);
+    draw7segDigit(cx0 + 2*(CW+CG) + 8, cy0, CW, CH, CT, (hh >= 0) ? mi / 10 : -1, AMB, AMBG);
+    draw7segDigit(cx0 + 3*(CW+CG) + 8, cy0, CW, CH, CT, (hh >= 0) ? mi % 10 : -1, AMB, AMBG);
   }
   if (g123) snprintf(bb, sizeof(bb), "%.1fV", g_g123Volt); else strcpy(bb, "--V");
-  drawTextSmall(340, 352, bb, AMB, 2);
+  drawTextSmall(312, 338, bb, AMB, 2);
+  if (gearShown) { char gb[2] = { gearShown, 0 }; drawTextSmall(387, 332, gb, AMB, 3); }
 
   // --- Lambda + Quelle als Statuszeile ---
   char st[26], lb[8];
@@ -1959,9 +1979,126 @@ static void drawDigifizPage() {
   presentFrame();
 }
 
+// ===== Stil 5 "OPEL GSI": Kadett-E-GSI/Monza-LCD-Tacho der 80er =====
+// Bernstein/Gelb dominant auf schwarz, Drehzahl-Leiter klettert links hoch,
+// riesige gelbe 7-Segment-Geschwindigkeit, rote Warnbloecke (= unsere Alarme).
+static void drawOpelPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  const bool fresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
+  const uint16_t AMB  = RGB565(250, 185, 30);    // Opel-Bernstein
+  const uint16_t AMBD = RGB565(56, 42, 10);      // Segment aus
+  const uint16_t REDL = RGB565(235, 60, 40);
+  const uint16_t REDD = RGB565(64, 18, 12);
+  const uint16_t DIMT = RGB565(120, 105, 70);
+
+  // --- Drehzahl-Leiter: klettert links steil hoch (Kadett-GSI-Look) ---
+  const float P0x = 84, P0y = 310, P1x = 130, P1y = 130, P2x = 310, P2y = 84;
+  const int SEGS = 44;
+  float frac = fresh ? constrain(g_rpm / (float)g_rpmScaleMax, 0.0f, 1.0f) : 0.0f;
+  int lit = (int)lroundf(frac * SEGS);
+  float redFrac = (float)g_rpmRedline / (float)g_rpmScaleMax;
+  for (int i = 0; i < SEGS; i++) {
+    float t = (float)i / (SEGS - 1), u = 1.0f - t;
+    float bx = u*u*P0x + 2*u*t*P1x + t*t*P2x;
+    float by = u*u*P0y + 2*u*t*P1y + t*t*P2y;
+    float dxT = 2*u*(P1x - P0x) + 2*t*(P2x - P1x);
+    float dyT = 2*u*(P1y - P0y) + 2*t*(P2y - P1y);
+    float nl = sqrtf(dxT*dxT + dyT*dyT); if (nl < 1) nl = 1;
+    float nx = dyT / nl, ny = -dxT / nl;
+    if (ny > 0) { nx = -nx; ny = -ny; }
+    bool red = ((float)i / SEGS) >= redFrac;
+    uint16_t col = (i < lit) ? (red ? REDL : AMB) : (red ? REDD : AMBD);
+    drawLineFast((int)bx, (int)by, (int)(bx + nx*26), (int)(by + ny*26), col, 6);
+  }
+  int kmax = g_rpmScaleMax / 1000;
+  for (int k = 1; k <= kmax; k++) {
+    float t = (float)(k * 1000) / g_rpmScaleMax, u = 1.0f - t;
+    float bx = u*u*P0x + 2*u*t*P1x + t*t*P2x;
+    float by = u*u*P0y + 2*u*t*P1y + t*t*P2y;
+    float dxT = 2*u*(P1x - P0x) + 2*t*(P2x - P1x);
+    float dyT = 2*u*(P1y - P0y) + 2*t*(P2y - P1y);
+    float nl = sqrtf(dxT*dxT + dyT*dyT); if (nl < 1) nl = 1;
+    float nx = dyT / nl, ny = -dxT / nl;
+    if (ny < 0) { nx = -nx; ny = -ny; }
+    char nb[3]; snprintf(nb, sizeof(nb), "%d", k);
+    drawTextSmall((int)(bx + nx*16) - 3, (int)(by + ny*16) - 3, nb, AMB, 1);
+  }
+  drawTextSmall(96, 336, "1/MIN x1000", DIMT, 1);
+
+  // --- Geschwindigkeit: riesige GELBE Ziffern direkt auf schwarz (Monza "288") ---
+  int spd = (fresh && g_speedValid) ? (int)lroundf(g_speedKmh) : 0;
+  if (spd > 999) spd = 999;
+  const int DW = 56, DH = 100, DT = 12, DGAP = 12;
+  int dx0 = 196, dy0 = 160;
+  int d100 = spd / 100, d10 = (spd / 10) % 10, d1 = spd % 10;
+  draw7segDigit(dx0,                 dy0, DW, DH, DT, (spd >= 100) ? d100 : -1, AMB, AMBD);
+  draw7segDigit(dx0 + DW + DGAP,     dy0, DW, DH, DT, (spd >= 10)  ? d10  : -1, AMB, AMBD);
+  draw7segDigit(dx0 + 2 * (DW+DGAP), dy0, DW, DH, DT, d1, AMB, AMBD);
+  drawTextSmall(322, 268, "km/h", DIMT, 1);
+
+  // --- Warnbloecke rechts (rote Quadrate wie beim Monza - unsere Alarme live) ---
+  const char* wlbl[3] = { "LAM", "TMP", "VLT" };
+  const uint8_t wbit[3] = { 1, 4, 8 };
+  for (int w = 0; w < 3; w++) {
+    bool on = (g_alertMask & wbit[w]) != 0;
+    fillRectFast(394, 130 + w * 44, 34, 30, on ? REDL : REDD);
+    drawTextSmall(398, 140 + w * 44, wlbl[w], on ? RGB565(255,235,230) : DIMT, 1);
+  }
+  // Temp-Balken darunter (bernstein)
+  const bool g123 = fresh && g_g123Valid;
+  float tFrac = g123 ? constrain((g_g123Temp - 40.0f) / 80.0f, 0.0f, 1.0f) : 0.0f;
+  int tLit = (int)lroundf(tFrac * 8.0f);
+  for (int j = 0; j < 8; j++)
+    fillRectFast(398, 306 - j * 11, 26, 9, (j < tLit) ? AMB : AMBD);
+  drawTextSmall(396, 318, "TEMP", DIMT, 1);
+
+  // --- untere Fenster: Trip | Uhr (7seg) | Volt | Gang (eigene Daempfungs-Statics) ---
+  const uint16_t WBG = RGB565(26, 24, 18);
+  fillRectFast( 74, 322, 122, 46, WBG);
+  fillRectFast(202, 322,  98, 46, WBG);
+  fillRectFast(306, 322,  62, 46, WBG);
+  fillRectFast(374, 322,  40, 46, WBG);
+  char ob[16];
+  if (g_tripValid) snprintf(ob, sizeof(ob), "T%.1f", g_tripKm); else strcpy(ob, "T --");
+  drawTextSmall(82, 338, ob, AMB, 2);
+  struct tm oNow = {};
+  int ohh = -1, omi = 0;
+  if (readClockTime(&oNow)) { ohh = oNow.tm_hour; omi = oNow.tm_min; }
+  { const int CW = 18, CH = 32, CT = 4, CG = 4;
+    int cx0 = 208, cy0 = 329;
+    draw7segDigit(cx0,           cy0, CW, CH, CT, (ohh >= 10) ? ohh / 10 : -1, AMB, AMBD);
+    draw7segDigit(cx0 + CW + CG, cy0, CW, CH, CT, (ohh >= 0) ? ohh % 10 : -1, AMB, AMBD);
+    fillRectFast(cx0 + 2*(CW+CG) + 1, cy0 + 7,  4, 4, AMB);
+    fillRectFast(cx0 + 2*(CW+CG) + 1, cy0 + 21, 4, 4, AMB);
+    draw7segDigit(cx0 + 2*(CW+CG) + 8, cy0, CW, CH, CT, (ohh >= 0) ? omi / 10 : -1, AMB, AMBD);
+    draw7segDigit(cx0 + 3*(CW+CG) + 8, cy0, CW, CH, CT, (ohh >= 0) ? omi % 10 : -1, AMB, AMBD);
+  }
+  if (g123) snprintf(ob, sizeof(ob), "%.1fV", g_g123Volt); else strcpy(ob, "--V");
+  drawTextSmall(312, 338, ob, AMB, 2);
+  static char oGearShown = 0, oGearCand = 0; static uint8_t oGearStable = 0;
+  if (fresh && g_speedValid && g_speedKmh > 8.0f && g_rpm > 500.0f) {
+    float r = g_rpm / g_speedKmh;
+    char g = (r >= g_gearR12) ? '1' : (r >= g_gearR23) ? '2' : '3';
+    if (g == oGearCand) { if (oGearStable < 3) oGearStable++; }
+    else                { oGearCand = g; oGearStable = 1; }
+    if (oGearStable >= 3) oGearShown = oGearCand;
+  } else { oGearShown = 0; oGearCand = 0; oGearStable = 0; }
+  if (oGearShown) { char gb[2] = { oGearShown, 0 }; drawTextSmall(387, 332, gb, AMB, 3); }
+
+  // --- Lambda + Quelle ---
+  char st[26], lb[8];
+  if (fresh && g_lambdaValid) snprintf(lb, sizeof(lb), "%.2f", g_lambda); else strcpy(lb, "--");
+  const char* src = fresh ? g_lastSrc : (g_bleConn ? "WARTE" : (g_canReady ? "CAN WARTE" : "KEIN HUB"));
+  snprintf(st, sizeof(st), "L %s  %s", lb, src);
+  drawTextCentered(240, 404, st, fresh ? AMB : RGB565(200, 120, 50), 2);
+  presentFrame();
+}
+
 static void drawMotorPage() {
   if (!ensureFrame()) return;
   if (g_motorStyle == 4) { drawDigifizPage(); return; }
+  if (g_motorStyle == 5) { drawOpelPage(); return; }
   const GaugeTheme& t = gTheme();
   fillFrame(t.face);
   if (t.chrome) {
@@ -4459,7 +4596,7 @@ void loop() {
             nightMaskEnsure(); g_redrawPage = true;
             Serial.printf("Nachtmodus-Grundhelligkeit = %d%%\n", v);
           } else Serial.println("night:10..85 (Grundhelligkeit %)"); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..4 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:rx | can:normal|listen"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..5 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
