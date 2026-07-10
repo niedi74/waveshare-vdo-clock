@@ -1239,9 +1239,46 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
 static bool ensureFrame()         { return hal_fb() != nullptr; }
 static void drawCircleLine(int cx, int cy, int radius, int thickness, uint16_t color);  // fwd
 static void drawTextCentered(int cx, int y, const char *text, uint16_t color, int scale);  // fwd
+
+// ===== Gruene Nachtbeleuchtung: virtuelle Birne unten (wie das Original-Birnchen) =====
+// Karsten 8.7.: soll aussehen wie im echten Instrument - EINE kleine Birne unten,
+// deren Licht nach oben hin abfaellt. Kein flaechiger Gruenfilter. Wirkt zentral in
+// presentFrame auf ALLE Seiten; rote Zeiger werden dunkel (authentisch bei Gruenlicht).
+// Trigger vorerst manuell (Dev-Tab/Serial) - Licht-Draht an GPIO0 kommt spaeter.
+static bool     g_nightMode = false;      // NVS "night"
+static uint8_t* g_nightMask = nullptr;    // 480x480 Helligkeitsfaktor der Birne (PSRAM, lazy)
+static void nightMaskEnsure() {
+  if (g_nightMask) return;
+  g_nightMask = (uint8_t*)ps_malloc(480 * 480);
+  if (!g_nightMask) return;
+  for (int y = 0; y < 480; y++)
+    for (int x = 0; x < 480; x++) {
+      float dx = x - 240.0f, dy = y - 500.0f;          // Birne knapp unterhalb des Glasrands
+      float d  = sqrtf(dx * dx + dy * dy);
+      float f  = 1.06f - d / 430.0f;                   // Lichtkegel: unten ~voll, oben ~dunkel
+      if (f > 1.0f) f = 1.0f;
+      if (f < 0.16f) f = 0.16f;
+      g_nightMask[y * 480 + x] = (uint8_t)(f * 255.0f);
+    }
+}
+static void nightApply(uint16_t* fb) {
+  if (!fb || !g_nightMask) return;
+  for (int i = 0; i < 480 * 480; i++) {
+    uint16_t px = fb[i];
+    if (px == 0) continue;                             // schwarz bleibt schwarz (Grossteil des Bilds)
+    uint32_t m = g_nightMask[i];
+    uint32_t r = (px >> 11) & 0x1F, g = (px >> 5) & 0x3F, b = px & 0x1F;
+    r = (r * m * 84) >> 16;                            // Rot stark daempfen (~x0.33)
+    g = (g * m)      >> 8;                             // Gruen voll durch
+    b = (b * m * 64) >> 16;                            // Blau stark daempfen (~x0.25)
+    fb[i] = (uint16_t)((r << 11) | (g << 5) | b);
+  }
+}
+
 // Zentraler Present: bei aktivem Alarm blinkt ein roter Ring + Grund als Overlay
 // auf JEDER Seite (alle Seiten zeichnen voll neu -> Overlay verschwindet sauber).
 static void presentFrame() {
+  if (g_nightMode) nightApply(hal_fb());               // erst tinten - Alarm bleibt knallrot obendrauf
   if (g_alertMask && (millis() / 500) % 2 == 0) {
     drawCircleLine(240, 240, 236, 10, RGB565(220, 44, 32));
     if (g_alertText[0]) drawTextCentered(240, 20, g_alertText, RGB565(235, 60, 45), 2);
@@ -1951,21 +1988,23 @@ static void drawMotorPage() {
     drawTextCentered(240, M_Y(352), buf, lc2, M_F(4));
     drawTextCentered(240, M_Y(336), "LAMBDA", t.txtDim, M_F(1));
     const bool g123c = fresh && g_g123Valid;
+    // Untere zwei Zeilen: FESTE Position + Groesse 3 (Karsten 8.7., Fotos aus dem Bus:
+    // bei GROESSE=115% schob M_Y sie unter die Einbaublende, und sie waren zu klein).
     char tv[32];
     if (millis() < g_tripArmUntil) {
       strcpy(tv, "TRIP NULLEN? UNTEN HALTEN");
-      drawTextCentered(240, M_Y(396), tv, TACH_RED, M_F(2));
+      drawTextCentered(240, 388, tv, TACH_RED, 2);
     } else {
       char tr[12] = "";
-      if (g_tripValid) snprintf(tr, sizeof(tr), "  T%.1f", g_tripKm);
-      if (g123c) snprintf(tv, sizeof(tv), "%dC  %.1fV%s", (int)g_g123Temp, g_g123Volt, tr);
-      else       snprintf(tv, sizeof(tv), "--C  --V%s", tr);
-      drawTextCentered(240, M_Y(396), tv, t.txtDim, M_F(2));
+      if (g_tripValid) snprintf(tr, sizeof(tr), " T%.1f", g_tripKm);
+      if (g123c) snprintf(tv, sizeof(tv), "%dC %.1fV%s", (int)g_g123Temp, g_g123Volt, tr);
+      else       snprintf(tv, sizeof(tv), "--C --V%s", tr);
+      drawTextCentered(240, 388, tv, t.txtDim, 3);
     }
     char st3[24];
     const char* src3 = fresh ? g_lastSrc : (g_bleConn ? "WARTE" : (g_canReady ? "CAN WARTE" : "KEIN HUB"));
-    snprintf(st3, sizeof(st3), "%s%s", fresh ? "LIVE " : "", src3);
-    drawTextCentered(240, M_Y(424), st3, fresh ? t.liveCol : t.statusBad, M_F(2));
+    snprintf(st3, sizeof(st3), "%s", src3);   // Farbe traegt live/tot - "LIVE" spart Breite
+    drawTextCentered(240, 414, st3, fresh ? t.liveCol : t.statusBad, 3);
     presentFrame();
     return;
   }
@@ -2001,29 +2040,31 @@ static void drawMotorPage() {
   } else { strcpy(buf, "----"); lcol = t.txtDim; }
   drawTextCentered(240, M_Y(216), buf, lcol, M_F(6));
 
-  // AMP (Zuendspulenstrom) + Tempo + Trip, dann Status, im unteren Ring-Gap
+  // AMP (Zuendspulenstrom) + Tempo + Trip, dann Status, im unteren Ring-Gap.
+  // FESTE Position + Groesse 3 (Karsten 8.7., Fotos aus dem Bus: bei GROESSE=115%
+  // schob M_Y die Zeilen unter die Einbaublende, und sie waren zu klein).
   char line[32];
   if (millis() < g_tripArmUntil) {
     strcpy(line, "TRIP NULLEN? UNTEN HALTEN");
-    drawTextCentered(240, M_Y(396), line, TACH_RED, M_F(2));
+    drawTextCentered(240, 388, line, TACH_RED, 2);
   } else {
     char amp[10], spd[10], tr[12] = "";
     if (g123)        snprintf(amp, sizeof(amp), "%.1fA", g_g123Coil); else strcpy(amp, "--");
     if (fresh && g_speedValid) snprintf(spd, sizeof(spd), "%dKMH", (int)g_speedKmh); else strcpy(spd, "--");
-    if (g_tripValid) snprintf(tr, sizeof(tr), "  T%.1f", g_tripKm);
-    snprintf(line, sizeof(line), "AMP %s  %s%s", amp, spd, tr);
-    drawTextCentered(240, M_Y(396), line, t.txtDim, M_F(2));
+    if (g_tripValid) snprintf(tr, sizeof(tr), " T%.1f", g_tripKm);
+    snprintf(line, sizeof(line), "%s %s%s", amp, spd, tr);   // "AMP"-Prefix weg: Breite fuer Groesse 3
+    drawTextCentered(240, 388, line, t.txtDim, 3);
   }
 
-  // Statuszeile unten: Uhrzeit + Datenquelle (Uhr fehlt sonst im Kombi)
+  // Statuszeile unten: Uhrzeit + Datenquelle (Farbe traegt live/tot - "LIVE" spart Breite)
   char st[24];
   const char* src = fresh ? g_lastSrc : (g_bleConn ? "WARTE" : (g_canReady ? "CAN WARTE" : "KEIN HUB"));
   struct tm mnow = {};
   if (readClockTime(&mnow))
-    snprintf(st, sizeof(st), "%02d:%02d  %s%s", mnow.tm_hour, mnow.tm_min, fresh ? "LIVE " : "", src);
+    snprintf(st, sizeof(st), "%02d:%02d %s", mnow.tm_hour, mnow.tm_min, src);
   else
-    snprintf(st, sizeof(st), "%s%s", fresh ? "LIVE " : "", src);
-  drawTextCentered(240, M_Y(424), st, fresh ? t.liveCol : t.statusBad, M_F(2));
+    snprintf(st, sizeof(st), "%s", src);
+  drawTextCentered(240, 414, st, fresh ? t.liveCol : t.statusBad, 3);
   presentFrame();
 }
 #undef M_S
@@ -2775,6 +2816,8 @@ static void loadSettings() {
   g_trendShowRpm  = p.getBool("tr_rpm", true);        // Drehzahl-Linie zeigen
   g_gearR12       = p.getFloat("gr12", 90.0f);        // Ganganzeige: Grenze 1./2. Gang
   g_gearR23       = p.getFloat("gr23", 46.0f);        // Ganganzeige: Grenze 2./3. Gang
+  g_nightMode     = p.getBool("night", false);        // gruene Nachtbeleuchtung
+  if (g_nightMode) nightMaskEnsure();
   p.end();
   // Einmalige Migration: falsch getippte/veraltete Hub-AP-Namen (Tastatur konnte nur
   // eine Schreibung darstellen, SSIDs sind case-sensitiv) auf den echten AP-Namen
@@ -3332,6 +3375,10 @@ static void handleWebRoot() {
   html += g_trendShowRpm ? "checked" : "";
   html += F("> Drehzahl-Linie</label></p>"
     "<hr style='border-color:#333'>"
+    "<p><label><input type='checkbox' name='nightm' value='1' ");
+  html += g_nightMode ? "checked" : "";
+  html += F("> <b>Nachtmodus</b> (gr&uuml;ne Birne unten, wie Original-Instrumentenlicht)</label></p>"
+    "<hr style='border-color:#333'>"
     "<p><b>Ganganzeige</b> (DIGIFIZ, 3 G&auml;nge, Drehzahl je km/h): "
     "1&rarr;2 ab <input name='gr12' type='number' step='1' min='40' max='250' value='");
   html += String((int)lroundf(g_gearR12));
@@ -3496,6 +3543,8 @@ static void handleWebSet() {
         if (v == 60 || v == 120 || v == 180 || v == 300) { g_trendWindowS = (uint16_t)v; p.putUShort("tr_win", g_trendWindowS); } }
       g_trendShowMap = webServer.hasArg("trmap"); p.putBool("tr_map", g_trendShowMap);
       g_trendShowRpm = webServer.hasArg("trrpm"); p.putBool("tr_rpm", g_trendShowRpm);
+      g_nightMode = webServer.hasArg("nightm"); p.putBool("night", g_nightMode);
+      if (g_nightMode) nightMaskEnsure();
       // Ganganzeige-Grenzen (rpm pro km/h); 1->2 muss ueber 2->3 liegen
       if (webServer.hasArg("gr12")) { float v = webServer.arg("gr12").toFloat();
         if (v >= 40.0f && v <= 250.0f) { g_gearR12 = v; p.putFloat("gr12", v); } }
@@ -4361,6 +4410,12 @@ void loop() {
         else if (cmd == "trend:rpm on" || cmd == "trend:rpm off") { saveTrendCfg(0, g_trendShowMap, cmd.endsWith("on"));
                                              Serial.printf("Trend-RPM = %s\n", g_trendShowRpm ? "an" : "aus");
                                              if (currentPage == 3) drawLambdaPage(); }
+        else if (cmd == "night:on" || cmd == "night:off") {
+          g_nightMode = cmd.endsWith("on");
+          if (g_nightMode) nightMaskEnsure();
+          Preferences pn; pn.begin("clock", false); pn.putBool("night", g_nightMode); pn.end();
+          g_redrawPage = true;
+          Serial.printf("Nachtmodus = %s\n", g_nightMode ? "an (gruene Birne)" : "aus"); }
         else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..4 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
