@@ -1659,8 +1659,8 @@ static const GaugeTheme THEME_123 = {
   RGB565(238,238,236), RGB565(220,44,32), false, RGB565(22,22,26) };
 
 static uint8_t g_motorStyle = 2;   // 0=digital, 1=vdo, 2=123tune+
-static const char* const MOTOR_STYLE_NAMES[] = { "DIGITAL", "VDO", "123TUNE+", "VDO+UHR" };
-#define MOTOR_STYLE_COUNT 4
+static const char* const MOTOR_STYLE_NAMES[] = { "DIGITAL", "VDO", "123TUNE+", "VDO+UHR", "DIGIFIZ" };
+#define MOTOR_STYLE_COUNT 5
 static uint32_t g_tripArmUntil = 0;   // Trip-Reset: 1. Langdruck scharf (5 s), 2. Langdruck nullt
 static const GaugeTheme& gTheme() {
   return g_motorStyle == 0 ? THEME_DIGITAL : g_motorStyle == 2 ? THEME_123 : THEME_VDO;  // 1+3 = VDO-Look
@@ -1779,8 +1779,128 @@ static void drawTach(int cx, int cy, float rpm, bool valid, const GaugeTheme& t,
 #define M_R(r) ((int)lroundf((r) * M_S))
 #define M_F(f) (max(1, min(8, (int)lroundf((f) * M_S))))
 
+// ===== Stil 4 "DIGIFIZ": VW/Audi-Digitaltacho der 80er (Golf 2 GTI DigiFIZ) =====
+// Gruene Segment-Drehzahlkurve, grosse 7-Segment-Geschwindigkeit, Temp-Balken
+// rechts, Bernstein-Zeile unten (Trip/Uhr/Volt) - LCD-Phosphor-Look auf schwarz.
+// Ganganzeige: Grenzen in "Drehzahl pro km/h" zwischen den 3 Gaengen (Dev-Tab, NVS).
+// Defaults aus Karstens Ankern: 3.Gang=37.5 (100km/h@3750), 2. bis ~75, 1. bis ~30 km/h.
+static float g_gearR12 = 90.0f;          // >= dieser Wert -> 1. Gang (NVS gr12)
+static float g_gearR23 = 46.0f;          // >= dieser Wert -> 2. Gang, darunter 3. (NVS gr23)
+
+static const uint8_t SEG7[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };
+static void draw7segDigit(int x, int y, int w, int h, int t, int d, uint16_t on, uint16_t off) {
+  uint8_t m = (d >= 0 && d <= 9) ? SEG7[d] : 0;      // -1 = Geister-Digit (alles aus)
+  int hh = (h - 3 * t) / 2;
+  fillRectFast(x + t,     y,                w - 2 * t, t,  (m & 0x01) ? on : off);  // A oben
+  fillRectFast(x + w - t, y + t,            t,         hh, (m & 0x02) ? on : off);  // B re oben
+  fillRectFast(x + w - t, y + 2 * t + hh,   t,         hh, (m & 0x04) ? on : off);  // C re unten
+  fillRectFast(x + t,     y + 2 * t + 2*hh, w - 2 * t, t,  (m & 0x08) ? on : off);  // D unten
+  fillRectFast(x,         y + 2 * t + hh,   t,         hh, (m & 0x10) ? on : off);  // E li unten
+  fillRectFast(x,         y + t,            t,         hh, (m & 0x20) ? on : off);  // F li oben
+  fillRectFast(x + t,     y + t + hh,       w - 2 * t, t,  (m & 0x40) ? on : off);  // G Mitte
+}
+
+static void drawDigifizPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  const bool fresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
+  const uint16_t GRN  = RGB565(95, 225, 110);    // Phosphor-Gruen
+  const uint16_t GRND = RGB565(20, 52, 28);      // Segment aus
+  const uint16_t AMB  = RGB565(235, 195, 70);    // Bernstein (untere Zeile)
+  const uint16_t REDL = RGB565(235, 60, 40);
+  const uint16_t REDD = RGB565(66, 20, 16);      // roter Bereich, aus
+  const uint16_t DIMT = RGB565(105, 115, 105);
+
+  // --- Drehzahl: Segmentbogen, steigt von links unten nach rechts oben ---
+  const float cxA = 330.0f, cyA = 330.0f, rA = 240.0f;   // Kreisbogen 180..268 Grad
+  const int SEGS = 40;
+  float frac = fresh ? constrain(g_rpm / (float)g_rpmScaleMax, 0.0f, 1.0f) : 0.0f;
+  int lit = (int)lroundf(frac * SEGS);
+  float redFrac = (float)g_rpmRedline / (float)g_rpmScaleMax;
+  for (int i = 0; i < SEGS; i++) {
+    float a = (180.0f + (88.0f * i) / (SEGS - 1)) * PI / 180.0f;
+    float ca = cosf(a), sa = sinf(a);
+    int x0 = (int)lroundf(cxA + ca * (rA - 12)), y0 = (int)lroundf(cyA + sa * (rA - 12));
+    int x1 = (int)lroundf(cxA + ca * (rA + 10)), y1 = (int)lroundf(cyA + sa * (rA + 10));
+    bool red = ((float)i / SEGS) >= redFrac;
+    uint16_t col = (i < lit) ? (red ? REDL : GRN) : (red ? REDD : GRND);
+    drawLineFast(x0, y0, x1, y1, col, (i < lit) ? 4 : 3);
+  }
+  // Skalenzahlen (1..kmax = x1000) innen unter dem Bogen
+  int kmax = g_rpmScaleMax / 1000;
+  for (int k = 1; k <= kmax; k++) {
+    float a = (180.0f + 88.0f * ((float)(k * 1000) / g_rpmScaleMax)) * PI / 180.0f;
+    int lx = (int)lroundf(cxA + cosf(a) * (rA - 30)) - 3;
+    int ly = (int)lroundf(cyA + sinf(a) * (rA - 30)) - 3;
+    char nb[3]; snprintf(nb, sizeof(nb), "%d", k);
+    drawTextSmall(lx, ly, nb, GRN, 1);
+  }
+  drawTextSmall(126, 336, "1/MIN x1000", DIMT, 1);   // unterhalb des Bogen-Endes (Bogen endet y=330)
+  drawTextSmall(330, 72, "VDO", AMB, 1);
+
+  // --- Geschwindigkeit: 3-stellige 7-Segment-Anzeige ---
+  int spd = (fresh && g_speedValid) ? (int)lroundf(g_speedKmh) : 0;
+  if (spd > 999) spd = 999;
+  const int DW = 52, DH = 96, DT = 10, DGAP = 12;
+  int dx0 = 170, dy0 = 170;
+  int d100 = spd / 100, d10 = (spd / 10) % 10, d1 = spd % 10;
+  draw7segDigit(dx0,                 dy0, DW, DH, DT, (spd >= 100) ? d100 : -1, GRN, GRND);
+  draw7segDigit(dx0 + DW + DGAP,     dy0, DW, DH, DT, (spd >= 10)  ? d10  : -1, GRN, GRND);
+  draw7segDigit(dx0 + 2 * (DW+DGAP), dy0, DW, DH, DT, d1, GRN, GRND);
+  drawTextSmall(306, 272, "KM/H", DIMT, 1);
+
+  // --- Temperatur-Balken rechts (senkrecht, oben rot) ---
+  const bool g123 = fresh && g_g123Valid;
+  int tSegs = 12;
+  float tFrac = g123 ? constrain((g_g123Temp - 40.0f) / 80.0f, 0.0f, 1.0f) : 0.0f;  // 40..120 C
+  int tLit = (int)lroundf(tFrac * tSegs);
+  float tRed = constrain(((float)g_alTempMax - 40.0f) / 80.0f, 0.0f, 1.0f);
+  for (int j = 0; j < tSegs; j++) {                    // j=0 unten
+    int y = 320 - j * 15;
+    bool red = ((float)(j + 1) / tSegs) > tRed;
+    uint16_t col = (j < tLit) ? (red ? REDL : GRN) : (red ? REDD : GRND);
+    fillRectFast(396, y, 22, 11, col);
+  }
+  drawTextSmall(392, 333, "TEMP", DIMT, 1);
+
+  // --- Ganganzeige unten rechts (wie im Original-DigiFIZ) ---
+  // T2b: 3-Gang-AUTOMATIK. Anker (Karsten, 8.7.): 100 km/h = ~3750/min im 3. = 37.5 rpm/kmh;
+  // 1. bis ~30, 2. bis ~75 km/h. Grenzen im Dev-Tab kalibrierbar. Wandler-Schlupf laesst
+  // die Kennzahl beim Beschleunigen hochwandern -> Daempfung: Gang erst nach 3 stabilen
+  // Redraws (~1.5 s) uebernehmen, sonst flackert die Ziffer bei jedem Gasstoss.
+  static char gearShown = 0, gearCand = 0; static uint8_t gearStable = 0;
+  if (fresh && g_speedValid && g_speedKmh > 8.0f && g_rpm > 500.0f) {
+    float r = g_rpm / g_speedKmh;
+    char g = (r >= g_gearR12) ? '1' : (r >= g_gearR23) ? '2' : '3';
+    if (g == gearCand) { if (gearStable < 3) gearStable++; }
+    else               { gearCand = g; gearStable = 1; }
+    if (gearStable >= 3) gearShown = gearCand;
+    if (gearShown) { char gb[2] = { gearShown, 0 }; drawTextSmall(398, 346, gb, AMB, 3); }
+  } else { gearShown = 0; gearCand = 0; gearStable = 0; }
+
+  // --- untere Anzeigezeile (Bernstein): Trip, Uhr, Bordspannung ---
+  char bb[16];
+  if (g_tripValid) snprintf(bb, sizeof(bb), "T%.1f", g_tripKm); else strcpy(bb, "T --");
+  drawTextSmall(64, 352, bb, AMB, 2);
+  struct tm dfNow = {};
+  if (readClockTime(&dfNow)) snprintf(bb, sizeof(bb), "%d:%02d", dfNow.tm_hour, dfNow.tm_min);
+  else strcpy(bb, "-:--");
+  drawTextCentered(240, 348, bb, AMB, 3);
+  if (g123) snprintf(bb, sizeof(bb), "%.1fV", g_g123Volt); else strcpy(bb, "--V");
+  drawTextSmall(346, 352, bb, AMB, 2);
+
+  // --- Lambda + Quelle als Statuszeile ---
+  char st[26], lb[8];
+  if (fresh && g_lambdaValid) snprintf(lb, sizeof(lb), "%.2f", g_lambda); else strcpy(lb, "--");
+  const char* src = fresh ? g_lastSrc : (g_bleConn ? "WARTE" : (g_canReady ? "CAN WARTE" : "KEIN HUB"));
+  snprintf(st, sizeof(st), "L %s  %s%s", lb, fresh ? "LIVE " : "", src);
+  drawTextCentered(240, 404, st, fresh ? GRN : RGB565(200, 120, 50), 2);
+  presentFrame();
+}
+
 static void drawMotorPage() {
   if (!ensureFrame()) return;
+  if (g_motorStyle == 4) { drawDigifizPage(); return; }
   const GaugeTheme& t = gTheme();
   fillFrame(t.face);
   if (t.chrome) {
@@ -2634,7 +2754,7 @@ static void loadSettings() {
   g_canId         = p.getUShort("can_id", 0x510);      // CAN: Frame-ID (Dev-Tab)
   g_canKbps       = p.getUShort("can_kbps", 500);      // CAN: Bitrate (Dev-Tab)
   if (g_canKbps != 125 && g_canKbps != 250 && g_canKbps != 1000) g_canKbps = 500;
-  g_motorStyle    = p.getUChar("mstyle", 2);          // 0=digital,1=vdo,2=123tune+,3=vdo+uhr
+  g_motorStyle    = p.getUChar("mstyle", 2);          // 0=digital,1=vdo,2=123tune+,3=vdo+uhr,4=digifiz
   if (g_motorStyle > MOTOR_STYLE_COUNT - 1) g_motorStyle = 2;
   g_alertsOn   = p.getBool("alerts", true);            // Alarme (Dev-Tab)
   g_alLamMin   = p.getFloat("al_lmin", 0.90f);
@@ -2652,6 +2772,8 @@ static void loadSettings() {
   if (g_trendWindowS != 60 && g_trendWindowS != 120 && g_trendWindowS != 180 && g_trendWindowS != 300) g_trendWindowS = 60;
   g_trendShowMap  = p.getBool("tr_map", false);       // Saugrohrdruck mit anzeigen
   g_trendShowRpm  = p.getBool("tr_rpm", true);        // Drehzahl-Linie zeigen
+  g_gearR12       = p.getFloat("gr12", 90.0f);        // Ganganzeige: Grenze 1./2. Gang
+  g_gearR23       = p.getFloat("gr23", 46.0f);        // Ganganzeige: Grenze 2./3. Gang
   p.end();
   // Einmalige Migration: falsch getippte/veraltete Hub-AP-Namen (Tastatur konnte nur
   // eine Schreibung darstellen, SSIDs sind case-sensitiv) auf den echten AP-Namen
@@ -3209,6 +3331,16 @@ static void handleWebRoot() {
   html += g_trendShowRpm ? "checked" : "";
   html += F("> Drehzahl-Linie</label></p>"
     "<hr style='border-color:#333'>"
+    "<p><b>Ganganzeige</b> (DIGIFIZ, 3 G&auml;nge, Drehzahl je km/h): "
+    "1&rarr;2 ab <input name='gr12' type='number' step='1' min='40' max='250' value='");
+  html += String((int)lroundf(g_gearR12));
+  html += F("' style='width:70px;padding:6px;border:0;border-radius:6px'> &nbsp; "
+    "2&rarr;3 ab <input name='gr23' type='number' step='1' min='20' max='120' value='");
+  html += String((int)lroundf(g_gearR23));
+  html += F("' style='width:70px;padding:6px;border:0;border-radius:6px'></p>"
+    "<div style='color:#888;font-size:0.85em'>Kalibrieren: bei bekanntem Gang Drehzahl &divide; km/h "
+    "rechnen (T2b-Anker: 3. Gang = 37.5). Grenze = Mittelwert zwischen zwei G&auml;ngen.</div>"
+    "<hr style='border-color:#333'>"
     "<p><label><input type='checkbox' name='canon' value='1' ");
   html += g_featureCan ? "checked" : "";
   html += F("> <b>CAN-Cockpit</b>");
@@ -3363,6 +3495,11 @@ static void handleWebSet() {
         if (v == 60 || v == 120 || v == 180 || v == 300) { g_trendWindowS = (uint16_t)v; p.putUShort("tr_win", g_trendWindowS); } }
       g_trendShowMap = webServer.hasArg("trmap"); p.putBool("tr_map", g_trendShowMap);
       g_trendShowRpm = webServer.hasArg("trrpm"); p.putBool("tr_rpm", g_trendShowRpm);
+      // Ganganzeige-Grenzen (rpm pro km/h); 1->2 muss ueber 2->3 liegen
+      if (webServer.hasArg("gr12")) { float v = webServer.arg("gr12").toFloat();
+        if (v >= 40.0f && v <= 250.0f) { g_gearR12 = v; p.putFloat("gr12", v); } }
+      if (webServer.hasArg("gr23")) { float v = webServer.arg("gr23").toFloat();
+        if (v >= 20.0f && v <= 120.0f && v < g_gearR12) { g_gearR23 = v; p.putFloat("gr23", v); } }
       g_redrawPage = true;                       // Tacho/Band/Trend sofort neu zeichnen
     }
     { // CAN-Konfig: an/aus, Modus, ID, Bitrate - Aenderung re-initialisiert den Treiber
@@ -4223,7 +4360,7 @@ void loop() {
         else if (cmd == "trend:rpm on" || cmd == "trend:rpm off") { saveTrendCfg(0, g_trendShowMap, cmd.endsWith("on"));
                                              Serial.printf("Trend-RPM = %s\n", g_trendShowRpm ? "an" : "aus");
                                              if (currentPage == 3) drawLambdaPage(); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..3 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:rx | can:normal|listen"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..4 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:rx | can:normal|listen"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
