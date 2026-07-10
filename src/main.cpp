@@ -1811,43 +1811,44 @@ static void drawDigifizPage() {
   const uint16_t REDD = RGB565(66, 20, 16);      // roter Bereich, aus
   const uint16_t DIMT = RGB565(105, 115, 105);
 
-  // --- Drehzahl: Segmentbogen, steigt von links unten nach rechts oben ---
-  const float cxA = 330.0f, cyA = 330.0f, rA = 240.0f;   // Kreisbogen 180..268 Grad
-  const int SEGS = 40;
+  // --- Drehzahl: Segmentbogen, steigt von links unten weit ueber die Mitte oben ---
+  // "Der Hochlaufbalken kann mehr sein" (8.7.): 96 Grad Sweep, 48 Segmente, 34px lang.
+  const float cxA = 330.0f, cyA = 330.0f, rA = 240.0f;   // Kreisbogen 180..276 Grad
+  const int SEGS = 48;
   float frac = fresh ? constrain(g_rpm / (float)g_rpmScaleMax, 0.0f, 1.0f) : 0.0f;
   int lit = (int)lroundf(frac * SEGS);
   float redFrac = (float)g_rpmRedline / (float)g_rpmScaleMax;
   for (int i = 0; i < SEGS; i++) {
-    float a = (180.0f + (88.0f * i) / (SEGS - 1)) * PI / 180.0f;
+    float a = (180.0f + (96.0f * i) / (SEGS - 1)) * PI / 180.0f;
     float ca = cosf(a), sa = sinf(a);
-    int x0 = (int)lroundf(cxA + ca * (rA - 12)), y0 = (int)lroundf(cyA + sa * (rA - 12));
-    int x1 = (int)lroundf(cxA + ca * (rA + 10)), y1 = (int)lroundf(cyA + sa * (rA + 10));
+    int x0 = (int)lroundf(cxA + ca * (rA - 16)), y0 = (int)lroundf(cyA + sa * (rA - 16));
+    int x1 = (int)lroundf(cxA + ca * (rA + 18)), y1 = (int)lroundf(cyA + sa * (rA + 18));
     bool red = ((float)i / SEGS) >= redFrac;
     uint16_t col = (i < lit) ? (red ? REDL : GRN) : (red ? REDD : GRND);
-    drawLineFast(x0, y0, x1, y1, col, (i < lit) ? 4 : 3);
+    drawLineFast(x0, y0, x1, y1, col, (i < lit) ? 5 : 3);
   }
   // Skalenzahlen (1..kmax = x1000) innen unter dem Bogen
   int kmax = g_rpmScaleMax / 1000;
   for (int k = 1; k <= kmax; k++) {
-    float a = (180.0f + 88.0f * ((float)(k * 1000) / g_rpmScaleMax)) * PI / 180.0f;
-    int lx = (int)lroundf(cxA + cosf(a) * (rA - 30)) - 3;
-    int ly = (int)lroundf(cyA + sinf(a) * (rA - 30)) - 3;
+    float a = (180.0f + 96.0f * ((float)(k * 1000) / g_rpmScaleMax)) * PI / 180.0f;
+    int lx = (int)lroundf(cxA + cosf(a) * (rA - 34)) - 3;
+    int ly = (int)lroundf(cyA + sinf(a) * (rA - 34)) - 3;
     char nb[3]; snprintf(nb, sizeof(nb), "%d", k);
     drawTextSmall(lx, ly, nb, GRN, 1);
   }
   drawTextSmall(126, 336, "1/MIN x1000", DIMT, 1);   // unterhalb des Bogen-Endes (Bogen endet y=330)
-  drawTextSmall(330, 72, "VDO", AMB, 1);
+  drawTextSmall(140, 116, "VDO", AMB, 1);            // oben links wie das Logo im Original
 
   // --- Geschwindigkeit: 3-stellige 7-Segment-Anzeige ---
   int spd = (fresh && g_speedValid) ? (int)lroundf(g_speedKmh) : 0;
   if (spd > 999) spd = 999;
   const int DW = 52, DH = 96, DT = 10, DGAP = 12;
-  int dx0 = 170, dy0 = 170;
+  int dx0 = 182, dy0 = 182;                          // Ecke bleibt innerhalb des Bogen-Innenradius
   int d100 = spd / 100, d10 = (spd / 10) % 10, d1 = spd % 10;
   draw7segDigit(dx0,                 dy0, DW, DH, DT, (spd >= 100) ? d100 : -1, GRN, GRND);
   draw7segDigit(dx0 + DW + DGAP,     dy0, DW, DH, DT, (spd >= 10)  ? d10  : -1, GRN, GRND);
   draw7segDigit(dx0 + 2 * (DW+DGAP), dy0, DW, DH, DT, d1, GRN, GRND);
-  drawTextSmall(306, 272, "KM/H", DIMT, 1);
+  drawTextSmall(318, 284, "KM/H", DIMT, 1);
 
   // --- Temperatur-Balken rechts (senkrecht, oben rot) ---
   const bool g123 = fresh && g_g123Valid;
