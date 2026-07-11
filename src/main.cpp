@@ -23,7 +23,6 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <ESPmDNS.h>
-#include "esp_wps.h"               // WLAN per Tastendruck (WPS PBC) - wie im M5 Dial
 #include "SD_MMC.h"                // Micro-SD am 2.8C (SDMMC 1-bit: CLK=2/CMD=1/D0=42, D3=EXIO4)
 #include <sys/time.h>
 #include <time.h>
@@ -61,12 +60,12 @@
 #define NUS_TX  "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
 static float g_lambda = 0, g_rpm = 0, g_adv = 0, g_map = 0;
-static float g_battVolt = 0, g_speedKmh = 0;
+static float g_speedKmh = 0;
 static float g_g123Volt = 0, g_g123Temp = 0, g_g123Coil = 0;
-static bool  g_lambdaValid = false, g_battValid = false;
+static bool  g_lambdaValid = false;
 static bool  g_speedValid = false, g_g123Valid = false;
 
-// -------- Board-Akku (MX1.25-LiPo, separat vom Motor-g_battVolt oben) --------
+// -------- Board-Akku (MX1.25-LiPo) --------
 // GPIO4 = BAT_ADC, Teiler R5=200k(BAT)/R9=100k(GND) laut Schaltplan -> Vadc=Vbat/3.
 // WICHTIG (empirisch bestaetigt 7.7.): der Ladechip haelt diesen Pin bei USB-Strom
 // nahe Ladespannung (~4.2V), AUCH OHNE eingesteckten Akku - es gibt keine separate
@@ -124,9 +123,6 @@ static volatile size_t g_otaRxBytes = 0;
 // ---- GT911 touch state ----
 static uint8_t  gt911Addr = GT911_ADDR_PRIMARY;
 static bool     gt911Found = false;
-static uint16_t g_lastTouchX = 0, g_lastTouchY = 0;
-static uint32_t g_lastTouchMs = 0;
-static uint8_t  g_lastTouchStatus = 0;
 // true solange ein Finger auf dem Touch ist -> blockierenden HTTP-Poll aussetzen,
 // damit kein Tap mit einem GET-Timeout kollidiert (Touch bleibt reaktiv).
 static volatile bool g_uiTouchActive = false;
@@ -136,7 +132,6 @@ static volatile bool g_wlanScanBusy = false;
 
 // ---- App state ----
 static uint8_t   currentPage    = 0;
-static bool      touchSeen      = false;
 static char      g_ipStr[20]    = "---";
 static int       g_dialScalePct = 100;
 static int       g_brightnessPct = 100;
@@ -404,13 +399,8 @@ static bool wifiNtpTick() {
   return false;
 }
 
-// ---- WLAN per WPS (PBC = Tastendruck am Router), wie im M5 Dial ----
 static void saveWprof(uint8_t, const char*, const char*, const char*);   // fwd
 static uint32_t g_manualWifiUntil = 0;   // selectWprof: Schonfrist gegen Auto-Fallback
-enum WpsState : uint8_t { WPS_IDLE = 0, WPS_RUN = 1, WPS_OK = 2, WPS_FAIL = 3 };
-static volatile WpsState g_wpsState       = WPS_IDLE;
-static volatile bool     g_wpsActive      = false;  // WPS laeuft -> normalen Reconnect aussetzen
-static volatile bool     g_wpsSavePending = false;  // nach Erfolg Zugangsdaten ins Heim-Profil sichern
 
 // WLAN-Auto-Fallback: probiert (ohne Scan!) Hub-AP > Heim durch, je ~6 s. KEIN
 // WiFi.scanNetworks() - das crasht auf diesem Arduino-Stand, wenn kein Netz in
@@ -419,22 +409,6 @@ static volatile bool     g_wpsSavePending = false;  // nach Erfolg Zugangsdaten 
 // (Handy-Hotspot) ist NICHT in der Auto-Kette (nur manuell), damit das Display
 // bei einem kurzen Hub-AP-Abriss nicht am Hotspot ohne Hub-Daten haengenbleibt.
 static void wifiAutoTick() {
-  // Waehrend WPS laeuft: keinen normalen Reconnect (sonst ueberschreibt WiFi.begin
-  // die per WPS empfangene Verbindung). Bei Erfolg Router-Zugangsdaten ins Heim-Profil.
-  if (g_wpsActive) {
-    if (g_wpsSavePending && WiFi.status() == WL_CONNECTED) {
-      String s = WiFi.SSID(), pw = WiFi.psk();
-      if (s.length() > 0) {
-        saveWprof(0, s.c_str(), pw.c_str(), g_wprof[0].hubip);   // Slot 0 = Heim
-        g_wifiProfile = 0;
-        g_wpsState = WPS_OK;
-        Serial.printf("WPS: ok -> Heim '%s' gespeichert\n", s.c_str());
-      }
-      g_wpsSavePending = false;
-      g_wpsActive = false;
-    }
-    return;
-  }
   if (!g_featureWifi || !g_wifiAuto) return;
   if (WiFi.status() == WL_CONNECTED) return;
   if (millis() < g_manualWifiUntil) return;        // manuell gewaehltem Profil Zeit lassen -
@@ -463,45 +437,6 @@ static void wifiAutoTick() {
   tryAt = millis() + 5000;                         // kein belegtes Profil
 }
 
-static void onWifiWpsEvent(arduino_event_id_t ev, arduino_event_info_t) {
-  if (ev == ARDUINO_EVENT_WPS_ER_SUCCESS) {
-    esp_wifi_wps_disable();
-    g_wpsSavePending = true;
-    g_wpsState = WPS_RUN;
-    WiFi.begin();                                  // mit den per WPS empfangenen Daten verbinden
-    Serial.println("WPS: Erfolg, verbinde...");
-  } else if (ev == ARDUINO_EVENT_WPS_ER_FAILED || ev == ARDUINO_EVENT_WPS_ER_TIMEOUT) {
-    esp_wifi_wps_disable();
-    g_wpsActive = false;
-    g_wpsSavePending = false;
-    g_wpsState = WPS_FAIL;
-    Serial.println("WPS: fehlgeschlagen/Timeout");
-  }
-}
-
-// WPS (Push-Button) starten: Router-WPS-Taste + diesen Button = verbinden ohne Tippen.
-static void startWps() {
-  static bool evtRegistered = false;
-  if (!evtRegistered) { WiFi.onEvent(onWifiWpsEvent); evtRegistered = true; }
-  g_featureWifi = true;
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(false, true);
-  esp_wps_config_t cfg;
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.wps_type = WPS_TYPE_PBC;
-  strcpy(cfg.factory_info.manufacturer, "ESPRESSIF");
-  strcpy(cfg.factory_info.model_number, "ESP32S3");
-  strcpy(cfg.factory_info.model_name,   "VDO-CLOCK");
-  strcpy(cfg.factory_info.device_name,  "VDO-CLOCK");
-  if (esp_wifi_wps_enable(&cfg) == ESP_OK && esp_wifi_wps_start(0) == ESP_OK) {
-    g_wpsActive = true; g_wpsSavePending = false; g_wpsState = WPS_RUN;
-    Serial.println("WPS: gestartet (PBC) - jetzt WPS-Taste am Router druecken");
-  } else {
-    g_wpsActive = false; g_wpsState = WPS_FAIL;
-    Serial.println("WPS: Start fehlgeschlagen");
-  }
-}
-
 // -------- BLE Spartan3-Hub client --------
 static void parseSpartanPayload(const String& p) {
   if (!(p.startsWith("L") && p.indexOf('R') > 1)) return;
@@ -520,11 +455,6 @@ static void parseSpartanPayload(const String& p) {
   int mapEnd = posV > posM ? posV : (posS > posM ? posS : (posI > posM ? posI : p.length()));
   g_map = p.substring(posM + 1, mapEnd).toFloat();
 
-  if (posV > posM) {
-    int vEnd = posS > posV ? posS : (posI > posV ? posI : p.length());
-    float v = p.substring(posV + 1, vEnd).toFloat();
-    if (v > 0.5f) { g_battVolt = v; g_battValid = true; }
-  }
   if (posS > posM) {
     int sEnd = posI > posS ? posI : p.length();
     g_speedKmh = p.substring(posS + 1, sEnd).toFloat();
@@ -952,6 +882,11 @@ static void hubTimeSyncTick() {
   if (g_hubNtpSynced) { g_hubTimeSyncDone = true; return; }   // Hub schon gut - nichts zu tun
   time_t t = time(nullptr);
   if (t < 1700000000) return;            // eigene Zeit noch nicht plausibel (kein NTP/RTC-Sync)
+  // hubTimeSyncPush blockiert bis zu ~1.4s (POST-Timeouts) - nicht mitten in einen Tap
+  // hinein feuern, sonst frisst der einzige automatische Versuch pro Boot einen Touch
+  // (haeufig genau in den ersten Sekunden nach dem Boot, wenn der Fahrer aufs Display
+  // tippt). Kein Done-Flag setzen -> naechster Loop-Durchlauf probiert es einfach erneut.
+  if (g_uiTouchActive) return;
   g_hubTimeSyncDone = true;              // nur EIN Versuch pro Boot/Reconnect (Erfolg oder nicht)
   hubTimeSyncPush(t);
 }
@@ -1194,7 +1129,6 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
     gt911Addr  = other;
     gt911Found = true;
   }
-  g_lastTouchStatus = status;
   if ((status & 0x80) == 0) {
     uint8_t clear = 0;
     i2cRegWrite16(gt911Addr, GT911_READ_XY, &clear, 1);
@@ -1229,9 +1163,6 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
     *x = (uint16_t)lx;
     *y = (uint16_t)ly;
   }
-  g_lastTouchX  = *x;
-  g_lastTouchY  = *y;
-  g_lastTouchMs = millis();
   return true;
 }
 
@@ -1250,14 +1181,24 @@ static uint8_t  g_nightFloorPct = 40;     // Grundhelligkeit oben in % (NVS nigh
                                           // Spaeter live vom echten Dimmer-Drehregler (ADS1115-Projekt).
 static uint8_t* g_nightMask = nullptr;    // 480x480 Helligkeitsfaktor der Birne (PSRAM, lazy)
 static uint8_t  g_nightMaskFor = 255;     // Floor-Wert, fuer den die Maske gebaut wurde
+static int      g_nightMaskForRot = -999; // Rotation, fuer die die Maske gebaut wurde
 static void nightMaskEnsure() {
-  if (g_nightMask && g_nightMaskFor == g_nightFloorPct) return;
+  if (g_nightMask && g_nightMaskFor == g_nightFloorPct && g_nightMaskForRot == g_rotationDeg) return;
   if (!g_nightMask) g_nightMask = (uint8_t*)ps_malloc(480 * 480);
   if (!g_nightMask) return;
   float fl = g_nightFloorPct / 100.0f;                 // Karsten 8.7.: fest 16% war zu dunkel -
   for (int y = 0; y < 480; y++)                        // Grundhelligkeit jetzt einstellbar
     for (int x = 0; x < 480; x++) {
-      float dx = x - 240.0f, dy = y - 500.0f;          // Birne knapp unterhalb des Glasrands
+      // Birne sitzt LOGISCH unten (wie im echten, aufrecht verbauten Instrument).
+      // presentFrame/nightApply arbeitet auf dem rohen Panel-FB, aber setPixel()
+      // dreht gezeichneten Inhalt bei aktiver Justage-Rotation - ohne Ruecktrans-
+      // formation wanderte der Lichtkegel bei Rotation!=0 relativ zum aufrecht
+      // gezeichneten Zifferblatt an eine falsche Stelle. Panel->logisch zurueckdrehen
+      // (Umkehrung von setPixel, gleiche Formel wie die Touch-Koordinaten-Ruecktrafo).
+      float dpx = x - 239.5f, dpy = y - 239.5f;
+      float lx = dpx * g_rotCos + dpy * g_rotSin + 239.5f;
+      float ly = -dpx * g_rotSin + dpy * g_rotCos + 239.5f;
+      float dx = lx - 240.0f, dy = ly - 500.0f;        // Birne knapp unterhalb des Glasrands
       float d  = sqrtf(dx * dx + dy * dy);
       float k  = 1.06f - d / 430.0f;                   // Lichtkegel: unten ~voll, oben ~dunkel
       if (k > 1.0f) k = 1.0f;
@@ -1266,6 +1207,7 @@ static void nightMaskEnsure() {
       g_nightMask[y * 480 + x] = (uint8_t)(f * 255.0f);
     }
   g_nightMaskFor = g_nightFloorPct;
+  g_nightMaskForRot = g_rotationDeg;
 }
 static void nightApply(uint16_t* fb) {
   if (!fb || !g_nightMask) return;
@@ -1284,7 +1226,10 @@ static void nightApply(uint16_t* fb) {
 // Zentraler Present: bei aktivem Alarm blinkt ein roter Ring + Grund als Overlay
 // auf JEDER Seite (alle Seiten zeichnen voll neu -> Overlay verschwindet sauber).
 static void presentFrame() {
-  if (g_nightMode) nightApply(hal_fb());               // erst tinten - Alarm bleibt knallrot obendrauf
+  if (g_nightMode) {
+    nightMaskEnsure();      // billiger No-Op-Check falls Floor/Rotation seit letztem Frame gleich blieben
+    nightApply(hal_fb());   // erst tinten - Alarm bleibt knallrot obendrauf
+  }
   if (g_alertMask && (millis() / 500) % 2 == 0) {
     drawCircleLine(240, 240, 236, 10, RGB565(220, 44, 32));
     if (g_alertText[0]) drawTextCentered(240, 20, g_alertText, RGB565(235, 60, 45), 2);
@@ -1456,40 +1401,6 @@ static void drawTextCentered(int cx, int y, const char *text, uint16_t color, in
   drawTextSmall(cx - textWidthSmall(text, scale) / 2, y, text, color, scale);
 }
 
-static void drawGlyphPixelRotated(int x, int y, int lx, int ly, int w, int h, int scale, int rot, uint16_t color) {
-  int rx = lx, ry = ly;
-  if (rot == 1)      { rx = h - 1 - ly; ry = lx; }
-  else if (rot == 2) { rx = w - 1 - lx; ry = h - 1 - ly; }
-  else if (rot == 3) { rx = ly;          ry = w - 1 - lx; }
-  fillRectFast(x + rx * scale, y + ry * scale, scale, scale, color);
-}
-
-static void drawTextRotated(int x, int y, const char *text, uint16_t color, int scale, int rotation) {
-  int w = textWidthSmall(text, 1), h = 7, cursor = 0;
-  while (*text) {
-    char c = *text++;
-    if (c == ' ') { cursor += 4; continue; }
-    for (int col = 0; col < 5; col++) {
-      uint8_t bits = glyphColumn(c, col);
-      for (int row = 0; row < 7; row++)
-        if (bits & (1 << row)) drawGlyphPixelRotated(x, y, cursor + col, row, w, h, scale, rotation, color);
-    }
-    cursor += 6;
-  }
-}
-
-static void drawTextCenteredRotated(int cx, int cy, const char *text, uint16_t color, int scale, int rotation) {
-  int w = textWidthSmall(text, 1) * scale, h = 7 * scale;
-  int rw = (rotation == 1 || rotation == 3) ? h : w;
-  int rh = (rotation == 1 || rotation == 3) ? w : h;
-  drawTextRotated(cx - rw / 2, cy - rh / 2, text, color, scale, rotation);
-}
-
-static void drawDialText(int cx, int cy, const char *text, uint16_t color, int scale, int rotation) {
-  if (rotation == 0) drawTextCentered(cx, cy - (7 * scale) / 2, text, color, scale);
-  else drawTextCenteredRotated(cx, cy, text, color, scale, rotation);
-}
-
 static void copyVdoDialToFrame() {
   uint16_t *fb = hal_fb();
   if (!fb) return;
@@ -1612,10 +1523,20 @@ static void alertTick() {
   const bool fresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
   if (g_alertsOn && fresh) {
     const bool running = g_rpm >= 250.0f;          // Motor dreht (kein Alarm im Stand/aus; Test-Hub sendet 300)
-    if (running && g_lambdaValid && (g_lambda < g_alLamMin || g_lambda > g_alLamMax)) m |= 1;
-    if (g_rpm > (float)g_alRpmMax)                                                    m |= 2;
-    if (g_g123Valid && g_g123Temp > (float)g_alTempMax)                               m |= 4;
-    if (running && g_g123Valid && g_g123Volt > 1.0f && g_g123Volt < g_alVoltMin)      m |= 8;
+    // Hysterese: EIN-Schwelle bleibt exakt die eingestellte Grenze, aber AUS braucht
+    // etwas Abstand zurueck ins Band - sonst kippt ein am Bandrand pendelnder Wert
+    // (z.B. Test-Hub-Lambda-Sweep) bis zu 2x/s und jede Flanke loggt+redrawt (Review 11.7.).
+    const bool wasLam = g_alertMask & 1, wasRpm = g_alertMask & 2,
+               wasTmp = g_alertMask & 4, wasVlt = g_alertMask & 8;
+    if (running && g_lambdaValid) {
+      float lo = wasLam ? g_alLamMin + 0.02f : g_alLamMin;
+      float hi = wasLam ? g_alLamMax - 0.02f : g_alLamMax;
+      if (g_lambda < lo || g_lambda > hi) m |= 1;
+    }
+    if (g_rpm > (wasRpm ? (float)g_alRpmMax - 100.0f : (float)g_alRpmMax)) m |= 2;
+    if (g_g123Valid && g_g123Temp > (wasTmp ? (float)g_alTempMax - 3.0f : (float)g_alTempMax)) m |= 4;
+    if (running && g_g123Valid && g_g123Volt > 1.0f &&
+        g_g123Volt < (wasVlt ? g_alVoltMin + 0.2f : g_alVoltMin)) m |= 8;
   }
   if (m != g_alertMask) {
     g_alertMask = m;
@@ -1627,9 +1548,13 @@ static void alertTick() {
     size_t n = strlen(g_alertText);                 // trailing space weg
     if (n && g_alertText[n-1] == ' ') g_alertText[n-1] = 0;
     Serial.printf("ALARM: %s\n", m ? g_alertText : "aus");
-    char logMsg[48];
-    snprintf(logMsg, sizeof(logMsg), "ALARM %s", m ? g_alertText : "aus");
-    sdLog(logMsg);
+    static uint32_t lastLogAt = 0;                  // SD-Schreibrate deckeln (Hysterese
+    if (millis() - lastLogAt > 5000) {              // sollte das idR unnoetig machen)
+      lastLogAt = millis();
+      char logMsg[48];
+      snprintf(logMsg, sizeof(logMsg), "ALARM %s", m ? g_alertText : "aus");
+      sdLog(logMsg);
+    }
     g_redrawPage = true;                            // Ring sofort an/aus zeichnen
   }
 }
@@ -2777,9 +2702,6 @@ static void drawWlanPage() {
   bool conn = (WiFi.status() == WL_CONNECTED);
   if (conn) snprintf(l, sizeof(l), "verbunden  %s", g_ipStr); else snprintf(l, sizeof(l), "nicht verbunden");
   drawTextCentered(240, 114, l, conn ? RGB565(120, 220, 140) : RGB565(225, 150, 120), 2);
-  if      (g_wpsState == WPS_RUN)  drawTextCentered(240, 136, "WPS laeuft - Router-Taste druecken", RGB565(230, 200, 80), 1);
-  else if (g_wpsState == WPS_OK)   drawTextCentered(240, 136, "WPS ok", RGB565(120, 220, 140), 1);
-  else if (g_wpsState == WPS_FAIL) drawTextCentered(240, 136, "WPS fehlgeschlagen", RGB565(225, 120, 120), 1);
   const char* lbl[WLAN_BTN_N]  = { "Netze scannen", "SSID tippen", "Passwort tippen",
                                    "Profil wechseln", "Zurueck" };
   const uint16_t bg[WLAN_BTN_N] = { RGB565(40,110,60), RGB565(50,95,140), RGB565(55,80,120),
@@ -3186,7 +3108,10 @@ static void sdLog(const char* msg) {
   snprintf(path, sizeof(path), "/log/%04d%02d%02d.txt",
            now.tm_year + 1900, now.tm_mon + 1, now.tm_mday);
   File f = SD_MMC.open(path, FILE_APPEND);
-  if (!f) return;
+  if (!f) {                       // Karte gezogen/Kontaktproblem waehrend der Fahrt:
+    g_sdMounted = false;          // wie sdSyncWifiTxt abmelden, sonst rennt jeder weitere
+    return;                       // sdLog-Aufruf (z.B. Alarm-Flanke) erneut in SDMMC-Timeouts
+  }
   f.printf("%02d:%02d:%02d  %s\n", now.tm_hour, now.tm_min, now.tm_sec, msg);
   f.close();
 }
@@ -3717,11 +3642,21 @@ static void handleWebSet() {
       if (webServer.hasArg("nfloor")) { int v = webServer.arg("nfloor").toInt();
         if (v >= 10 && v <= 85) { g_nightFloorPct = (uint8_t)v; p.putUChar("night_min", g_nightFloorPct); } }
       if (g_nightMode) nightMaskEnsure();   // baut die Maske bei geaendertem Floor neu
-      // Ganganzeige-Grenzen (rpm pro km/h); 1->2 muss ueber 2->3 liegen
-      if (webServer.hasArg("gr12")) { float v = webServer.arg("gr12").toFloat();
-        if (v >= 40.0f && v <= 250.0f) { g_gearR12 = v; p.putFloat("gr12", v); } }
-      if (webServer.hasArg("gr23")) { float v = webServer.arg("gr23").toFloat();
-        if (v >= 20.0f && v <= 120.0f && v < g_gearR12) { g_gearR23 = v; p.putFloat("gr23", v); } }
+      // Ganganzeige-Grenzen (rpm pro km/h); 1->2 muss ueber 2->3 liegen. Beide Werte
+      // ERST einlesen und als PAAR validieren - sonst kann ein einzeln gueltiger
+      // neuer gr12 den noch-alten gr23 unterlaufen (v<g_gearR12 prueft gegen den
+      // bereits ueberschriebenen Wert) und Gang 2 im Ergebnis unerreichbar machen.
+      { float newR12 = g_gearR12, newR23 = g_gearR23;
+        bool r12Changed = false, r23Changed = false;
+        if (webServer.hasArg("gr12")) { float v = webServer.arg("gr12").toFloat();
+          if (v >= 40.0f && v <= 250.0f) { newR12 = v; r12Changed = true; } }
+        if (webServer.hasArg("gr23")) { float v = webServer.arg("gr23").toFloat();
+          if (v >= 20.0f && v <= 120.0f) { newR23 = v; r23Changed = true; } }
+        if (newR23 < newR12) {   // Paar-Invariante am Ende pruefen, nicht einzeln
+          if (r12Changed) { g_gearR12 = newR12; p.putFloat("gr12", newR12); }
+          if (r23Changed) { g_gearR23 = newR23; p.putFloat("gr23", newR23); }
+        }
+      }
       g_redrawPage = true;                       // Tacho/Band/Trend sofort neu zeichnen
     }
     { // CAN-Konfig: an/aus, Modus, ID, Bitrate - Aenderung re-initialisiert den Treiber
@@ -4352,7 +4287,6 @@ void loop() {
   const bool touchHeld = touchActive && (nowMs - touchLastSeenMs < 200);
   const bool touchNow = touchFrame || touchHeld;
   if (touchNow) {
-    touchSeen = true;
     if (touchFrame) {
       // WICHTIG: nur bei echtem Touch-Frame aktualisieren! Sonst haelt der
       // touchHeld-Zeitfenster-Mechanismus sich selbst am Leben (touchHeld ->
@@ -4596,7 +4530,7 @@ void loop() {
             nightMaskEnsure(); g_redrawPage = true;
             Serial.printf("Nachtmodus-Grundhelligkeit = %d%%\n", v);
           } else Serial.println("night:10..85 (Grundhelligkeit %)"); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:next|off | wauto:on|off | rot:+|-|NN | clock | motor | style:0..5 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:rx | can:normal|listen"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:show | wifi:set <slot> <SSID>|<Pass> | wifi:next|off | wauto:on|off | ap:on | scan | thub:show|on|off | thub:ip <ip> | rot:+|-|NN | clock | motor | style:0..5 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:ping | can:rx | can:normal|listen | lambda:0|1 | night:on|off|NN | reboot"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
@@ -4621,10 +4555,11 @@ void loop() {
   alertTick();
   alertBuzzTick();
 
-  // Lambda-Verlauf: immer sampeln (Historie da, egal welche Seite) + Trend-Seite scrollen
+  // Lambda-Verlauf: immer sampeln (Historie da, egal welche Seite). Das Neuzeichnen
+  // der Trend-Seite selbst uebernimmt bereits der generische "Data pages"-Block
+  // weiter unten (Seite 3 liegt in dessen 2..5-Bereich) - ein zweiter, hier vormals
+  // eigener 500ms-Timer verdoppelte die Redraw-Rate auf bis zu 4 Vollframes/s (Review 11.7.).
   trendSample();
-  { static uint32_t trRedrawAt = 0;
-    if (currentPage == 3 && g_lambdaStyle == 1 && millis() > trRedrawAt) { trRedrawAt = millis() + 500; drawLambdaPage(); } }
 
   // Fallback-Setup-AP verwalten (nur AN wenn keine STA-Verbindung)
   manageWifiAp();

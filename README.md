@@ -23,6 +23,7 @@ runden Touch-Display im Cockpit — plus **Live-Motordaten** vom Spartan3-Hub
 | SD | SD_MMC 1-bit (CLK=2, CMD=1, D0=42; D3 via EXIO4 high) |
 | CAN | SN65HVD230 an GPIO43/44 (TWAI, 500k, Cockpit-Frame 0x510) |
 | USB | nativ USB-CDC; Auto-Reset nach Flash unzuverlässig → `reboot`-Kommando |
+| Board-Akku | MX1.25-LiPo, GPIO4 (ADC1_CH3), Teiler R5/R9 → Vadc=Vbat/3; am USB-Strom unzuverlässig (Ladechip hält Pin nahe Regelspannung) — Anzeige bewusst zurückhaltend |
 
 > ⚠️ **Nicht verwechseln** mit der eckigen `ESP32-S3-Touch-LCD-2.8` (240×320, SPI).
 > Dieses Projekt ist die **runde C-Variante** (480×480 RGB). Pins: `docs/PINOUT.md`.
@@ -40,14 +41,16 @@ runden Touch-Display im Cockpit — plus **Live-Motordaten** vom Spartan3-Hub
 |---|---|---|
 | 0 | **Uhr** (VDO-Zifferblatt, skalierbar/rotierbar) | Tap → Menü |
 | 1 | Menü | 6 Kacheln |
-| 2 | **Motor-Kombi** (4 Stile, s.u.) | Long-Press Mitte → Stil wechseln |
-| 3 | Lambda (Gauge ↔ 60-s-Verlauf) | Long-Press Mitte → umschalten |
+| 2 | **Motor-Kombi** (6 Stile, s.u.) | Long-Press Mitte → Stil wechseln |
+| 3 | Lambda (Gauge ↔ Verlauf, Fenster 60-300 s) | Long-Press Mitte → umschalten, Tap oben → Fenster zyklen |
 | 4 | Hub-Status | |
 | 5 | Setup | Tap/Long-Press je Zeile |
 | 6 | IMU (Neigung) | |
 | 7 | Justage (Größe/Rotation) | |
 | 10 | On-Screen-Tastatur (WLAN-Passwort) | |
-| 11 | WLAN (WPS/Tippen/Profil) | |
+| 11 | WLAN (Tippen/Profil) | |
+| 12 | CAN-Status | |
+| 13 | CAN-Konfiguration | |
 
 **Kombi-Stile:** `DIGITAL` (bunt, Streifenband) · `VDO` (70er-Look, creme auf grau) ·
 `123TUNE+` (schwarz/orange) · `VDO+UHR` (Tacho außen, **Analoguhr** innen) ·
@@ -109,7 +112,7 @@ wiederhergestellt: das Live-Hub-Profil ist immer wählbar.
 | IMU | Neigung + Nullung |
 | System | Features (WLAN/BLE/Buzzer/123), FW-Stand + Git-Link, OTA-Upload |
 | SD | Status + `wifi.txt`-Editor |
-| **Dev** | Auto-Cockpit (an/Schwelle), **Test-Hub**, **Alarme** (alle Grenzen), **Tacho** (rot/Skala) |
+| **Dev** | Auto-Cockpit (an/Schwelle), **Test-Hub**, **Alarme** (alle Grenzen), **Tacho** (rot/Skala), **Ganganzeige** (Grenzen gr12/gr23), **Lambda-Verlauf** (Fenster/MAP/Drehzahl-Linie), **Nachtmodus** (Grundhelligkeit), **CAN** (an/aus, Modus, ID, Bitrate) |
 
 ### HTTP-Endpoints
 
@@ -118,6 +121,8 @@ wiederhergestellt: das Live-Hub-Profil ist immer wählbar.
 | `/version` | JSON: FW/Git/Features/Alarme/Anzeige/SD/Heap |
 | `/live` | JSON: aktuelle Cockpit-Werte + Alarm (für Live-Tab) |
 | `/screen` | Roh-RGB565 160×160 (Display-Screenshot, ~50 KB) |
+| `/imu` | JSON: aktuelle IMU-Rohwerte (Neigung) |
+| `/log` | SD-Systemlog, `?d=JJJJMMTT` für ein bestimmtes Datum |
 | `/set`, `/features`, `/wifi`, `/page`, `/sd`, `/sdwifi` | Konfiguration |
 | `/update` | OTA (multipart POST, `curl -F firmware=@firmware.bin`) |
 
@@ -137,9 +142,12 @@ curl -F "firmware=@.pio/build/waveshare_s3_28c/firmware.bin" http://<ip>/update 
 
 ### Serial-Kommandos (115200)
 
-`wifi:show` · `wifi:set <slot> <SSID>|<Pass>` · `wifi:next` · `wauto:on|off` ·
-`ap:on` · `ble:on|off` · `123:on|off` · `buzzer:on|off` · `style:0..3` · `motor` ·
-`clock` · `rot:±|NN` · `imu:null` · `can:test|ping|rx|normal|listen` · `reboot`
+`wifi:show` · `wifi:set <slot> <SSID>|<Pass>` · `wifi:next|off` · `wauto:on|off` ·
+`ap:on` · `scan` · `thub:show|on|off` · `thub:ip <ip>` · `ble:on|off` ·
+`123:on|off` · `buzzer:on|off` · `style:0..5` · `motor` · `clock` · `rot:±|NN` ·
+`trip:reset` · `hubtime` · `hubpull` · `batt` · `imu:null` ·
+`trend:win 60|120|180|300` · `trend:map on|off` · `trend:rpm on|off` ·
+`can:on|off|test|ping|rx|normal|listen` · `lambda:0|1` · `night:on|off|NN` · `reboot`
 
 ## Backlog
 
@@ -147,10 +155,12 @@ curl -F "firmware=@.pio/build/waveshare_s3_28c/firmware.bin" http://<ip>/update 
   Drehregler im originalen Cockpit dimmt die Lampen vermutlich per Spannungs-
   absenkung (12 V → dunkler). Idee: ESP liest diese Spannung per ADC ein und
   mappt sie auf `hal_backlight` (aktuell binär auf GPIO6 — für echtes Dimmen
-  auf PWM/LEDC umstellen). Freier ADC1-Pin bei aktivem WiFi: **GPIO4**
-  (ADC1_CH3). Offen: Spannungsteiler-Dimensionierung (12 V → ≤3,3 V, Messpunkt
-  an der Tacho-Beleuchtungsschaltung, nicht am Bordnetz), Kalibrierung
-  Rohwert→Helligkeit, Topologie des Original-Dimmers (reines R-Netzwerk?).
+  auf PWM/LEDC umstellen). **GPIO4 (ADC1_CH3) ist mittlerweile vom Board-Akku
+  belegt** — für den Tacho-Dimmer ist ein externes I2C-ADC (ADS1115) geplant,
+  statt eines weiteren freien ESP-Pins. Offen: Spannungsteiler-Dimensionierung
+  (12 V → ≤3,3 V, Messpunkt an der Tacho-Beleuchtungsschaltung, nicht am
+  Bordnetz), Kalibrierung Rohwert→Helligkeit (beide Dimm-Richtungen), Topologie
+  des Original-Dimmers (reines R-Netzwerk?).
 
 ## Lessons Learned (Post-Mortems)
 
