@@ -51,6 +51,7 @@ runden Touch-Display im Cockpit — plus **Live-Motordaten** vom Spartan3-Hub
 | 11 | WLAN (Tippen/Profil) | |
 | 12 | CAN-Status | |
 | 13 | CAN-Konfiguration | |
+| 14 | Nacht-Justage (An/Aus + Dimmer) | Kachel → Nachtmodus an/aus, -5/+5 → Grundhelligkeit |
 
 **Kombi-Stile:** `DIGITAL` (bunt, Streifenband) · `VDO` (70er-Look, creme auf grau) ·
 `123TUNE+` (schwarz/orange) · `VDO+UHR` (Tacho außen, **Analoguhr** innen) ·

@@ -2337,8 +2337,8 @@ static void drawHubPage() {
 
 // Setup-Zeilen: EINE Tabelle fuer Zeichnung UND Touch-Zonen (handleSetupLongPress
 // liest dieselben Y-Werte) - eine verschobene Zeile kann den Touch nicht mehr brechen.
-// 0=UHR 1=HELL 2=ROT 3=WIFI 4=BLE 5=CAN 6=BUZZER 7=IMU0 8=AKKU
-static const int SETUP_ROW_Y[9] = { 104, 136, 168, 200, 232, 264, 296, 328, 360 };
+// 0=UHR 1=HELL 2=ROT 3=WIFI 4=BLE 5=CAN 6=BUZZER 7=IMU0 8=AKKU 9=NACHT
+static const int SETUP_ROW_Y[10] = { 100, 128, 156, 184, 212, 240, 268, 296, 324, 352 };
 static void drawSetupPage() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
@@ -2383,6 +2383,10 @@ static void drawSetupPage() {
   // ist der Wert die echte Zellenspannung. Deshalb neutral: nur Spannung zeigen.
   snprintf(bb, sizeof(bb), "%.2fV", g_boardBattVolt);
   drawDataRow(SETUP_ROW_Y[8], "BAT/USB", bb, RGB565(180, 180, 170));
+  // NACHT: TIP an/aus, HALTEN = Grundhelligkeit (Dimmer) einen Schritt weiter
+  if (g_nightMode) snprintf(buf, sizeof(buf), "AN %d%%", g_nightFloorPct);
+  else             snprintf(buf, sizeof(buf), "AUS");
+  drawDataRow(SETUP_ROW_Y[9], "NACHT", buf, g_nightMode ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
   drawTextCentered(240, 402, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
@@ -2564,6 +2568,45 @@ static void handleAdjustTap(uint16_t x, uint16_t y) {
   else if (y >= 328 && y < 368)   saveRotation(g_rotationDeg + (right ? 5 : -5));     // ROT +/-5
   else if (y >= 376)            { currentPage = 1; drawMenuOverview(); return; }      // unten -> Menue
   drawAdjustPage();
+}
+
+// Nacht-Justage-Seite: An/Aus-Kachel + Dimmer (+/-5%), eigene Seite wie GROESSE/ROTATION -
+// bewusst nicht nur eine Setup-Zeile, damit man waehrend der Fahrt gross genug treffen kann.
+static void saveNightMode(bool on) {
+  g_nightMode = on;
+  Preferences p; p.begin("clock", false); p.putBool("night", g_nightMode); p.end();
+  if (g_nightMode) nightMaskEnsure();
+}
+static void saveNightFloor(int pct) {
+  if (pct < 10) pct = 10;
+  if (pct > 85) pct = 85;
+  g_nightFloorPct = (uint8_t)pct;
+  Preferences p; p.begin("clock", false); p.putUChar("night_min", g_nightFloorPct); p.end();
+  if (g_nightMode) nightMaskEnsure();
+}
+static void drawNightAdjustPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(70, 170, 90));
+  drawTextCentered(240, 44, "NACHTMODUS", RGB565(90, 200, 110), 4);
+  drawTextCentered(240, 92, "GRUENE INSTRUMENTENBELEUCHTUNG", RGB565(140, 140, 140), 1);
+  drawAdjBtn(120, 116, 240, 66, g_nightMode ? "AN" : "AUS",
+             g_nightMode ? RGB565(60, 210, 100) : RGB565(90, 90, 90));
+  char buf[16];
+  const uint16_t minus = RGB565(210, 120, 60), plus = RGB565(90, 195, 110);
+  drawTextCentered(240, 224, "DIMMER (GRUNDHELL.)", RGB565(150, 150, 150), 2);
+  snprintf(buf, sizeof(buf), "%d %%", g_nightFloorPct);
+  drawTextCentered(240, 250, buf, RGB565(235, 235, 225), 4);
+  drawAdjBtn(120, 288, 90, 46, "-5", minus);
+  drawAdjBtn(270, 288, 90, 46, "+5", plus);
+  drawTextCentered(240, 414, "TIP UNTEN ZURUECK", RGB565(180, 180, 170), 2);
+  presentFrame();
+}
+static void handleNightAdjustTap(uint16_t x, uint16_t y) {
+  if (y >= 398) { currentPage = 5; drawSetupPage(); return; }        // unten -> Setup
+  if (y >= 116 && y < 182)      saveNightMode(!g_nightMode);         // grosse Kachel -> An/Aus
+  else if (y >= 288 && y < 334) saveNightFloor(g_nightFloorPct + (x >= 240 ? 5 : -5));  // Dimmer +/-5%
+  drawNightAdjustPage();
 }
 
 // ===== On-Screen-Tastatur (Page 10): SSID/Passwort des aktiven Profils tippen =====
@@ -2827,6 +2870,7 @@ static void drawCurrentPage() {
   else if (currentPage == 11) drawWlanPage();
   else if (currentPage == 12) drawScanPage();
   else if (currentPage == 13) drawCanPage();
+  else if (currentPage == 14) drawNightAdjustPage();
 }
 
 // -------- Preferences --------
@@ -3729,7 +3773,7 @@ static void handleWebPage() {
     int page = webServer.arg("p").toInt();
     // Nur echte Seiten: 8/9 existieren nicht (Display friert ein), 10 (Tastatur)
     // braucht openKeyboard-Kontext, 12 (Scan) einen vorherigen Scan-Lauf.
-    if ((page >= 0 && page <= 7) || page == 11 || page == 13) {
+    if ((page >= 0 && page <= 7) || page == 11 || page == 13 || page == 14) {
       currentPage  = static_cast<uint8_t>(page);
       g_redrawPage = true;
       Serial.printf("Web: page=%u\n", currentPage);
@@ -3992,8 +4036,8 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
   }
   // Zeile aus derselben Tabelle bestimmen, mit der drawSetupPage zeichnet
   int row = -1;
-  for (int i = 0; i < 9; i++)
-    if ((int)y >= SETUP_ROW_Y[i] - 16 && (int)y < SETUP_ROW_Y[i] + 16) { row = i; break; }
+  for (int i = 0; i < 10; i++)
+    if ((int)y >= SETUP_ROW_Y[i] - 14 && (int)y < SETUP_ROW_Y[i] + 14) { row = i; break; }
 
   switch (row) {
     case 0:                             // UHR -> Justage-Seite (Groesse/Rotation fein)
@@ -4037,6 +4081,11 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
     case 8:                             // AKKU - nur Info, keine Aktion
       drawSetupPage();
       Serial.println("setup tap: akku (info only)");
+      break;
+    case 9:                             // NACHT -> eigene Justage-Seite (An/Aus + Dimmer), wie UHR/ROT
+      currentPage = 14;
+      drawNightAdjustPage();
+      Serial.println("setup tap: -> Nacht-Justage");
       break;
     default:
       drawSetupPage();
@@ -4382,6 +4431,8 @@ void loop() {
         handleScanTap(tapX, tapY);      // Scan-Ergebnis (SSID antippen)
       } else if (currentPage == 13) {
         handleCanTap(tapX, tapY);       // CAN-Seite (aktiv/Modus schalten)
+      } else if (currentPage == 14) {
+        handleNightAdjustTap(tapX, tapY);   // Nacht-Justage (An/Aus + Dimmer)
       } else if (currentPage == 3 && g_lambdaStyle == 1 && tapY < 132) {
         // Verlauf: Tap in den Kopfbereich -> Zeitfenster 60/120/180/300s zyklen
         cycleTrendWindow();
