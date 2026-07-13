@@ -798,7 +798,15 @@ static void httpPollTick() {
     if (jsonNum(bc, "rpm", v))       g_rpm = v;
     if (jsonNum(bc, "advance", v))   g_adv = v;
     if (jsonNum(bc, "map", v))       g_map = v;
-    if (jsonNum(bc, "lambda", v))  { g_lambda = v; g_lambdaValid = jsonTrue(bc, "valid") && v > 0; }
+    if (jsonNum(bc, "lambda", v)) {
+      g_lambda = v;
+      // Hub liefert den Sonden-Status als status_code (0=ERR,1=WAIT,2=HEAT,3=OK) -
+      // erst bei 3 (OK) ist der Wert belastbar (Sonde hat Betriebstemperatur).
+      // "valid" bleibt als Fallback fuer aeltere Hub-Firmware ohne status_code.
+      float sc;
+      bool ready = jsonNum(bc, "status_code", sc) ? (sc >= 2.999f) : jsonTrue(bc, "valid");
+      g_lambdaValid = ready && v > 0;
+    }
     if (jsonNum(bc, "tune_temp", v)) g_g123Temp = v;
     if (jsonNum(bc, "volt", v))      g_g123Volt = v;
     if (jsonNum(bc, "tune_amp", v))  g_g123Coil = v;
