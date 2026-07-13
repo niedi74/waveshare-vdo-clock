@@ -64,6 +64,15 @@ static float g_speedKmh = 0;
 static float g_g123Volt = 0, g_g123Temp = 0, g_g123Coil = 0;
 static bool  g_lambdaValid = false;
 static bool  g_speedValid = false, g_g123Valid = false;
+static int   g_lambdaStatusCode = -1;   // 0=ERR,1=WAIT,2=HEAT,3=OK, -1=unbekannt (Quelle ohne Status, z.B. BLE/123)
+static const char* lambdaStatusText() {
+  switch (g_lambdaStatusCode) {
+    case 0:  return "ERR";
+    case 1:  return "WAIT";
+    case 2:  return "HEAT";
+    default: return "--";
+  }
+}
 
 // -------- Board-Akku (MX1.25-LiPo) --------
 // GPIO4 = BAT_ADC, Teiler R5=200k(BAT)/R9=100k(GND) laut Schaltplan -> Vadc=Vbat/3.
@@ -589,8 +598,12 @@ static void applyCockpitCanFrame(const twai_message_t& msg) {
   const uint16_t rpm         = ((uint16_t)msg.data[2] << 8) | msg.data[3];
   const int16_t  advX10      = (int16_t)(((uint16_t)msg.data[4] << 8) | msg.data[5]);
   const uint8_t  flags       = msg.data[7];
-  g_lambda      = lambdaX1000 / 1000.0f;
-  g_lambdaValid = (flags & 0x01) && lambdaX1000 > 0;
+  // Bits 2-3 = Hub-Status (0=ERR,1=WAIT,2=HEAT,3=OK) - erst bei OK ist Lambda
+  // belastbar (Sonde hat Betriebstemperatur), analog zum HTTP-Pfad (status_code).
+  const uint8_t  statusCode  = (flags >> 2) & 0x03;
+  g_lambda           = lambdaX1000 / 1000.0f;
+  g_lambdaValid       = (statusCode == 3) && lambdaX1000 > 0;
+  g_lambdaStatusCode = statusCode;
   if (flags & 0x02) {            // tune fresh -> rpm/adv/map gueltig
     g_rpm = rpm;
     g_adv = advX10 / 10.0f;
@@ -804,8 +817,10 @@ static void httpPollTick() {
       // erst bei 3 (OK) ist der Wert belastbar (Sonde hat Betriebstemperatur).
       // "valid" bleibt als Fallback fuer aeltere Hub-Firmware ohne status_code.
       float sc;
-      bool ready = jsonNum(bc, "status_code", sc) ? (sc >= 2.999f) : jsonTrue(bc, "valid");
+      bool haveSc = jsonNum(bc, "status_code", sc);
+      bool ready = haveSc ? (sc >= 2.999f) : jsonTrue(bc, "valid");
       g_lambdaValid = ready && v > 0;
+      g_lambdaStatusCode = haveSc ? (int)(sc + 0.5f) : -1;
     }
     if (jsonNum(bc, "tune_temp", v)) g_g123Temp = v;
     if (jsonNum(bc, "volt", v))      g_g123Volt = v;
@@ -976,6 +991,7 @@ static void onTune123Notify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, b
     default: break;                              // u.a. 0x42 ignorieren
   }
   g_lambdaValid = false;                         // 123 liefert kein Lambda
+  g_lambdaStatusCode = -1;                       // kein Status verfuegbar ueber diesen Pfad
   g_tune123LastRxMs = millis();
   g_lastSrc = "123";
 }
@@ -1905,7 +1921,8 @@ static void drawDigifizPage() {
 
   // --- Lambda + Quelle als Statuszeile ---
   char st[26], lb[8];
-  if (fresh && g_lambdaValid) snprintf(lb, sizeof(lb), "%.2f", g_lambda); else strcpy(lb, "--");
+  if (fresh && g_lambdaValid) snprintf(lb, sizeof(lb), "%.2f", g_lambda);
+  else                        snprintf(lb, sizeof(lb), "%s", fresh ? lambdaStatusText() : "--");
   const char* src = fresh ? g_lastSrc : (g_bleConn ? "WARTE" : (g_canReady ? "CAN WARTE" : "KEIN HUB"));
   snprintf(st, sizeof(st), "L %s  %s%s", lb, fresh ? "LIVE " : "", src);
   drawTextCentered(240, 404, st, fresh ? GRN : RGB565(200, 120, 50), 2);
@@ -2021,7 +2038,8 @@ static void drawOpelPage() {
 
   // --- Lambda + Quelle ---
   char st[26], lb[8];
-  if (fresh && g_lambdaValid) snprintf(lb, sizeof(lb), "%.2f", g_lambda); else strcpy(lb, "--");
+  if (fresh && g_lambdaValid) snprintf(lb, sizeof(lb), "%.2f", g_lambda);
+  else                        snprintf(lb, sizeof(lb), "%s", fresh ? lambdaStatusText() : "--");
   const char* src = fresh ? g_lastSrc : (g_bleConn ? "WARTE" : (g_canReady ? "CAN WARTE" : "KEIN HUB"));
   snprintf(st, sizeof(st), "L %s  %s", lb, src);
   drawTextCentered(240, 404, st, fresh ? AMB : RGB565(200, 120, 50), 2);
@@ -2077,7 +2095,7 @@ static void drawMotorPage() {
     if (fresh && g_lambdaValid) {
       snprintf(buf, sizeof(buf), "%.2f", g_lambda);
       lc2 = (g_lambda < g_alLamMin || g_lambda > g_alLamMax) ? TACH_RED : t.txt;
-    } else strcpy(buf, "----");
+    } else snprintf(buf, sizeof(buf), "%s", fresh ? lambdaStatusText() : "----");
     drawTextCentered(240, M_Y(352), buf, lc2, M_F(4));
     drawTextCentered(240, M_Y(336), "LAMBDA", t.txtDim, M_F(1));
     const bool g123c = fresh && g_g123Valid;
@@ -2130,7 +2148,7 @@ static void drawMotorPage() {
     } else {
       lcol = (g_lambda < 0.95f || g_lambda > 1.05f) ? TACH_RED : t.txt;
     }
-  } else { strcpy(buf, "----"); lcol = t.txtDim; }
+  } else { snprintf(buf, sizeof(buf), "%s", fresh ? lambdaStatusText() : "----"); lcol = t.txtDim; }
   drawTextCentered(240, M_Y(216), buf, lcol, M_F(6));
 
   // AMP (Zuendspulenstrom) + Tempo + Trip, dann Status, im unteren Ring-Gap.
@@ -2217,7 +2235,8 @@ static void drawTrendPage() {
   bool fresh = live && g_lambdaValid;
   // Kopf: aktueller Lambda-Wert (farbcodiert) + Drehzahl. Fensterbreite im Titel.
   char hb[12];
-  if (fresh) snprintf(hb, sizeof(hb), "%.2f", g_lambda); else strcpy(hb, "--");
+  if (fresh) snprintf(hb, sizeof(hb), "%.2f", g_lambda);
+  else       snprintf(hb, sizeof(hb), "%s", live ? lambdaStatusText() : "--");
   uint16_t lc = RGB565(70, 210, 100);
   if (fresh) { if (g_lambda < 0.97f) lc = RGB565(235, 120, 40); else if (g_lambda > 1.03f) lc = RGB565(80, 160, 240); }
   else lc = RGB565(120, 90, 60);
@@ -2290,7 +2309,7 @@ static void drawLambdaPage() {
   bool fresh = live && g_lambdaValid;
   char buf[16];
   if (fresh) snprintf(buf, sizeof(buf), "%.2f", g_lambda);
-  else strcpy(buf, "----");
+  else       snprintf(buf, sizeof(buf), "%s", live ? lambdaStatusText() : "----");
   uint16_t col = RGB565(240, 240, 230);
   if (fresh) {
     if      (g_lambda < 0.97f) col = RGB565(235, 120, 40);
