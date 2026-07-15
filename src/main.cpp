@@ -65,6 +65,10 @@ static float g_g123Volt = 0, g_g123Temp = 0, g_g123Coil = 0;
 static bool  g_lambdaValid = false;
 static bool  g_speedValid = false, g_g123Valid = false;
 static int   g_lambdaStatusCode = -1;   // 0=ERR,1=WAIT,2=HEAT,3=OK, -1=unbekannt (Quelle ohne Status, z.B. BLE/123)
+static bool  g_hubLambdaSim = false;    // Hub selbst im lambda_test-Modus (Sonde simuliert statt echt) - NVS-unabhaengig, kommt live vom Hub
+static bool  g_hubCanReady = false;     // Hub<->Spartan-CAN-Bus aktiv (Hub-eigenes "CAN aktiv", NICHT die Display<->Hub-Verbindung)
+static float g_hubExhaustTempC = 0;     // Abgastemperatur an der Lambdasonde (Hub-Feld "temperature")
+static bool  g_showCanTemp = true;      // Dev-Tab: CAN-Status+Abgastemp-Zeile ein/aus (NVS show_ct)
 static const char* lambdaStatusText() {
   switch (g_lambdaStatusCode) {
     case 0:  return "ERR";
@@ -455,6 +459,7 @@ static void parseSpartanPayload(const String& p) {
   if (!(posR > 1 && posA > posR && posM > posA)) return;
 
   g_lambda = p.substring(1, posR).toFloat();  g_lambdaValid = true;
+  g_hubLambdaSim = false;   // BLE traegt (noch) kein Sim-Flag
   g_rpm    = p.substring(posR + 1, posA).toFloat();
   g_adv    = p.substring(posA + 1, posM).toFloat();
 
@@ -604,6 +609,7 @@ static void applyCockpitCanFrame(const twai_message_t& msg) {
   g_lambda           = lambdaX1000 / 1000.0f;
   g_lambdaValid       = (statusCode == 3) && lambdaX1000 > 0;
   g_lambdaStatusCode = statusCode;
+  g_hubLambdaSim      = false;   // CAN traegt (noch) kein Sim-Flag - echte Quelle hat Vorrang vor stehengebliebenem HTTP-SIM
   if (flags & 0x02) {            // tune fresh -> rpm/adv/map gueltig
     g_rpm = rpm;
     g_adv = advX10 / 10.0f;
@@ -825,6 +831,8 @@ static void httpPollTick() {
     if (jsonNum(bc, "tune_temp", v)) g_g123Temp = v;
     if (jsonNum(bc, "volt", v))      g_g123Volt = v;
     if (jsonNum(bc, "tune_amp", v))  g_g123Coil = v;
+    if (jsonNum(bc, "temperature", v)) g_hubExhaustTempC = v;   // Abgastemp an der Sonde
+    g_hubCanReady = jsonTrue(bc, "can_ready");                  // Hub<->Spartan-CAN (nicht Display<->Hub!)
     if (jsonNum(bc, "speed_kmh", v)){ g_speedKmh = v; g_speedValid = true; }
     if (jsonNum(bc, "trip_km", v)) { g_tripKm = v; g_tripValid = true; }
     g_hubNtpSynced = jsonTrue(bc, "ntp_synced");   // fuer hubTimeSyncTick(): Hub braucht Zeit-Push?
@@ -835,6 +843,14 @@ static void httpPollTick() {
     // Quelle kennzeichnen: Dev-Schalter ODER Test-Hub-AP erkannt am Subnetz.
     // Beschluss 3.7.: Live-Hub-AP = 192.168.4.x, Test-Hub-AP = 192.168.5.x.
     g_lastSrc     = (g_testHub || tgt.startsWith("192.168.5.")) ? "TEST" : "HTTP";
+    // Karsten 14.7.: Hub blieb nach Test-Session im lambda_test-Modus haengen (Sonde
+    // simuliert statt CAN-gelesen) - Display zeigte trotzdem "HTTP" wie bei echten
+    // Live-Daten, das fuehrte zu einer falschen Vergaser-Verstellung waehrend der
+    // Fahrt. "lambda_test_active" kommt direkt vom HUB (unabhaengig vom eigenen
+    // Test-Hub-Schalter!) - ueberschreibt die Quellenanzeige IMMER mit "SIM", auch
+    // wenn der Display selbst denkt er redet mit dem echten Live-Hub.
+    g_hubLambdaSim = jsonTrue(bc, "lambda_test_active");
+    if (g_hubLambdaSim) g_lastSrc = "SIM";
     g_httpRx++;
     if (g_httpRx == 1) Serial.printf("HTTP: erste Daten von %s\n", tgt.c_str());
     g_httpLastRxMs = millis();
@@ -992,6 +1008,7 @@ static void onTune123Notify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, b
   }
   g_lambdaValid = false;                         // 123 liefert kein Lambda
   g_lambdaStatusCode = -1;                       // kein Status verfuegbar ueber diesen Pfad
+  g_hubLambdaSim = false;                        // 123-direkt traegt kein Sim-Flag
   g_tune123LastRxMs = millis();
   g_lastSrc = "123";
 }
@@ -2136,6 +2153,14 @@ static void drawMotorPage() {
   if (g123) snprintf(buf, sizeof(buf), "%.1f", g_g123Volt); else strcpy(buf, "--");
   drawMiniGauge(M_X(332), M_Y(324), M_R(36), g_g123Volt, 10, 15, "VOLT", buf, RGB565(210, 180, 60), g123, t);
 
+  // CAN-Status + Abgastemp vom Hub (klein, Luecke zwischen TEMP/VOLT-Gauges) - nur
+  // ueber HTTP verfuegbar, das 0x510-CAN-Frame hat dafuer (noch) keinen Platz.
+  if (fresh && g_showCanTemp) {
+    char ct[20];
+    snprintf(ct, sizeof(ct), "%s %dC", g_hubCanReady ? "CAN OK" : "CAN --", (int)g_hubExhaustTempC);
+    drawTextCentered(240, M_Y(324), ct, g_hubCanReady ? t.txtDim : TACH_RED, M_F(2));
+  }
+
   // Lambda zentral
   drawTextCentered(240, M_Y(196), "LAMBDA", t.txtDim, M_F(2));
   uint16_t lcol;
@@ -2967,6 +2992,7 @@ static void loadSettings() {
   if (g_trendWindowS != 60 && g_trendWindowS != 120 && g_trendWindowS != 180 && g_trendWindowS != 300) g_trendWindowS = 60;
   g_trendShowMap  = p.getBool("tr_map", false);       // Saugrohrdruck mit anzeigen
   g_trendShowRpm  = p.getBool("tr_rpm", true);        // Drehzahl-Linie zeigen
+  g_showCanTemp   = p.getBool("show_ct", true);       // CAN-Status+Abgastemp-Zeile (Motor-Seite)
   g_gearR12       = p.getFloat("gr12", 90.0f);        // Ganganzeige: Grenze 1./2. Gang
   g_gearR23       = p.getFloat("gr23", 46.0f);        // Ganganzeige: Grenze 2./3. Gang
   g_nightMode     = p.getBool("night", false);        // gruene Nachtbeleuchtung
@@ -3533,6 +3559,10 @@ static void handleWebRoot() {
   html += g_trendShowRpm ? "checked" : "";
   html += F("> Drehzahl-Linie</label></p>"
     "<hr style='border-color:#333'>"
+    "<p><label><input type='checkbox' name='showct' value='1' ");
+  html += g_showCanTemp ? "checked" : "";
+  html += F("> CAN-Status + Abgastemp auf Motor-Seite (nur ueber HTTP verfuegbar)</label></p>"
+    "<hr style='border-color:#333'>"
     "<p><label><input type='checkbox' name='nightm' value='1' ");
   html += g_nightMode ? "checked" : "";
   html += F("> <b>Nachtmodus</b> (gr&uuml;ne Birne unten, wie Original-Instrumentenlicht)</label></p>"
@@ -3709,6 +3739,7 @@ static void handleWebSet() {
         if (v == 60 || v == 120 || v == 180 || v == 300) { g_trendWindowS = (uint16_t)v; p.putUShort("tr_win", g_trendWindowS); } }
       g_trendShowMap = webServer.hasArg("trmap"); p.putBool("tr_map", g_trendShowMap);
       g_trendShowRpm = webServer.hasArg("trrpm"); p.putBool("tr_rpm", g_trendShowRpm);
+      g_showCanTemp  = webServer.hasArg("showct"); p.putBool("show_ct", g_showCanTemp);
       g_nightMode = webServer.hasArg("nightm"); p.putBool("night", g_nightMode);
       if (webServer.hasArg("nfloor")) { int v = webServer.arg("nfloor").toInt();
         if (v >= 10 && v <= 85) { g_nightFloorPct = (uint8_t)v; p.putUChar("night_min", g_nightFloorPct); } }
