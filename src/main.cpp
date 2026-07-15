@@ -377,7 +377,12 @@ static bool wifiNtpTick() {
   if (strcmp(lastIp, g_ipStr) != 0) {
     strcpy(lastIp, g_ipStr);
     Serial.printf("WiFi verbunden, IP: %s (Profil %s)\n", g_ipStr, WPROF_LABELS[g_wifiProfile]);
-    Preferences pp; pp.begin("clock", false); pp.putUChar("wifi_prof", g_wifiProfile); pp.end();  // verbundenes Profil merken
+    // Verbundenes Profil merken - aber nur bei ECHTEM Wechsel schreiben: bei flatterndem
+    // Empfang (Hub-AP <-> Heim im Wechsel, wochenlang) wuerde sonst jeder Reconnect
+    // eine NVS-Flash-Schreibung kosten (begrenzte Schreibzyklen).
+    { Preferences pp; pp.begin("clock", false);
+      if (pp.getUChar("wifi_prof", 255) != g_wifiProfile) pp.putUChar("wifi_prof", g_wifiProfile);
+      pp.end(); }
     char logMsg[64];
     snprintf(logMsg, sizeof(logMsg), "WIFI %s ip=%s", WPROF_LABELS[g_wifiProfile], g_ipStr);
     sdLog(logMsg);
@@ -424,7 +429,9 @@ static uint32_t g_manualWifiUntil = 0;   // selectWprof: Schonfrist gegen Auto-F
 static void wifiAutoTick() {
   if (!g_featureWifi || !g_wifiAuto) return;
   if (WiFi.status() == WL_CONNECTED) return;
-  if (millis() < g_manualWifiUntil) return;        // manuell gewaehltem Profil Zeit lassen -
+  // Wrap-sicher (49,7-Tage-millis-Overflow bei Dauerplus): niemals millis() direkt
+  // mit einer Deadline vergleichen, immer die Differenz als int32 pruefen.
+  if (g_manualWifiUntil && (int32_t)(millis() - g_manualWifiUntil) < 0) return;   // manuell gewaehltem Profil Zeit lassen -
                                                    // sonst schiesst Auto jede S24-Wahl sofort ab
   // Nur Hub-AP > Heim automatisch. S24 NICHT auto (sonst landet das Display bei
   // einem Hub-AP-Abriss am Handy-Hotspot, wo es keine Hub-Daten gibt). S24 bleibt
@@ -433,7 +440,7 @@ static void wifiAutoTick() {
   static const uint8_t order[AUTO_N] = { 1, 0 };   // Hub-AP > Heim (Hub ist im Auto die primaere Verbindung)
   static uint8_t  oi    = 0;
   static uint32_t tryAt = 0;
-  if (millis() < tryAt) return;
+  if (tryAt && (int32_t)(millis() - tryAt) < 0) return;   // wrap-sicher
   for (uint8_t k = 0; k < AUTO_N; k++) {
     uint8_t slot = order[(oi + k) % AUTO_N];
     if (!g_wprof[slot].ssid[0]) continue;          // leeres Profil ueberspringen
@@ -451,6 +458,7 @@ static void wifiAutoTick() {
 }
 
 // -------- BLE Spartan3-Hub client --------
+static bool httpFresh();   // fwd - SIM-Latch: HTTP kennt lambda_test_active, CAN/BLE (noch) nicht
 static void parseSpartanPayload(const String& p) {
   if (!(p.startsWith("L") && p.indexOf('R') > 1)) return;
   int posR = p.indexOf('R');
@@ -458,8 +466,11 @@ static void parseSpartanPayload(const String& p) {
   int posM = p.indexOf('M', posA + 1);
   if (!(posR > 1 && posA > posR && posM > posA)) return;
 
-  g_lambda = p.substring(1, posR).toFloat();  g_lambdaValid = true;
-  g_hubLambdaSim = false;   // BLE traegt (noch) kein Sim-Flag
+  g_lambda = p.substring(1, posR).toFloat();
+  // BLE-Payload traegt keinen Sonden-Status (WAIT/HEAT/OK) - nur grobe Plausibilitaet
+  // statt blindem true, sonst laufen beim Kaltstart Aufwaerm-Fantasiewerte als LIVE durch.
+  g_lambdaValid = (g_lambda > 0.5f && g_lambda < 1.6f);
+  g_lambdaStatusCode = -1;
   g_rpm    = p.substring(posR + 1, posA).toFloat();
   g_adv    = p.substring(posA + 1, posM).toFloat();
 
@@ -484,7 +495,11 @@ static void parseSpartanPayload(const String& p) {
       g_g123Valid = true;
     }
   }
-  g_lastSrc = "BLE";
+  // SIM-Latch: solange der letzte frische HTTP-Poll lambda_test_active meldete, bleibt
+  // "SIM" stehen - der Hub speist seine Simulation in ALLE Ausgabepfade, BLE/CAN koennen
+  // das selbst nicht erkennen (kein Sim-Bit im Payload/Frame).
+  if (!httpFresh()) g_hubLambdaSim = false;
+  g_lastSrc = g_hubLambdaSim ? "SIM" : "BLE";
   g_bleRxCnt++;
   g_bleLastRx = millis();
 }
@@ -539,8 +554,11 @@ static void bleStartScan() {
   s->setActiveScan(false);
   s->setInterval(160);
   s->setWindow(30);
-  s->start(3000, false);
-  Serial.println("BLE: Scan nach Spartan-Hub...");
+  // Re-Arm VOR dem start(): schlaegt der Start fehl (Radio belegt), feuert kein
+  // onScanEnd und bleNextScanAt bliebe sonst 0 -> Scan fuer immer tot bis Reboot.
+  bleNextScanAt = millis() + 15000;
+  if (s->start(3000, false)) Serial.println("BLE: Scan nach Spartan-Hub...");
+  else                       Serial.println("BLE: Scan-Start FAIL, Retry in 15s");
 }
 
 static void bleConnect() {
@@ -566,7 +584,7 @@ static void bleConnect() {
 static void bleTick() {
   if (g_wlanScanBusy) return;                // waehrend WiFi-Scan Radio nicht fuer BLE nutzen
   if (bleDoConnect) { bleConnect(); return; }
-  if (!g_bleConn && bleNextScanAt != 0 && millis() >= bleNextScanAt) {
+  if (!g_bleConn && bleNextScanAt != 0 && (int32_t)(millis() - bleNextScanAt) >= 0) {   // wrap-sicher
     bleNextScanAt = 0;
     bleStartScan();
   }
@@ -609,13 +627,17 @@ static void applyCockpitCanFrame(const twai_message_t& msg) {
   g_lambda           = lambdaX1000 / 1000.0f;
   g_lambdaValid       = (statusCode == 3) && lambdaX1000 > 0;
   g_lambdaStatusCode = statusCode;
-  g_hubLambdaSim      = false;   // CAN traegt (noch) kein Sim-Flag - echte Quelle hat Vorrang vor stehengebliebenem HTTP-SIM
   if (flags & 0x02) {            // tune fresh -> rpm/adv/map gueltig
     g_rpm = rpm;
     g_adv = advX10 / 10.0f;
     g_map = msg.data[6];
   }
-  g_lastSrc     = "CAN";
+  // SIM-Latch: das 0x510-Frame traegt KEIN Sim-Bit - der Hub speist im lambda_test-
+  // Modus dieselbe Simulation auch in den CAN-Pfad. Solange der (langsamere) HTTP-Poll
+  // frisch ist und lambda_test_active meldet, darf CAN das SIM-Label nicht wegbuegeln,
+  // sonst wiederholt sich der Vergaser-Vorfall vom 14.7. ueber den zweiten Pfad.
+  if (!httpFresh()) g_hubLambdaSim = false;   // ohne frisches HTTP kein belastbares Sim-Wissen mehr
+  g_lastSrc     = (g_hubLambdaSim) ? "SIM" : "CAN";
   g_canRx++;
   g_canLastRxMs = millis();
 }
@@ -625,6 +647,24 @@ static void cockpitCanTick() {
   twai_status_info_t st;                          // Treiber wirklich installiert?
   if (twai_get_status_info(&st) != ESP_OK) {      // sonst assertet twai_receive auf NULL-Queue
     g_canReady = false;
+    return;
+  }
+  // Bus-Off-Selbstheilung: ein transienter Busfehler (Wackelkontakt/Vibration) treibt
+  // den TX-Fehlerzaehler ueber 255 -> Controller geht BUS_OFF und bleibt dort bis zum
+  // Zuendungswechsel, wenn niemand Recovery anstoesst. Auf 25000 km Urlaub keine Option.
+  if (st.state == TWAI_STATE_BUS_OFF) {
+    static uint32_t lastRecovery = 0;
+    if (millis() - lastRecovery >= 2000) {        // nicht im Fehlerfall hektisch spammen
+      lastRecovery = millis();
+      twai_initiate_recovery();
+      Serial.println("CAN: BUS_OFF -> Recovery angestossen");
+      sdLog("CAN BUS_OFF recovery");
+    }
+    return;
+  }
+  if (st.state == TWAI_STATE_STOPPED) {           // nach Recovery landet TWAI in STOPPED
+    twai_start();
+    Serial.println("CAN: STOPPED -> restart");
     return;
   }
   twai_message_t msg;
@@ -688,7 +728,7 @@ static void runCanPing() {
 static void imuCanTxTick() {
   static uint32_t at = 0;
   if (!g_featureCan || !g_canReady || g_canListenOnly || !g_imuPresent) return;
-  if (millis() < at) return;
+  if ((int32_t)(millis() - at) < 0) return;   // wrap-sicher
   at = millis() + 200;                      // 5 Hz
   qmi8658Read();
   int16_t  pitchX10 = (int16_t)lroundf((g_imuPitch - g_imuOffPitch) * 10.0f);
@@ -700,6 +740,7 @@ static void imuCanTxTick() {
   m.data[0] = (uint8_t)(pitchX10 >> 8); m.data[1] = (uint8_t)pitchX10;
   m.data[2] = (uint8_t)(rollX10  >> 8); m.data[3] = (uint8_t)rollX10;
   m.data[4] = (uint8_t)(gX100    >> 8); m.data[5] = (uint8_t)gX100;
+  m.ss = 1;   // Single-Shot: kein Retransmit-Sturm wenn der Bus kurz stoert (naechster Wert kommt eh in 200ms)
   twai_transmit(&m, 0);
 }
 
@@ -763,16 +804,22 @@ static String hubTarget() {
   // Cache nutzen solange Daten frisch sind; sonst gedrosselt neu aufloesen.
   if (g_hubResolvedIp.length() && httpFresh()) return g_hubResolvedIp;
   static uint32_t lastTry = 0;
-  if (g_hubResolvedIp.length() && millis() - lastTry < 5000) return g_hubResolvedIp;
+  static uint8_t  mdnsFails = 0;
+  // Backoff bei wiederholt unaufloesbarem Hostnamen: queryHost blockiert den Loop je
+  // 400 ms - bei totem Hub alle 5 s macht das den Touch wochenlang zaeh. Nach 5
+  // Fehlversuchen nur noch alle 30 s probieren.
+  const uint32_t retryMs = (mdnsFails >= 5) ? 30000 : 5000;
+  if (millis() - lastTry < retryMs) return g_hubResolvedIp;
   lastTry = millis();
   String name = g_hubIp;
   int dot = name.indexOf(".local");
   if (dot > 0) name = name.substring(0, dot);
   IPAddress ip = MDNS.queryHost(name.c_str(), 400);   // kurz halten -> blockiert den Loop/Touch nicht 1,5 s
   if (ip != IPAddress(0, 0, 0, 0)) {
+    mdnsFails = 0;
     g_hubResolvedIp = ip.toString();
     Serial.printf("mDNS: %s -> %s\n", g_hubIp.c_str(), g_hubResolvedIp.c_str());
-  }
+  } else if (mdnsFails < 5) mdnsFails++;
   return g_hubResolvedIp;
 }
 
@@ -784,9 +831,11 @@ static void httpPollTick() {
   if (g_uiTouchActive) return;
   static uint32_t last = 0;
   static uint8_t  failStreak = 0;
-  // Backoff: bei totem Hub nur alle 4s pollen, sonst blockiert der GET den Loop
+  // Backoff: bei totem Hub nur alle 2.5s pollen, sonst blockiert der GET den Loop
   // dauernd (Timeout) -> Touch wird traege. Bei Erfolg wieder flott (500ms).
-  const uint32_t interval = (failStreak >= 3) ? 4000 : 500;
+  // 2500 < 3000 (httpFresh-Fenster): sonst blinkte die Anzeige nach Hub-Erholung
+  // periodisch 1s auf "KEIN HUB", weil der Backoff das Fenster ueberdauerte.
+  const uint32_t interval = (failStreak >= 3) ? 2500 : 500;
   if (millis() - last < interval) return;
   last = millis();
 
@@ -812,6 +861,13 @@ static void httpPollTick() {
   int code = http.GET();
   if (code == 200) {
     String b = http.getString();
+    b.trim();
+    // Abgeschnittene Response (Timeout bei schwachem WLAN liefert Teilinhalt) nicht
+    // als frischen Poll werten - sonst laufen halb-geparste Alt-Werte als LIVE weiter.
+    if (b.length() < 2 || !b.endsWith("}")) {
+      if (failStreak < 200) failStreak++;
+      return;
+    }
     const char* bc = b.c_str();
     float v;
     if (jsonNum(bc, "rpm", v))       g_rpm = v;
@@ -995,6 +1051,10 @@ static int hexNibble(uint8_t c) {
 // Datenpaket: [opcode][hi_ascii_hex][lo_ascii_hex]
 static void onTune123Notify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
   if (n < 3) return;
+  // Rueckschalt-Race: Notifies laufen im NimBLE-Task weiter, bis tune123ScanTick den
+  // Disconnect ausfuehrt. Sobald HTTP/CAN wieder frisch sind, deren Daten nicht mehr
+  // mit den grob quantisierten 123-Werten ueberschreiben (Anzeige flackerte sonst).
+  if (httpFresh() || canFresh()) return;
   int hi = hexNibble(d[1]), lo = hexNibble(d[2]);
   int raw = (hi << 4) | lo;
   switch (d[0]) {
@@ -1082,7 +1142,7 @@ static void tune123ScanTick() {
   }
   if (g_tune123Conn) return;
   if (g_tune123DoConnect) { tune123Connect(); return; }
-  if (g_tune123NextScanAt != 0 && millis() < g_tune123NextScanAt) return;
+  if (g_tune123NextScanAt != 0 && (int32_t)(millis() - g_tune123NextScanAt) < 0) return;   // wrap-sicher
   bleEnsureInit();
   auto* s = NimBLEDevice::getScan();
   if (s->isScanning()) return;
@@ -1096,7 +1156,7 @@ static void tune123ScanTick() {
 
 static void tune123KeepaliveTick() {             // alle 1000ms "$\r"
   if (!g_tune123Conn || !tune123Rx) return;
-  if (millis() < g_tune123KeepAt) return;
+  if ((int32_t)(millis() - g_tune123KeepAt) < 0) return;   // wrap-sicher
   g_tune123KeepAt = millis() + 1000;
   tune123Rx->writeValue((const uint8_t*)"$\r", 2, false);
 }
@@ -1558,7 +1618,7 @@ static bool bleFresh() {
 // ===== Alarme: Grenzwerte pruefen (alle 500ms), Overlay via presentFrame =====
 static void alertTick() {
   static uint32_t at = 0;
-  if (millis() < at) return;
+  if ((int32_t)(millis() - at) < 0) return;   // wrap-sicher (Alarme MUESSEN auch nach 49 Tagen pruefen)
   at = millis() + 500;
   uint8_t m = 0;
   const bool fresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
@@ -1569,7 +1629,7 @@ static void alertTick() {
     // (z.B. Test-Hub-Lambda-Sweep) bis zu 2x/s und jede Flanke loggt+redrawt (Review 11.7.).
     const bool wasLam = g_alertMask & 1, wasRpm = g_alertMask & 2,
                wasTmp = g_alertMask & 4, wasVlt = g_alertMask & 8;
-    if (running && g_lambdaValid) {
+    if (running && g_lambdaValid && !g_hubLambdaSim) {   // SIM-Sweep pendelt uebers Band - kein Buzzer auf Simulationswerte
       float lo = wasLam ? g_alLamMin + 0.02f : g_alLamMin;
       float hi = wasLam ? g_alLamMax - 0.02f : g_alLamMax;
       if (g_lambda < lo || g_lambda > hi) m |= 1;
@@ -1605,8 +1665,8 @@ static void alertBuzzTick() {
   static bool on = false; static uint32_t nextAt = 0, offAt = 0;
   if (!g_alertMask || !g_featureBuzzer) { if (on) { hal_buzzer(false); on = false; } return; }
   const uint32_t now = millis();
-  if (!on && now >= nextAt) { hal_buzzer(true); on = true; offAt = now + 120; nextAt = now + 2000; }
-  else if (on && now >= offAt) { hal_buzzer(false); on = false; }
+  if (!on && (int32_t)(now - nextAt) >= 0) { hal_buzzer(true); on = true; offAt = now + 120; nextAt = now + 2000; }   // wrap-sicher
+  else if (on && (int32_t)(now - offAt) >= 0) { hal_buzzer(false); on = false; }
 }
 
 static void drawDataRow(int y, const char* label, const char* value, uint16_t col) {
@@ -2119,7 +2179,7 @@ static void drawMotorPage() {
     // Untere zwei Zeilen: FESTE Position + Groesse 3 (Karsten 8.7., Fotos aus dem Bus:
     // bei GROESSE=115% schob M_Y sie unter die Einbaublende, und sie waren zu klein).
     char tv[32];
-    if (millis() < g_tripArmUntil) {
+    if (g_tripArmUntil && (int32_t)(millis() - g_tripArmUntil) < 0) {
       strcpy(tv, "TRIP NULLEN? UNTEN HALTEN");
       drawTextCentered(240, 388, tv, TACH_RED, 2);
     } else {
@@ -2155,7 +2215,7 @@ static void drawMotorPage() {
 
   // CAN-Status + Abgastemp vom Hub (klein, Luecke zwischen TEMP/VOLT-Gauges) - nur
   // ueber HTTP verfuegbar, das 0x510-CAN-Frame hat dafuer (noch) keinen Platz.
-  if (fresh && g_showCanTemp) {
+  if (httpFresh() && g_showCanTemp) {   // Werte kommen NUR ueber HTTP - bei totem WLAN keine stale Temp als aktuell zeigen
     char ct[20];
     snprintf(ct, sizeof(ct), "%s %dC", g_hubCanReady ? "CAN OK" : "CAN --", (int)g_hubExhaustTempC);
     drawTextCentered(240, M_Y(324), ct, g_hubCanReady ? t.txtDim : TACH_RED, M_F(2));
@@ -2180,7 +2240,7 @@ static void drawMotorPage() {
   // FESTE Position + Groesse 3 (Karsten 8.7., Fotos aus dem Bus: bei GROESSE=115%
   // schob M_Y die Zeilen unter die Einbaublende, und sie waren zu klein).
   char line[32];
-  if (millis() < g_tripArmUntil) {
+  if (g_tripArmUntil && (int32_t)(millis() - g_tripArmUntil) < 0) {
     strcpy(line, "TRIP NULLEN? UNTEN HALTEN");
     drawTextCentered(240, 388, line, TACH_RED, 2);
   } else {
@@ -2224,13 +2284,15 @@ static bool     g_trendShowRpm = true;   // Drehzahl-Kontextlinie zeigen (NVS tr
 
 static void trendSample() {              // jeden Loop aufrufen; sampelt selbst getaktet
   static uint32_t at = 0;
-  if (millis() < at) return;
+  if ((int32_t)(millis() - at) < 0) return;   // wrap-sicher
   at = millis() + 500;
   bool fresh = httpFresh() || canFresh() || bleFresh() || tune123Fresh();
   int lx = (fresh && g_lambdaValid) ? (int)lroundf(g_lambda * 100.0f) : 0;
   g_trLam[g_trHead] = (uint8_t)constrain(lx, 0, 255);
-  g_trRpm[g_trHead] = (uint16_t)constrain((int)lroundf(g_rpm), 0, 9999);
-  g_trMap[g_trHead] = (uint8_t)constrain((int)lroundf(g_map), 0, 250);
+  // RPM/MAP nur bei frischer Quelle in die Historie - sonst schreiben stale Werte
+  // eine flache Linie in den Verlauf, die wie konstante Fahrt aussieht (Review 16.7.).
+  g_trRpm[g_trHead] = fresh ? (uint16_t)constrain((int)lroundf(g_rpm), 0, 9999) : 0;
+  g_trMap[g_trHead] = fresh ? (uint8_t)constrain((int)lroundf(g_map), 0, 250)   : 0;
   g_trHead = (g_trHead + 1) % TR_N;
   if (g_trCount < TR_N) g_trCount++;
 }
@@ -2269,7 +2331,8 @@ static void drawTrendPage() {
   drawTextCentered(240, 44, tt, RGB565(200, 200, 205), 2);
   drawTextSmall(TR_PX0, 62, "TIP OBEN = ZEIT", RGB565(90, 90, 100), 1);
   drawTextCentered(168, 92, hb, lc, 5);
-  char rb[12]; snprintf(rb, sizeof(rb), "%d", (int)lroundf(g_rpm));
+  char rb[12];
+  if (live) snprintf(rb, sizeof(rb), "%d", (int)lroundf(g_rpm)); else strcpy(rb, "--");   // stale RPM nicht als aktuell zeigen
   drawTextCentered(338, 86, rb, RGB565(120, 170, 230), 3);
   drawTextCentered(338, 116, g_trendShowMap ? "1/min kPa" : "1/min", RGB565(110, 110, 120), 1);
   // Soll-Band (Dev-Tab: g_alLamMin..g_alLamMax) + Stoechiometrie 1.0
@@ -3976,6 +4039,12 @@ static void handleWebLive() {
 }
 
 static void startWebServer() {
+  // Handler nur EINMAL registrieren: WebServer gibt alte RequestHandler nie frei -
+  // jeder WiFi-AUS/AN-Zyklus (saveFeatures setzt g_webStarted zurueck) haette sonst
+  // alle ~12 Handler erneut angehaengt und ein paar hundert Bytes Heap geleakt.
+  static bool handlersRegistered = false;
+  if (handlersRegistered) { webServer.begin(); return; }
+  handlersRegistered = true;
   webServer.on("/",        handleWebRoot);
   webServer.on("/screen",  handleWebScreen);
   webServer.on("/live",    handleWebLive);
@@ -4431,7 +4500,7 @@ void loop() {
           // 2. Langdruck innerhalb 5 s bestaetigt -> Teilstrecke am Hub nullen
           touchLongHandled = true;
           lastTouch = nowMs;
-          if (millis() < g_tripArmUntil) {
+          if (g_tripArmUntil && (int32_t)(millis() - g_tripArmUntil) < 0) {
             g_tripArmUntil = 0;
             tripResetOnHub();
           } else {
@@ -4651,11 +4720,11 @@ void loop() {
 
   // WLAN-Seite live halten (WPS-Status / IP aktualisieren)
   { static uint32_t wlanRedrawAt = 0;
-    if (currentPage == 11 && millis() > wlanRedrawAt) { wlanRedrawAt = millis() + 1200; drawWlanPage(); } }
+    if (currentPage == 11 && (int32_t)(millis() - wlanRedrawAt) > 0) { wlanRedrawAt = millis() + 1200; drawWlanPage(); } }   // wrap-sicher
 
   // CAN-Seite live halten (RX-Zaehler / Fehler / LIVE-Status)
   { static uint32_t canRedrawAt = 0;
-    if (currentPage == 13 && millis() > canRedrawAt) { canRedrawAt = millis() + 1000; drawCanPage(); } }
+    if (currentPage == 13 && (int32_t)(millis() - canRedrawAt) > 0) { canRedrawAt = millis() + 1000; drawCanPage(); } }   // wrap-sicher
 
   // Auto-Cockpit: bei laufendem Motor automatisch aufs Motor-Display (von Uhr/Menue)
   autoCockpitTick();
