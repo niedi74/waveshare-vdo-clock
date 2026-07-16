@@ -2217,11 +2217,12 @@ static void drawMotorPage() {
   // ueber HTTP verfuegbar, das 0x510-CAN-Frame hat dafuer (noch) keinen Platz.
   if (httpFresh() && g_showCanTemp) {   // Werte kommen NUR ueber HTTP - bei totem WLAN keine stale Temp als aktuell zeigen
     char ct[12];
-    // Zweizeilig (Karsten 16.7.): schmaler, passt besser in die Luecke zwischen den Gauges
-    drawTextCentered(240, M_Y(310), g_hubCanReady ? "CAN OK" : "CAN --",
+    // Zweizeilig, direkt unter dem Lambda-Wert (Karsten 16.7.: gehoert zusammen -
+    // CAN-Status + Abgastemp SIND die Lambda-Messkette)
+    drawTextCentered(240, M_Y(280), g_hubCanReady ? "CAN OK" : "CAN --",
                      g_hubCanReady ? t.txtDim : TACH_RED, M_F(2));
     snprintf(ct, sizeof(ct), "%dC", (int)g_hubExhaustTempC);
-    drawTextCentered(240, M_Y(334), ct, g_hubCanReady ? t.txtDim : TACH_RED, M_F(2));
+    drawTextCentered(240, M_Y(302), ct, g_hubCanReady ? t.txtDim : TACH_RED, M_F(2));
   }
 
   // Lambda zentral
