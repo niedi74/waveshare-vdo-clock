@@ -632,12 +632,13 @@ static void applyCockpitCanFrame(const twai_message_t& msg) {
     g_adv = advX10 / 10.0f;
     g_map = msg.data[6];
   }
-  // SIM-Latch: das 0x510-Frame traegt KEIN Sim-Bit - der Hub speist im lambda_test-
-  // Modus dieselbe Simulation auch in den CAN-Pfad. Solange der (langsamere) HTTP-Poll
-  // frisch ist und lambda_test_active meldet, darf CAN das SIM-Label nicht wegbuegeln,
-  // sonst wiederholt sich der Vergaser-Vorfall vom 14.7. ueber den zweiten Pfad.
-  if (!httpFresh()) g_hubLambdaSim = false;   // ohne frisches HTTP kein belastbares Sim-Wissen mehr
-  g_lastSrc     = (g_hubLambdaSim) ? "SIM" : "CAN";
+  // Sim-Erkennung (Sicherheitskontrakt nach Vergaser-Vorfall 14.7.): der Hub setzt
+  // im lambda_test-Modus Bit 4 im flags-Byte (flags & 0x10, siehe Hub-Doku
+  // lambda-status-logik.md). Fallback fuer aeltere Hub-FW ohne Sim-Bit: HTTP-Latch
+  // (solange frisches HTTP lambda_test_active meldet, bleibt SIM stehen).
+  if (flags & 0x10)          g_hubLambdaSim = true;
+  else if (!httpFresh())     g_hubLambdaSim = false;   // kein Sim-Bit + kein HTTP-Wissen -> echt
+  g_lastSrc     = g_hubLambdaSim ? "SIM" : "CAN";
   g_canRx++;
   g_canLastRxMs = millis();
 }
@@ -905,7 +906,9 @@ static void httpPollTick() {
     // Fahrt. "lambda_test_active" kommt direkt vom HUB (unabhaengig vom eigenen
     // Test-Hub-Schalter!) - ueberschreibt die Quellenanzeige IMMER mit "SIM", auch
     // wenn der Display selbst denkt er redet mit dem echten Live-Hub.
-    g_hubLambdaSim = jsonTrue(bc, "lambda_test_active");
+    // Sicherheitskontrakt (Hub-Doku lambda-status-logik.md): echte Lambda-Daten haben
+    // source=="CAN". lambda_test (TEST) und DEMO sind Simulation -> Quelle "SIM" zeigen.
+    g_hubLambdaSim = jsonTrue(bc, "lambda_test_active") || strstr(bc, "\"source\":\"DEMO\"") != nullptr;
     if (g_hubLambdaSim) g_lastSrc = "SIM";
     g_httpRx++;
     if (g_httpRx == 1) Serial.printf("HTTP: erste Daten von %s\n", tgt.c_str());
