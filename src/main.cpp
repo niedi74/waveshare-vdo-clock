@@ -3366,7 +3366,12 @@ static void handleWebRoot() {
     "a{color:#8cf}.val{font-size:1.6em;color:#e0c040}"
     ".tabs{display:flex;flex-wrap:wrap;justify-content:center;gap:4px;max-width:440px;margin:10px auto}"
     ".tabbtn{background:#333;color:#eee;padding:10px 16px}"
-    ".tab{display:none}.tab.on{display:block}</style></head><body>");
+    ".tab{display:none}.tab.on{display:block}"
+    ".i{display:inline-block;width:18px;height:18px;line-height:18px;border-radius:50%;"
+    "background:#345;color:#8cf;font-size:12px;font-weight:700;cursor:pointer;margin-left:6px;text-align:center}"
+    ".ht{display:none;color:#9ab;font-size:.82em;text-align:left;background:#161616;"
+    "border-left:3px solid #345;border-radius:0 6px 6px 0;padding:6px 10px;margin:4px 0 8px 6px}"
+    ".ht.on{display:block}</style></head><body>");
   html += F("<h1>VDO Quartz-Zeit</h1>");
   html += "<div class='card'><div class='big'>" + String(timeStr) + "</div>";
   html += "<div>IP " + String(g_ipStr) + "</div></div>";
@@ -3498,20 +3503,38 @@ static void handleWebRoot() {
             "<input type='hidden' name='fsave' value='1'>");
   html += "<p><label><input type='checkbox' name='wifi' value='1' ";
   html += g_featureWifi ? "checked" : "";
-  html += F("> WLAN/Web aktiv</label></p><p><label>"
+  html += F("> WLAN/Web aktiv</label>"
+    "<span class='i' onclick='ih(this)'>i</span>"
+    "<span class='ht'>Schaltet WLAN + diese WebGUI ganz ab. Ohne WLAN keine Hub-Daten per "
+    "HTTP &ndash; nur noch CAN/BLE. Normal AN lassen.</span></p><p><label>"
     "<input type='checkbox' name='ble' value='1' ");
   html += g_featureBle ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> BLE-Hub Daten aktiv</label></p><p><label>"
+  html += F(" onchange='this.form.submit()'> BLE-Hub Daten aktiv</label>"
+    "<span class='i' onclick='ih(this)'>i</span>"
+    "<span class='ht'>Kabelloser <b>Reserve-Weg</b> zum Hub per Bluetooth, falls WLAN UND CAN "
+    "ausfallen. Kostet Funk-/Rechenzeit (Anzeige kann ruckeln) &rarr; nur einschalten wenn ohne "
+    "CAN-Kabel gefahren wird. Am Schreibtisch/mit CAN: AUS.</span></p><p><label>"
     "<input type='checkbox' name='buzzer' value='1' ");
   html += g_featureBuzzer ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> Buzzer (Shake-Alarm) aktiv</label></p><p><label>"
+  html += F(" onchange='this.form.submit()'> Buzzer (Shake-Alarm) aktiv</label>"
+    "<span class='i' onclick='ih(this)'>i</span>"
+    "<span class='ht'>Summer piept bei Alarm (Lambda/Drehzahl/Temp/Volt au&szlig;er Grenze). "
+    "Ohne Haken bleibt nur der rote Warnring auf dem Display.</span></p><p><label>"
     "<input type='checkbox' name='f123' value='1' ");
   html += g_feature123 ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> 123TUNE+ direkt (Fallback bei Hub-Ausfall)</label></p><p><label>"
+  html += F(" onchange='this.form.submit()'> 123TUNE+ direkt (Fallback bei Hub-Ausfall)</label>"
+    "<span class='i' onclick='ih(this)'>i</span>"
+    "<span class='ht'>Letzter Notweg: Display verbindet sich per BLE <b>direkt mit der "
+    "123ignition-Z&uuml;ndbox</b> (nicht mit dem Hub) &ndash; liefert Drehzahl/ZZP/MAP, aber "
+    "<b>kein Lambda</b>. Greift nur wenn HTTP + CAN + BLE-Hub alle tot sind. Normal AUS.</span></p><p><label>"
     "<input type='checkbox' name='wauto' value='1' ");
   html += g_wifiAuto ? "checked" : "";
-  html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label></p>"
-    "<div style='color:#888'>WLAN-Auto verbindet automatisch das verf&uuml;gbare Netz nach Priorit&auml;t.</div>"
+  html += F(" onchange='this.form.submit()'> WLAN-Auto (S24 &gt; Heim &gt; Hub-AP)</label>"
+    "<span class='i' onclick='ih(this)'>i</span>"
+    "<span class='ht'>Sucht automatisch das beste bekannte Netz und wechselt bei Verlust. "
+    "<b>Nachteil:</b> pendelt am Schreibtisch st&auml;ndig Heim&harr;Hub-AP &rarr; kurze "
+    "&quot;kein Hub&quot;-Aussetzer. F&uuml;r festen Betrieb an EINEM Netz (z.B. nur Hub-AP im "
+    "Bus): <b>AUS</b> und Profil per Setup/WLAN-Tab fest w&auml;hlen.</span></p>"
     "<button type='submit'>Speichern</button></form></div>");
   html += F("<div class='card'><h3>Firmware-Update (OTA)</h3>"
     "<form method='POST' action='/update' enctype='multipart/form-data'>"
@@ -3664,13 +3687,22 @@ static void handleWebRoot() {
              (unsigned long)g_canRx, (unsigned long)g_canIgnored);
     html += cs;
   }
-  html += F("</label></p>"
+  html += F("</label>"
+    "<span class='i' onclick='ih(this)'>i</span>"
+    "<span class='ht'>Motordaten &uuml;bers CAN-Kabel (0x510 vom Hub, GPIO43/44). Der Fahr-Weg "
+    "im Bus. Ohne Kabel: AUS lassen (z&auml;hlt sonst nur Fehler).</span></p>"
     "<p>Modus: <select name='canmode' style='padding:6px;border:0;border-radius:6px'>"
     "<option value='1'");
   html += g_canListenOnly ? " selected" : "";
-  html += F(">listen-only (Bus mit Spartan-ACK)</option><option value='0'");
+  html += F(">LISTEN (nur mith&ouml;ren)</option><option value='0'");
   html += g_canListenOnly ? "" : " selected";
-  html += F(">NORMAL/ACK (2-Knoten-Pr&uuml;fstand)</option></select></p>"
+  html += F(">NORMAL/ACK (empfohlen)</option></select>"
+    "<span class='i' onclick='ih(this)'>i</span>"
+    "<span class='ht'><b>NORMAL/ACK</b> = Display best&auml;tigt jeden Frame (schickt das "
+    "ACK-Bit zur&uuml;ck). <b>Immer diesen nehmen, wenn nur Hub + Display am Bus h&auml;ngen</b> "
+    "&ndash; sonst sammelt der Hub tausende TX-Fehler.<br><b>LISTEN</b> = h&ouml;rt nur zu, "
+    "best&auml;tigt nichts. Nur sinnvoll wenn ein anderes Ger&auml;t schon ACKt (gr&ouml;&szlig;erer "
+    "Bus).</span></p>"
     "<p>ID 0x<input name='canid' value='");
   { char idb[8]; snprintf(idb, sizeof(idb), "%03X", g_canId); html += idb; }
   html += F("' style='width:60px;padding:6px;border:0;border-radius:6px'> &nbsp; Bitrate "
@@ -3696,7 +3728,9 @@ static void handleWebRoot() {
     "<br><b>Tacho:</b> roter Bereich + Skalenende wirken auf alle Kombi-Stile.</div></div></div>");
 
   html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p>"
-    "<script>function sh(t,b){var x=document.querySelectorAll('.tab');"
+    "<script>function ih(e){var d=e.nextElementSibling;"
+    "d.className=d.className.indexOf('on')<0?'ht on':'ht';}"
+    "function sh(t,b){var x=document.querySelectorAll('.tab');"
     "for(var i=0;i<x.length;i++)x[i].className='tab';"
     "document.getElementById('t-'+t).className='tab on';"
     "var y=document.querySelectorAll('.tabbtn');"
