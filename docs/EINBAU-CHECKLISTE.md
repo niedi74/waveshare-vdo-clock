@@ -29,15 +29,15 @@ Wenn beides gleichzeitig auftritt = zwei Baustellen, getrennt abarbeiten.
    I2C-Bus → LCD-Reset/Expander spinnt → **Display schwarz/eingefroren**.
 2. **Nicht kreuzen**: H↔H, L↔L (der SN65HVD230 ist ein CAN-Transceiver, kein UART!).
    GPIO43=TXD/D, GPIO44=RXD/R.
-3. **Termination messen** (alles stromlos, Multimeter CAN-H ↔ CAN-L):
-   | Messwert | Bedeutung |
-   |---|---|
-   | **~60 Ω** | ✅ korrekt (beide Enden je 120 Ω) |
-   | ~120 Ω | nur ein Ende → zweite Termination (Spartan) einschalten |
-   | ~40 Ω | einer zu viel |
-   | offen/∞ | keine Termination |
-   Ziel: **~60 Ω**. Display hat fest 120 Ω → der Spartan muss das andere Ende
-   terminieren (Spartan v3 hat schaltbaren Abschluss — ggf. einschalten).
+3. **Termination**: Display-Ende hat fest 120 Ω. Der **Spartan 3 terminiert das
+   andere Ende ab Werk selbst** (Abschlusswiderstand default AKTIV; beim ADV per
+   Serial-Kommando `SETCANR1`/`SETCANR0` schaltbar, kein Jumper). Bei nur
+   Hub+Display am Bus: Spartan-Termination AN lassen = beide Enden ok.
+   **ACHTUNG Messung:** Der Spartan-Abschluss ist ein ELEKTRONISCHER Widerstand —
+   stromlos gemessen zeigt er ~120 Ω für ~8 s und faellt dann auf 0 (14Point7-
+   Forum). Die klassische stromlose 60-Ω-Messung ist am Spartan daher NICHT
+   aussagekraeftig. Verlaesslicher: Funktionstest (canRx zaehlt, rx_err=0,
+   Hub-TX-Fehler stabil bei ACK-Modus).
 4. **Display-CAN-Modus = NORMAL/ACK** (nicht LISTEN!). Bei nur Hub + Display am Bus
    muss das Display die Frames bestätigen, sonst sammelt der Hub tausende TX-Fehler.
    WebGUI Dev-Tab → CAN → Modus, oder Serial `can:normal`.
