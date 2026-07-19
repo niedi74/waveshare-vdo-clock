@@ -836,7 +836,14 @@ static void httpPollTick() {
   // dauernd (Timeout) -> Touch wird traege. Bei Erfolg wieder flott (500ms).
   // 2500 < 3000 (httpFresh-Fenster): sonst blinkte die Anzeige nach Hub-Erholung
   // periodisch 1s auf "KEIN HUB", weil der Backoff das Fenster ueberdauerte.
-  const uint32_t interval = (failStreak >= 3) ? 2500 : 500;
+  // Freeze-Schutz (Karsten, Bus 18.7.): liefert CAN gerade frische Daten, dann traegt
+  // CAN die kritischen Werte (Lambda/Drehzahl/ADV/MAP/Status) - HTTP wird nur noch fuer
+  // Temp/Volt/Speed/Trip gebraucht. Darum bei frischem CAN nur alle 2s pollen: der
+  // blockierende GET trifft den Loop ~4x seltener -> Einfrieren bei schwachem WLAN
+  // deutlich reduziert, Extras bleiben aktuell. 2000 < 3000 -> kein "KEIN HUB"-Blinken.
+  uint32_t interval = 500;
+  if (failStreak >= 3)   interval = 2500;
+  else if (canFresh())   interval = 2000;
   if (millis() - last < interval) return;
   last = millis();
 
