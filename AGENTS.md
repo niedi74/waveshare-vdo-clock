@@ -69,6 +69,13 @@ Displays verbinden nach Reboot bevorzugt zum Hub-AP (WLAN-Auto) — wenn eins
 Commit-Messages auf Deutsch (Anlass → Fix → Verifikation), Abschluss:
 `Co-Authored-By: Claude <Modell> <noreply@anthropic.com>`
 
+## Einbau/Fehlersuche
+
+Beim Anschluss im Fahrzeug (CAN, Lambda-Sonde, WLAN) → `docs/EINBAU-CHECKLISTE.md`.
+Kernpunkt: Lambda-Sonde (am Spartan) und CAN-Bus (Hub↔Display) sind elektrisch
+getrennt — loser Sonden-Stecker = falsches Lambda, CAN-Problem = "kein Hub"/Freeze;
+nicht verwechseln. Die FW macht die Klassen am Display unterscheidbar (Quelle + Lambda-Status).
+
 ## Bekannte Fallstricke
 
 - `HAL_EXIO_SD_CS` ist laut Schaltplan evtl. um 1 Bit verschoben — SD läuft
