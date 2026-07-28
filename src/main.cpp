@@ -2857,11 +2857,12 @@ static void handleKbTap(uint16_t x, uint16_t y) {
 }
 
 // ===== WLAN-Seite (Page 11): Buttons WPS / SSID / Passwort / Profil / Zurueck =====
+static void saveFeatures(bool wifi, bool ble, bool buzzer);   // fwd - fuer WLAN-AUS/AN-Button
 #define WLAN_BTN_X 108
 #define WLAN_BTN_W 264
-#define WLAN_BTN_H 48
-#define WLAN_BTN_N 5
-static const int WLAN_BTN_Y[WLAN_BTN_N] = { 146, 200, 254, 308, 362 };
+#define WLAN_BTN_H 42
+#define WLAN_BTN_N 6
+static const int WLAN_BTN_Y[WLAN_BTN_N] = { 140, 186, 232, 278, 324, 370 };
 
 static void drawWlanPage() {
   if (!ensureFrame()) return;
@@ -2875,12 +2876,14 @@ static void drawWlanPage() {
   if (conn) snprintf(l, sizeof(l), "verbunden  %s", g_ipStr); else snprintf(l, sizeof(l), "nicht verbunden");
   drawTextCentered(240, 114, l, conn ? RGB565(120, 220, 140) : RGB565(225, 150, 120), 2);
   const char* lbl[WLAN_BTN_N]  = { "Netze scannen", "SSID tippen", "Passwort tippen",
-                                   "Profil wechseln", "Zurueck" };
+                                   "Profil wechseln", g_featureWifi ? "WLAN AUS" : "WLAN AN",
+                                   "Zurueck" };
   const uint16_t bg[WLAN_BTN_N] = { RGB565(40,110,60), RGB565(50,95,140), RGB565(55,80,120),
-                                    RGB565(70,70,78), RGB565(95,60,55) };
+                                    RGB565(70,70,78), g_featureWifi ? RGB565(120,55,45) : RGB565(45,110,70),
+                                    RGB565(95,60,55) };
   for (int i = 0; i < WLAN_BTN_N; i++) {
     fillRectFast(WLAN_BTN_X, WLAN_BTN_Y[i], WLAN_BTN_W, WLAN_BTN_H, bg[i]);
-    drawTextCentered(240, WLAN_BTN_Y[i] + 16, lbl[i], RGB565(240, 240, 235), 2);
+    drawTextCentered(240, WLAN_BTN_Y[i] + 13, lbl[i], RGB565(240, 240, 235), 2);
   }
   presentFrame();
 }
@@ -2981,6 +2984,13 @@ static void handleWlanTap(uint16_t x, uint16_t y) {
     else if (i == 1) { openKeyboard(g_wifiProfile, 0); }                 // SSID (-> danach PW)
     else if (i == 2) { openKeyboard(g_wifiProfile, 1); }                 // nur Passwort
     else if (i == 3) { cycleWifiProfile();  drawWlanPage(); }            // naechstes Profil
+    else if (i == 4) {                                                  // WLAN AUS/AN - direkt
+                                                                        // am Display, ohne WebGUI
+                                                                        // (fuer instabiles Hub-WLAN:
+                                                                        // komplett auf CAN umschalten)
+      saveFeatures(!g_featureWifi, g_featureBle, g_featureBuzzer);
+      drawWlanPage();
+    }
     else             { currentPage = 5;     drawSetupPage(); }           // zurueck -> Setup
     return;
   }
