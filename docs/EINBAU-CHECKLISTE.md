@@ -1,5 +1,10 @@
 # Einbau- & Fehlersuch-Checkliste (VDO-Display im T2b)
 
+**Datenweg-Priorität (Karsten 17.7.): CAN ist der primäre Kommunikationspfad im
+Fahrbetrieb — WLAN/HTTP ist nur Troubleshooting/Setup-Werkzeug**, kein Dauerbetrieb-
+Pfad. Grund: WLAN zum Hub kann instabil sein und dabei das Frontend blockieren
+(siehe Abschnitt C). Direkt am Touch abschaltbar: Setup → WIFI → „WLAN AUS".
+
 Schritt-für-Schritt beim Einbau/Anschluss abhaken. Hintergrund: Vorfall 14.7. —
 Display lief einen Tag gut, dann nach Anschluss von CAN + Reed + loser Lambda-
 Sonde plötzlich falsche Lambda-Werte (→ Vergaser verstellt) + Einfrieren. Ursache

@@ -6,8 +6,13 @@ Cockpit-Display für einen VW T2b (Vergaser-Boxer): rundes 2,8"-Touch-Display
 (Waveshare ESP32-S3-Touch-LCD-2.8C, 480×480, ST7701) repliziert die originale
 VDO-"Quartz-Zeit"-Uhr und zeigt live Motordaten vom Spartan3-Hub
 (Schwester-Projekt `spartan3v2-can-adapter`):
-- **HTTP-Poll** `/api/status` vom Hub (primär, 2 Hz)
 - **CAN 0x510** (TWAI, GPIO43/44, 500k — Adern **nicht kreuzen**, `can:normal` für ACK)
+  ist der **primäre Datenweg im Fahrbetrieb** (Karsten 17.7.: robust, kein Funk nötig)
+- **HTTP-Poll** `/api/status` vom Hub (WLAN) ist **Troubleshooting/Setup-Werkzeug**,
+  nicht der Haupt-Datenweg — im Code technisch weiterhin bevorzugt, wenn beides
+  frisch ist (kein hartes CAN-only im Code), operativ aber bewusst zweitrangig.
+  Direkt am Touch abschaltbar (Setup→WIFI→„WLAN AUS"), falls instabiles Hub-WLAN
+  das Frontend blockiert (siehe `touch-hang-http-block`-Memory).
 - **BLE-Hub** und **123TUNE+-direkt** als optionale Fallbacks
 - 6 Kombi-Stile (DIGITAL/VDO/123TUNE+/VDO+UHR/DIGIFIZ/OPEL GSI), Lambda-Verlauf,
   Nachtmodus (grüne Birne), Alarme mit Buzzer, WebGUI, OTA, SD-Log, IMU
