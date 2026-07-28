@@ -66,8 +66,24 @@ void qmi8658Read(void) {
     g_imuGyro.y = gy * gyroScale;
     g_imuGyro.z = gz * gyroScale;
 
-    g_imuPitch = atan2(g_imuAccel.y, sqrt(g_imuAccel.x*g_imuAccel.x + g_imuAccel.z*g_imuAccel.z)) * 180.0 / PI;
-    g_imuRoll  = atan2(-g_imuAccel.x, g_imuAccel.z) * 180.0 / PI;
+    // Rohe Neigung aus dem Beschleunigungssensor - der spuert JEDE Erschuetterung
+    // (Motorvibration, Schlagloch, Bremsen), nicht nur die Schwerkraft-Neigung.
+    // Ohne Filter sprang die Anzeige deswegen bei jeder Unebenheit (Karsten 19.7.:
+    // "reagiert wie ein Pflummi"). Tiefpass (exponentiell gleitender Mittelwert)
+    // daempft schnelle Ausschlaege, laesst echte (langsame) Steigungsaenderungen
+    // durch. alpha=0.10 ist ein erster Wert zum Nachjustieren waehrend der Fahrt -
+    // kleiner=ruhiger/traeger, groesser=direkter/zittriger.
+    const float rawPitch = atan2(g_imuAccel.y, sqrt(g_imuAccel.x*g_imuAccel.x + g_imuAccel.z*g_imuAccel.z)) * 180.0 / PI;
+    const float rawRoll  = atan2(-g_imuAccel.x, g_imuAccel.z) * 180.0 / PI;
+    static bool  smInit = false;
+    const float  alpha  = 0.10f;
+    if (!smInit) { g_imuPitch = rawPitch; g_imuRoll = rawRoll; smInit = true; }
+    else {
+      g_imuPitch += alpha * (rawPitch - g_imuPitch);
+      g_imuRoll  += alpha * (rawRoll  - g_imuRoll);
+    }
+    // GForce bewusst UNGEFILTERT lassen - die Shake-Erkennung (qmi8658ShakeDetected)
+    // braucht genau die kurzen Spitzen, die der Pitch/Roll-Filter oben rausdaempft.
     g_imuGForce = sqrt(g_imuAccel.x*g_imuAccel.x + g_imuAccel.y*g_imuAccel.y + g_imuAccel.z*g_imuAccel.z);
 }
 
