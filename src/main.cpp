@@ -632,15 +632,43 @@ static void applyCockpitCanFrame(const twai_message_t& msg) {
     g_adv = advX10 / 10.0f;
     g_map = msg.data[6];
   }
-  // Sim-Erkennung (Sicherheitskontrakt nach Vergaser-Vorfall 14.7.): der Hub setzt
-  // im lambda_test-Modus Bit 4 im flags-Byte (flags & 0x10, siehe Hub-Doku
-  // lambda-status-logik.md). Fallback fuer aeltere Hub-FW ohne Sim-Bit: HTTP-Latch
-  // (solange frisches HTTP lambda_test_active meldet, bleibt SIM stehen).
-  if (flags & 0x10)          g_hubLambdaSim = true;
-  else if (!httpFresh())     g_hubLambdaSim = false;   // kein Sim-Bit + kein HTTP-Wissen -> echt
+  // Sim-Erkennung (Sicherheitskontrakt nach Vergaser-Vorfall 14.7.): Bit4 im flags-
+  // Byte ist kCockpitFlagRealCan (siehe Hub-Repo include/hub_can.h) - GESETZT (1)
+  // heisst ECHTER Spartan-CAN-Wert, GELOESCHT (0) heisst Demo/lambda_test/ADC-
+  // Fallback = SIMULIERT. Polung bewusst so gewaehlt (Hub-Team): ein Bit-Ausfall/
+  // Reset auf 0 loest im Zweifel SIM aus, nie umgekehrt "still real". Frueherer
+  // Code hier hatte die Polung invertiert (Bit gesetzt faelschlich als SIM
+  // gewertet) - waere im Ernstfall STILL geblieben statt SIM anzuzeigen, wenn
+  // echte Daten kamen, und haette SIM nie angezeigt wenn wirklich simuliert
+  // wurde. Fallback fuer aeltere Hub-FW ohne dieses Bit: HTTP-Latch (solange
+  // frisches HTTP lambda_test_active meldet, bleibt SIM stehen).
+  if (!(flags & 0x10))       g_hubLambdaSim = true;                 // Bit NICHT gesetzt = simuliert
+  else if (!httpFresh())     g_hubLambdaSim = false;   // Bit gesetzt + kein HTTP-Widerspruch -> echt
   g_lastSrc     = g_hubLambdaSim ? "SIM" : "CAN";
   g_canRx++;
   g_canLastRxMs = millis();
+}
+
+// Ext-Frame (ID = g_canId+1, z.B. 0x511, siehe Hub-Repo include/hub_can.h):
+// 123-Volt/Temp/Coil + Geschwindigkeit - bisher nur per HTTP verfuegbar, jetzt
+// auch per CAN (Karsten 19.7.: CAN ist der primaere Datenweg, WLAN nur
+// Troubleshooting - diese Werte sollen ohne WLAN nicht fehlen).
+//   [0-1] tune_volt_x100 (uint16)   [2] tune_temp_c (int8)  [3] tune_coil_x10 (uint8)
+//   [4-5] speed_kmh_x10 (uint16)    [6] flags: Bit0=TuneFresh   [7] reserviert
+static void applyCockpitExtFrame(const twai_message_t& msg) {
+  const uint16_t voltX100 = ((uint16_t)msg.data[0] << 8) | msg.data[1];
+  const int8_t   tempC    = (int8_t)msg.data[2];
+  const uint8_t  coilX10  = msg.data[3];
+  const uint16_t speedX10 = ((uint16_t)msg.data[4] << 8) | msg.data[5];
+  const uint8_t  flags    = msg.data[6];
+  if (flags & 0x01) {                 // TuneFresh
+    g_g123Volt  = voltX100 / 100.0f;
+    g_g123Temp  = (float)tempC;
+    g_g123Coil  = coilX10 / 10.0f;
+    g_g123Valid = true;
+  }
+  g_speedKmh   = speedX10 / 10.0f;
+  g_speedValid = true;
 }
 
 static void cockpitCanTick() {
@@ -672,8 +700,10 @@ static void cockpitCanTick() {
   uint8_t drained = 0;
   while (drained < 8 && twai_receive(&msg, 0) == ESP_OK) {
     drained++;
-    if (msg.extd || msg.rtr || msg.identifier != g_canId || msg.data_length_code != 8) { g_canIgnored++; continue; }
-    applyCockpitCanFrame(msg);
+    if (msg.extd || msg.rtr || msg.data_length_code != 8) { g_canIgnored++; continue; }
+    if      (msg.identifier == g_canId)                            applyCockpitCanFrame(msg);
+    else if (msg.identifier == (uint32_t)(g_canId + 1) && g_canId < 0x7FE) applyCockpitExtFrame(msg);
+    else { g_canIgnored++; continue; }
   }
 }
 
@@ -724,8 +754,10 @@ static void runCanPing() {
 
 // IMU-Werte periodisch aufs CAN senden, damit der Hub sie mitloggen kann. Nur im
 // NORMAL-Modus moeglich: TWAI_MODE_LISTEN_ONLY verbietet jede eigene Uebertragung
-// (ESP-IDF-Doku). ID = Cockpit-ID+1 - wandert automatisch mit, falls g_canId je
-// umgestellt wird. Fire-and-forget (Timeout 0): blockiert den Loop nie.
+// (ESP-IDF-Doku). ID = Cockpit-ID+3 (NICHT +1/+2 - die sind laut Hub-Repo
+// include/hub_can.h als Hub->Display-Ext-Frames belegt, 0x511/0x512; +3 wandert
+// automatisch mit, falls g_canId je umgestellt wird). Fire-and-forget (Timeout 0):
+// blockiert den Loop nie.
 static void imuCanTxTick() {
   static uint32_t at = 0;
   if (!g_featureCan || !g_canReady || g_canListenOnly || !g_imuPresent) return;
@@ -736,7 +768,7 @@ static void imuCanTxTick() {
   int16_t  rollX10  = (int16_t)lroundf((g_imuRoll  - g_imuOffRoll)  * 10.0f);
   uint16_t gX100    = (uint16_t)constrain((int)lroundf(g_imuGForce * 100.0f), 0, 65535);
   twai_message_t m = {};
-  m.identifier = (g_canId < 0x7FF) ? (uint32_t)(g_canId + 1) : g_canId;
+  m.identifier = (g_canId < 0x7FC) ? (uint32_t)(g_canId + 3) : g_canId;
   m.data_length_code = 6;
   m.data[0] = (uint8_t)(pitchX10 >> 8); m.data[1] = (uint8_t)pitchX10;
   m.data[2] = (uint8_t)(rollX10  >> 8); m.data[3] = (uint8_t)rollX10;
