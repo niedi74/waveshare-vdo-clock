@@ -2476,8 +2476,10 @@ static void drawTrendPage() {
   presentFrame();
 }
 
+static void drawTunePage();   // fwd - Live-Tuning ist Lambda-Stil 2, Definition weiter unten
 static void drawLambdaPage() {
   if (g_lambdaStyle == 1) { drawTrendPage(); return; }
+  if (g_lambdaStyle == 2) { drawTunePage();  return; }
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(45, 150, 70));
@@ -2539,10 +2541,12 @@ static void drawHubPage() {
   presentFrame();
 }
 
-// Setup-Zeilen: EINE Tabelle fuer Zeichnung UND Touch-Zonen (handleSetupLongPress
-// liest dieselben Y-Werte) - eine verschobene Zeile kann den Touch nicht mehr brechen.
-// 0=UHR 1=HELL 2=ROT 3=WIFI 4=BLE 5=CAN 6=BUZZER 7=IMU0 8=AKKU 9=NACHT 10=WARN 11=ROT AB
-static const int SETUP_ROW_Y[12] = { 96, 120, 144, 168, 192, 216, 240, 264, 288, 312, 336, 360 };
+// Setup ist auf 2 Seiten aufgeteilt (Karsten 19.7.: eine Seite mit 12 Zeilen war zu
+// voll). Seite 1 (hier, Page 5) = Kernfunktionen + "MEHR"-Zeile zur Seite 2.
+// Je EINE Tabelle fuer Zeichnung UND Touch-Zonen (Zeile verschieben kann den Touch
+// nicht mehr brechen).
+// Seite 1: 0=UHR 1=HELL 2=ROT 3=WIFI 4=BLE 5=CAN 6=BUZZER 7=MEHR
+static const int SETUP1_ROW_Y[8] = { 104, 136, 168, 200, 232, 264, 296, 328 };
 static void drawSetupPage() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
@@ -2550,34 +2554,47 @@ static void drawSetupPage() {
   drawTextCentered(240, 50, "SETUP", RGB565(230, 190, 70), 5);
   char buf[28];
   snprintf(buf, sizeof(buf), "%d %%", g_dialScalePct);
-  drawDataRow(SETUP_ROW_Y[0], "UHR",   buf, RGB565(235, 235, 225));
+  drawDataRow(SETUP1_ROW_Y[0], "UHR",   buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d %%", g_brightnessPct);
-  drawDataRow(SETUP_ROW_Y[1], "HELL",  buf, RGB565(235, 235, 225));
+  drawDataRow(SETUP1_ROW_Y[1], "HELL",  buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d DEG", g_rotationDeg);
-  drawDataRow(SETUP_ROW_Y[2], "ROT",   buf, RGB565(235, 235, 225));
+  drawDataRow(SETUP1_ROW_Y[2], "ROT",   buf, RGB565(235, 235, 225));
   if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
     snprintf(buf, sizeof(buf), "%s", WPROF_LABELS[g_wifiProfile]);
-    drawDataRow(SETUP_ROW_Y[3], "WIFI", buf,
+    drawDataRow(SETUP1_ROW_Y[3], "WIFI", buf,
                 WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   } else {
-    drawDataRow(SETUP_ROW_Y[3], "WIFI", "AUS", RGB565(220, 130, 50));
+    drawDataRow(SETUP1_ROW_Y[3], "WIFI", "AUS", RGB565(220, 130, 50));
   }
-  drawDataRow(SETUP_ROW_Y[4], "BLE",    g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
+  drawDataRow(SETUP1_ROW_Y[4], "BLE",    g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
               g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   // CAN: TIP zyklisch AUS -> AN (listen) -> ACK (normal) -> AUS
-  drawDataRow(SETUP_ROW_Y[5], "CAN",
+  drawDataRow(SETUP1_ROW_Y[5], "CAN",
               !g_featureCan ? "AUS" : canFresh() ? (g_canListenOnly ? "OK" : "OK·ACK")
                                                  : (g_canListenOnly ? "AN" : "ACK"),
               !g_featureCan ? RGB565(150, 150, 150)
                             : canFresh() ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawDataRow(SETUP_ROW_Y[6], "BUZZER", g_featureBuzzer ? "AN" : "AUS",
+  drawDataRow(SETUP1_ROW_Y[6], "BUZZER", g_featureBuzzer ? "AN" : "AUS",
               g_featureBuzzer ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
+  drawDataRow(SETUP1_ROW_Y[7], "MEHR",   ">>", RGB565(200, 170, 90));
+  drawTextCentered(240, 402, "TIP MENU", RGB565(180, 180, 170), 2);
+  presentFrame();
+}
+
+// Seite 2 (Page 18): 0=IMU0 1=BAT/USB 2=NACHT 3=WARN 4=ROT AB
+static const int SETUP2_ROW_Y[5] = { 120, 176, 232, 288, 344 };
+static void drawSetupPage2() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
+  drawTextCentered(240, 50, "SETUP 2", RGB565(230, 190, 70), 4);
+  char buf[28];
   if (g_imuPresent) {
     qmi8658Read();
     snprintf(buf, sizeof(buf), "%+.1f DEG", g_imuPitch - g_imuOffPitch);
-    drawDataRow(SETUP_ROW_Y[7], "IMU 0", buf, RGB565(235, 235, 225));   // TIP = aktuelle Lage nullen
+    drawDataRow(SETUP2_ROW_Y[0], "IMU 0", buf, RGB565(235, 235, 225));   // TIP = aktuelle Lage nullen
   } else {
-    drawDataRow(SETUP_ROW_Y[7], "IMU 0", "---", RGB565(150, 150, 150));
+    drawDataRow(SETUP2_ROW_Y[0], "IMU 0", "---", RGB565(150, 150, 150));
   }
   boardBattRead();
   char bb[20];
@@ -2586,18 +2603,18 @@ static void drawSetupPage() {
   // 7.7.: 4.19V trotz abgezogenem Akku). Nur bei reinem Akkubetrieb (USB ab)
   // ist der Wert die echte Zellenspannung. Deshalb neutral: nur Spannung zeigen.
   snprintf(bb, sizeof(bb), "%.2fV", g_boardBattVolt);
-  drawDataRow(SETUP_ROW_Y[8], "BAT/USB", bb, RGB565(180, 180, 170));
-  // WARN: Alarme (Lambda/Drehzahl/Temp/Volt) global an/aus, TIP toggelt direkt
-  drawDataRow(SETUP_ROW_Y[10], "WARN", g_alertsOn ? "AN" : "AUS",
-              g_alertsOn ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
-  // ROT AB: Tacho-Grenzdrehzahl fuer den roten Bereich -> eigene Justage-Seite
-  snprintf(buf, sizeof(buf), "%d /min", g_rpmRedline);
-  drawDataRow(SETUP_ROW_Y[11], "ROT AB", buf, RGB565(235, 235, 225));
+  drawDataRow(SETUP2_ROW_Y[1], "BAT/USB", bb, RGB565(180, 180, 170));
   // NACHT: TIP an/aus, HALTEN = Grundhelligkeit (Dimmer) einen Schritt weiter
   if (g_nightMode) snprintf(buf, sizeof(buf), "AN %d%%", g_nightFloorPct);
   else             snprintf(buf, sizeof(buf), "AUS");
-  drawDataRow(SETUP_ROW_Y[9], "NACHT", buf, g_nightMode ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
-  drawTextCentered(240, 402, "TIP MENU", RGB565(180, 180, 170), 2);
+  drawDataRow(SETUP2_ROW_Y[2], "NACHT", buf, g_nightMode ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
+  // WARN: Alarme (Lambda/Drehzahl/Temp/Volt) global an/aus, TIP toggelt direkt
+  drawDataRow(SETUP2_ROW_Y[3], "WARN", g_alertsOn ? "AN" : "AUS",
+              g_alertsOn ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
+  // ROT AB: Tacho-Grenzdrehzahl fuer den roten Bereich -> eigene Justage-Seite
+  snprintf(buf, sizeof(buf), "%d /min", g_rpmRedline);
+  drawDataRow(SETUP2_ROW_Y[4], "ROT AB", buf, RGB565(235, 235, 225));
+  drawTextCentered(240, 402, "TIP UNTEN ZURUECK", RGB565(180, 180, 170), 2);
   presentFrame();
 }
 
@@ -2813,7 +2830,7 @@ static void drawNightAdjustPage() {
   presentFrame();
 }
 static void handleNightAdjustTap(uint16_t x, uint16_t y) {
-  if (y >= 398) { currentPage = 5; drawSetupPage(); return; }        // unten -> Setup
+  if (y >= 398) { currentPage = 18; drawSetupPage2(); return; }      // unten -> Setup Seite 2
   if (y >= 116 && y < 182)      saveNightMode(!g_nightMode);         // grosse Kachel -> An/Aus
   else if (y >= 288 && y < 334) saveNightFloor(g_nightFloorPct + (x >= 240 ? 5 : -5));  // Dimmer +/-5%
   drawNightAdjustPage();
@@ -2847,7 +2864,7 @@ static void drawRpmAdjustPage() {
   presentFrame();
 }
 static void handleRpmAdjustTap(uint16_t x, uint16_t y) {
-  if (y >= 398) { currentPage = 5; drawSetupPage(); return; }        // unten -> Setup
+  if (y >= 398) { currentPage = 18; drawSetupPage2(); return; }      // unten -> Setup Seite 2
   if (y >= 280 && y < 326) saveRpmRedline(g_rpmRedline + (x >= 240 ? 100 : -100));
   drawRpmAdjustPage();
 }
@@ -2870,10 +2887,12 @@ static void drawTunePage() {
   const bool active = g_tuneModeConfirmed;
   drawAdjBtn(120, 96, 240, 60, active ? "AKTIV" : "AUS",
              active ? RGB565(60, 210, 100) : RGB565(90, 90, 90));
-  if (g_tuneWantActive != g_tuneModeConfirmed)
-    drawTextCentered(240, 164, "...wartet auf Hub-Bestaetigung", RGB565(220, 160, 60), 1);
+  // Kein Bit5 trotz Wunsch = Hub hat abgelehnt (kein BLE-Streaming zur 123), nicht
+  // nur "wartet" - Hub-Team 19.7.: sendTuneRaw() lehnt sauber ab, Bit5 bleibt 0.
+  if (g_tuneWantActive && !g_tuneModeConfirmed)
+    drawTextCentered(240, 164, "abgelehnt - 123 nicht verbunden?", TACH_RED, 1);
   char buf[16];
-  drawTextCentered(240, 202, "SCHRITTE (bestaetigt)", RGB565(150, 150, 150), 1);
+  drawTextCentered(240, 202, "SCHRITTE (bestaetigt, max +-10)", RGB565(150, 150, 150), 1);
   snprintf(buf, sizeof(buf), "%+d", (int)g_tuneAdvSteps);
   drawTextCentered(240, 236, buf, RGB565(235, 235, 225), 6);
   const uint16_t minus = RGB565(210, 120, 60), plus = RGB565(90, 195, 110);
@@ -2884,13 +2903,15 @@ static void drawTunePage() {
     drawTextCentered(240, 356, "CAN AUS/LISTEN - kein Senden moeglich", TACH_RED, 1);
   else if (!canFresh())
     drawTextCentered(240, 356, "kein CAN-Empfang vom Hub", RGB565(220, 130, 50), 1);
-  drawTextCentered(240, 414, "TIP UNTEN ZURUECK", RGB565(180, 180, 170), 2);
+  drawTextCentered(240, 414, "LANGER DRUCK MITTE = NAECHSTER STIL", RGB565(120, 120, 120), 1);
   presentFrame();
 }
+// Tune-Bedienzonen liegen NUR bei aktivem Stil 2 im Touch-Dispatch scharf (siehe
+// currentPage==3-Block im Hauptloop) - andere Taps auf dieser Lambda-Seite blaettern
+// wie gewohnt zur naechsten Datenseite weiter.
 static void handleTuneTap(uint16_t x, uint16_t y) {
-  if (y >= 398) { currentPage = 5; drawSetupPage(); return; }        // unten -> Setup
-  if (y >= 96 && y < 156) { toggleTuneMode(); drawTunePage(); return; }
-  if (y >= 292 && y < 338) {
+  if (y >= 96 && y < 156) { toggleTuneMode(); }
+  else if (y >= 292 && y < 338) {
     if      (x < 192) sendTuneCmd(2);   // "-"  Schritt runter
     else if (x < 288) sendTuneCmd(3);   // RESET
     else               sendTuneCmd(1);   // "+"  Schritt hoch
@@ -3163,6 +3184,7 @@ static void drawCurrentPage() {
   else if (currentPage == 3) drawLambdaPage();
   else if (currentPage == 4) drawHubPage();
   else if (currentPage == 5) drawSetupPage();
+  else if (currentPage == 18) drawSetupPage2();
   else if (currentPage == 6) drawImuPage();
   else if (currentPage == 7) drawAdjustPage();
   else if (currentPage == 10) drawKeyboardPage();
@@ -3171,7 +3193,6 @@ static void drawCurrentPage() {
   else if (currentPage == 13) drawCanPage();
   else if (currentPage == 14) drawNightAdjustPage();
   else if (currentPage == 16) drawRpmAdjustPage();
-  else if (currentPage == 17) drawTunePage();
 }
 
 // -------- Preferences --------
@@ -3235,8 +3256,8 @@ static void loadSettings() {
   g_rpmScaleMax = p.getInt("sc_rpm", 8000);
   if (g_rpmScaleMax < 3000 || g_rpmScaleMax > 12000) g_rpmScaleMax = 8000;
   if (g_rpmRedline < 1000 || g_rpmRedline > g_rpmScaleMax) g_rpmRedline = g_rpmScaleMax * 3 / 4;
-  g_lambdaStyle   = p.getUChar("lstyle", 0);          // 0=Gauge, 1=Verlauf
-  if (g_lambdaStyle > 1) g_lambdaStyle = 0;
+  g_lambdaStyle   = p.getUChar("lstyle", 0);          // 0=Gauge, 1=Verlauf, 2=Live-Tuning
+  if (g_lambdaStyle > 2) g_lambdaStyle = 0;
   g_trendWindowS  = p.getUShort("tr_win", 60);        // Lambda-Verlauf: Fensterbreite
   if (g_trendWindowS != 60 && g_trendWindowS != 120 && g_trendWindowS != 180 && g_trendWindowS != 300) g_trendWindowS = 60;
   g_trendShowMap  = p.getBool("tr_map", false);       // Saugrohrdruck mit anzeigen
@@ -3318,8 +3339,9 @@ static void saveMotorStyle(int style) {
   p.end();
 }
 
-static void saveLambdaStyle(int s) {       // 0=Gauge, 1=Verlauf
-  g_lambdaStyle = (uint8_t)(s & 1);
+static void saveLambdaStyle(int s) {       // 0=Gauge, 1=Verlauf, 2=Live-Tuning
+  if (s < 0) s = 2; if (s > 2) s = 0;       // zyklisch, kein Maskieren mehr (war 0/1 per &1)
+  g_lambdaStyle = (uint8_t)s;
   Preferences p;
   p.begin("clock", false);
   p.putUChar("lstyle", g_lambdaStyle);
@@ -3970,10 +3992,11 @@ static void handleWebSet() {
     g_redrawPage = true;
     Serial.printf("Web: Motor-Stil = %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
   }
-  if (webServer.hasArg("lstyle")) {             // Lambda-Stil (0=Gauge, 1=Verlauf/Kurve) - wie Motor-Stil fernsetzbar
-    saveLambdaStyle(webServer.arg("lstyle").toInt() ? 1 : 0);
+  if (webServer.hasArg("lstyle")) {             // Lambda-Stil (0=Gauge 1=Verlauf 2=Live-Tuning) - wie Motor-Stil fernsetzbar
+    saveLambdaStyle(webServer.arg("lstyle").toInt());
     g_redrawPage = true;
-    Serial.printf("Web: Lambda-Stil = %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
+    const char* lsNames[3] = { "Gauge", "Verlauf", "Live-Tuning" };
+    Serial.printf("Web: Lambda-Stil = %u (%s)\n", g_lambdaStyle, lsNames[g_lambdaStyle]);
   }
   if (webServer.hasArg("imunull")) {
     saveImuNull();
@@ -4114,7 +4137,7 @@ static void handleWebPage() {
     int page = webServer.arg("p").toInt();
     // Nur echte Seiten: 8/9 existieren nicht (Display friert ein), 10 (Tastatur)
     // braucht openKeyboard-Kontext, 12 (Scan) einen vorherigen Scan-Lauf.
-    if ((page >= 0 && page <= 7) || page == 11 || page == 13 || page == 14 || page == 16 || page == 17) {
+    if ((page >= 0 && page <= 7) || page == 11 || page == 13 || page == 14 || page == 16 || page == 18) {
       currentPage  = static_cast<uint8_t>(page);
       g_redrawPage = true;
       Serial.printf("Web: page=%u\n", currentPage);
@@ -4383,8 +4406,8 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
   }
   // Zeile aus derselben Tabelle bestimmen, mit der drawSetupPage zeichnet
   int row = -1;
-  for (int i = 0; i < 12; i++)
-    if ((int)y >= SETUP_ROW_Y[i] - 11 && (int)y < SETUP_ROW_Y[i] + 11) { row = i; break; }
+  for (int i = 0; i < 8; i++)
+    if ((int)y >= SETUP1_ROW_Y[i] - 15 && (int)y < SETUP1_ROW_Y[i] + 15) { row = i; break; }
 
   switch (row) {
     case 0:                             // UHR -> Justage-Seite (Groesse/Rotation fein)
@@ -4410,52 +4433,71 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
       drawSetupPage();
       Serial.printf("setup tap: ble=%s\n", g_featureBle ? "on" : "off");
       break;
-    case 5:                             // CAN -> CAN-Seite (Status + Schalter); HALTEN -> TUNE
-      if (isLong) {
-        currentPage = 17;
-        drawTunePage();
-        Serial.println("setup hold: -> TUNE-Seite");
-      } else {
-        currentPage = 13;
-        drawCanPage();
-        Serial.println("setup tap: -> CAN-Seite");
-      }
+    case 5:                             // CAN -> CAN-Seite (Status + Schalter)
+      currentPage = 13;
+      drawCanPage();
+      Serial.println("setup tap: -> CAN-Seite");
       break;
     case 6:                             // BUZZER an/aus
       saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
       drawSetupPage();
       Serial.printf("setup tap: buzzer=%s\n", g_featureBuzzer ? "on" : "off");
       break;
-    case 7:                             // IMU 0 -> Einbaulage nullen
-      saveImuNull();
-      drawSetupPage();
-      Serial.println("setup tap: IMU NULL");
-      break;
-    case 8:                             // AKKU - nur Info, keine Aktion
-      drawSetupPage();
-      Serial.println("setup tap: akku (info only)");
-      break;
-    case 9:                             // NACHT -> eigene Justage-Seite (An/Aus + Dimmer), wie UHR/ROT
-      currentPage = 14;
-      drawNightAdjustPage();
-      Serial.println("setup tap: -> Nacht-Justage");
-      break;
-    case 10: {                          // WARN: Alarme (Lambda/Drehzahl/Temp/Volt) global an/aus
-      g_alertsOn = !g_alertsOn;
-      if (!g_alertsOn) { g_alertMask = 0; g_alertText[0] = 0; }
-      Preferences pw; pw.begin("clock", false); pw.putBool("alerts", g_alertsOn); pw.end();
-      Serial.printf("setup tap: Alarme=%s\n", g_alertsOn ? "an" : "aus");
-      drawSetupPage();
-      break;
-    }
-    case 11:                            // ROT AB -> eigene Justage-Seite (Tacho-Grenzdrehzahl)
-      currentPage = 16;
-      drawRpmAdjustPage();
-      Serial.println("setup tap: -> Tacho-Justage");
+    case 7:                             // MEHR -> Setup Seite 2
+      currentPage = 18;
+      drawSetupPage2();
+      Serial.println("setup tap: -> Setup 2");
       break;
     default:
       drawSetupPage();
       Serial.println("setup tap: no action");
+  }
+}
+
+// Setup Seite 2 (Page 18): IMU0/BAT-USB/NACHT/WARN/ROT AB. Kein Long-Press-Sonder-
+// verhalten mehr noetig - einfache Tap-Zonen wie bei den meisten anderen Unterseiten.
+static void handleSetupPage2Tap(uint16_t y) {
+  if (y >= 380) {                       // unten -> zurueck zu Setup Seite 1
+    currentPage = 5;
+    drawSetupPage();
+    Serial.println("setup2 tap: -> Setup 1");
+    return;
+  }
+  int row = -1;
+  for (int i = 0; i < 5; i++)
+    if ((int)y >= SETUP2_ROW_Y[i] - 22 && (int)y < SETUP2_ROW_Y[i] + 22) { row = i; break; }
+
+  switch (row) {
+    case 0:                             // IMU 0 -> Einbaulage nullen
+      saveImuNull();
+      drawSetupPage2();
+      Serial.println("setup2 tap: IMU NULL");
+      break;
+    case 1:                             // BAT/USB - nur Info, keine Aktion
+      drawSetupPage2();
+      Serial.println("setup2 tap: akku (info only)");
+      break;
+    case 2:                             // NACHT -> eigene Justage-Seite (An/Aus + Dimmer)
+      currentPage = 14;
+      drawNightAdjustPage();
+      Serial.println("setup2 tap: -> Nacht-Justage");
+      break;
+    case 3: {                           // WARN: Alarme (Lambda/Drehzahl/Temp/Volt) global an/aus
+      g_alertsOn = !g_alertsOn;
+      if (!g_alertsOn) { g_alertMask = 0; g_alertText[0] = 0; }
+      Preferences pw; pw.begin("clock", false); pw.putBool("alerts", g_alertsOn); pw.end();
+      Serial.printf("setup2 tap: Alarme=%s\n", g_alertsOn ? "an" : "aus");
+      drawSetupPage2();
+      break;
+    }
+    case 4:                             // ROT AB -> eigene Justage-Seite (Tacho-Grenzdrehzahl)
+      currentPage = 16;
+      drawRpmAdjustPage();
+      Serial.println("setup2 tap: -> Tacho-Justage");
+      break;
+    default:
+      drawSetupPage2();
+      Serial.println("setup2 tap: no action");
   }
 }
 
@@ -4749,14 +4791,15 @@ void loop() {
           drawMotorPage();
         }
       } else if (currentPage == 3) {
-        // LAMBDA: langer Druck in die Mitte -> Gauge <-> Verlauf umschalten
+        // LAMBDA: langer Druck in die Mitte -> Stil zyklen Gauge->Verlauf->Live-Tuning->Gauge
         const int dx = (int)touchLastX - 240, dy = (int)touchLastY - 240;
         if (dx * dx + dy * dy <= 95 * 95) {
           touchLongHandled = true;
           lastTouch = nowMs;
-          saveLambdaStyle(g_lambdaStyle ^ 1);
+          saveLambdaStyle(g_lambdaStyle + 1);
           drawLambdaPage();
-          Serial.printf("lambda long-press -> Stil %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
+          const char* names[3] = { "Gauge", "Verlauf", "Live-Tuning" };
+          Serial.printf("lambda long-press -> Stil %u (%s)\n", g_lambdaStyle, names[g_lambdaStyle]);
         }
       }
     }
@@ -4801,8 +4844,11 @@ void loop() {
         handleNightAdjustTap(tapX, tapY);   // Nacht-Justage (An/Aus + Dimmer)
       } else if (currentPage == 16) {
         handleRpmAdjustTap(tapX, tapY);     // Tacho-Justage (Rot-ab-Grenze)
-      } else if (currentPage == 17) {
-        handleTuneTap(tapX, tapY);          // Live-Tuning (Zuendwinkel per CAN)
+      } else if (currentPage == 18) {
+        handleSetupPage2Tap(tapY);          // Setup Seite 2 (IMU0/BAT/NACHT/WARN/ROT AB)
+      } else if (currentPage == 3 && g_lambdaStyle == 2 &&
+                 ((tapY >= 96 && tapY < 156) || (tapY >= 292 && tapY < 338))) {
+        handleTuneTap(tapX, tapY);          // Live-Tuning: nur in den Bedienzonen, sonst Seiten-Weiterblaettern
       } else if (currentPage == 3 && g_lambdaStyle == 1 && tapY < 132) {
         // Verlauf: Tap in den Kopfbereich -> Zeitfenster 60/120/180/300s zyklen
         cycleTrendWindow();
@@ -4925,8 +4971,9 @@ void loop() {
         else if (cmd.startsWith("style:")) { saveMotorStyle(cmd.substring(6).toInt());
                                              Serial.printf("Motor-Stil = %u (%s)\n", g_motorStyle, MOTOR_STYLE_NAMES[g_motorStyle]);
                                              if (currentPage == 2) drawMotorPage(); }
-        else if (cmd.startsWith("lambda:")) { saveLambdaStyle(cmd.substring(7).toInt() ? 1 : 0);
-                                             Serial.printf("Lambda-Stil = %u (%s)\n", g_lambdaStyle, g_lambdaStyle ? "Verlauf" : "Gauge");
+        else if (cmd.startsWith("lambda:")) { saveLambdaStyle(cmd.substring(7).toInt());
+                                             const char* lsNames[3] = { "Gauge", "Verlauf", "Live-Tuning" };
+                                             Serial.printf("Lambda-Stil = %u (%s)\n", g_lambdaStyle, lsNames[g_lambdaStyle]);
                                              if (currentPage == 3) drawLambdaPage(); }
         else if (cmd.startsWith("trend:win ")) { saveTrendCfg((uint16_t)cmd.substring(10).toInt(), g_trendShowMap, g_trendShowRpm);
                                              Serial.printf("Trend-Fenster = %ds\n", g_trendWindowS);
@@ -4951,7 +4998,7 @@ void loop() {
             nightMaskEnsure(); g_redrawPage = true;
             Serial.printf("Nachtmodus-Grundhelligkeit = %d%%\n", v);
           } else Serial.println("night:10..85 (Grundhelligkeit %)"); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:show | wifi:set <slot> <SSID>|<Pass> | wifi:next|off | wauto:on|off | ap:on | scan | thub:show|on|off | thub:ip <ip> | rot:+|-|NN | clock | motor | style:0..5 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:ping | can:rx | can:normal|listen | lambda:0|1 | night:on|off|NN | reboot"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:show | wifi:set <slot> <SSID>|<Pass> | wifi:next|off | wauto:on|off | ap:on | scan | thub:show|on|off | thub:ip <ip> | rot:+|-|NN | clock | motor | style:0..5 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:ping | can:rx | can:normal|listen | lambda:0|1|2 | night:on|off|NN | reboot"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
