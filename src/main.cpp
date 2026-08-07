@@ -115,6 +115,16 @@ static uint32_t g_canRx         = 0;
 static uint32_t g_canIgnored    = 0;
 static uint32_t g_canLastRxMs   = 0;
 
+// -------- Live-Tuning (0x513 Display->Hub, Karsten 19.7. mit Hub-Team abgestimmt) --------
+// ID = Cockpit-ID+3 (0x513 bei Standard-0x510). Byte0: 0=Ping(Dead-Man) 1=Schritt hoch
+// 2=Schritt runter 3=Reset 4=Modus umschalten. Dead-Man-Timeout am Hub: exakt 60000ms -
+// Ping alle 10-15s pflicht solange g_tuneWantActive. Bestaetigung kommt NICHT vom TX
+// selbst, sondern vom naechsten 0x510 (Bit5=Modus) bzw. 0x511 (Byte7=Schritte).
+static bool  g_tuneWantActive     = false;  // Anzeige-Wunsch (Toggle-Taste) - authoritativ ist g_tuneModeConfirmed
+static bool  g_tuneModeConfirmed  = false;  // vom Hub bestaetigt (0x510 Bit5)
+static int8_t g_tuneAdvSteps      = 0;      // vom Hub bestaetigt (0x511 Byte7)
+static uint32_t g_tuneLastPingMs  = 0;
+
 // -------- HTTP-Poll-Client (zieht /api/status vom Spartan-Hub) --------
 // g_hubIp darf eine IP ODER ein mDNS-Hostname sein (z.B. "spartanhub.local") -
 // per Hostname findet das Display den Hub in jedem Subnetz (Handy-Hotspot!).
@@ -645,6 +655,9 @@ static void applyCockpitCanFrame(const twai_message_t& msg) {
   if (!(flags & 0x10))       g_hubLambdaSim = true;                 // Bit NICHT gesetzt = simuliert
   else if (!httpFresh())     g_hubLambdaSim = false;   // Bit gesetzt + kein HTTP-Widerspruch -> echt
   g_lastSrc     = g_hubLambdaSim ? "SIM" : "CAN";
+  // Bit 5 (0x20) = Live-Tuning-Modus gerade aktiv - direkte Antwort auf 0x513-
+  // Kommando 4 (Modus umschalten). Siehe sendTuneCmd()/tuneCanTick().
+  g_tuneModeConfirmed = (flags & 0x20) != 0;
   g_canRx++;
   g_canLastRxMs = millis();
 }
@@ -654,7 +667,7 @@ static void applyCockpitCanFrame(const twai_message_t& msg) {
 // auch per CAN (Karsten 19.7.: CAN ist der primaere Datenweg, WLAN nur
 // Troubleshooting - diese Werte sollen ohne WLAN nicht fehlen).
 //   [0-1] tune_volt_x100 (uint16)   [2] tune_temp_c (int8)  [3] tune_coil_x10 (uint8)
-//   [4-5] speed_kmh_x10 (uint16)    [6] flags: Bit0=TuneFresh   [7] reserviert
+//   [4-5] speed_kmh_x10 (uint16)    [6] flags: Bit0=TuneFresh   [7] tune_adv_steps (int8)
 static void applyCockpitExtFrame(const twai_message_t& msg) {
   const uint16_t voltX100 = ((uint16_t)msg.data[0] << 8) | msg.data[1];
   const int8_t   tempC    = (int8_t)msg.data[2];
@@ -669,6 +682,9 @@ static void applyCockpitExtFrame(const twai_message_t& msg) {
   }
   g_speedKmh   = speedX10 / 10.0f;
   g_speedValid = true;
+  // tune_adv_steps: direkte Antwort auf 0x513-Kommando 1/2/3 (Schritt hoch/runter/
+  // Reset) - aktuell kommandierte Zuendwinkel-Schritte relativ zum Basiswert.
+  g_tuneAdvSteps = (int8_t)msg.data[7];
 }
 
 static void cockpitCanTick() {
@@ -754,8 +770,9 @@ static void runCanPing() {
 
 // IMU-Werte periodisch aufs CAN senden, damit der Hub sie mitloggen kann. Nur im
 // NORMAL-Modus moeglich: TWAI_MODE_LISTEN_ONLY verbietet jede eigene Uebertragung
-// (ESP-IDF-Doku). ID = Cockpit-ID+3 (NICHT +1/+2 - die sind laut Hub-Repo
-// include/hub_can.h als Hub->Display-Ext-Frames belegt, 0x511/0x512; +3 wandert
+// (ESP-IDF-Doku). ID = Cockpit-ID+4 (NICHT +1/+2 - die sind laut Hub-Repo
+// include/hub_can.h als Hub->Display-Ext-Frames belegt, 0x511/0x512; +3 gehoert seit
+// 19.7. dem Live-Tuning-Kommando 0x513, s.u. - IMU deshalb auf +4 verschoben, wandert
 // automatisch mit, falls g_canId je umgestellt wird). Fire-and-forget (Timeout 0):
 // blockiert den Loop nie.
 static void imuCanTxTick() {
@@ -768,13 +785,39 @@ static void imuCanTxTick() {
   int16_t  rollX10  = (int16_t)lroundf((g_imuRoll  - g_imuOffRoll)  * 10.0f);
   uint16_t gX100    = (uint16_t)constrain((int)lroundf(g_imuGForce * 100.0f), 0, 65535);
   twai_message_t m = {};
-  m.identifier = (g_canId < 0x7FC) ? (uint32_t)(g_canId + 3) : g_canId;
+  m.identifier = (g_canId < 0x7FB) ? (uint32_t)(g_canId + 4) : g_canId;
   m.data_length_code = 6;
   m.data[0] = (uint8_t)(pitchX10 >> 8); m.data[1] = (uint8_t)pitchX10;
   m.data[2] = (uint8_t)(rollX10  >> 8); m.data[3] = (uint8_t)rollX10;
   m.data[4] = (uint8_t)(gX100    >> 8); m.data[5] = (uint8_t)gX100;
   m.ss = 1;   // Single-Shot: kein Retransmit-Sturm wenn der Bus kurz stoert (naechster Wert kommt eh in 200ms)
   twai_transmit(&m, 0);
+}
+
+// Live-Tuning-Kommando senden (0x513 = Cockpit-ID+3). cmd: 0=Ping 1=Schritt hoch
+// 2=Schritt runter 3=Reset 4=Modus umschalten. DLC=8 (restliche Bytes 0) - passt
+// zum Muster der uebrigen Cockpit-Frames, auch wenn nur Byte0 belegt ist.
+// Fire-and-forget + Single-Shot: ein verlorenes Kommando/Ping stoert nicht, das
+// naechste folgt in kurzem Abstand (Taste erneut, bzw. tuneCanTick alle ~12s).
+static void sendTuneCmd(uint8_t cmd) {
+  if (!g_featureCan || !g_canReady || g_canListenOnly) return;
+  twai_message_t m = {};
+  m.identifier = (g_canId < 0x7FC) ? (uint32_t)(g_canId + 3) : g_canId;
+  m.data_length_code = 8;
+  m.data[0] = cmd;
+  m.ss = 1;
+  twai_transmit(&m, 0);
+}
+
+// Dead-Man-Keepalive: solange der Live-Tuning-Modus vom Display GEWUENSCHT ist,
+// alle 12s ein Ping (Byte0=0) senden - Hub-Timeout ist exakt 60000ms, 12s laesst
+// reichlich Luft fuer verlorene Frames. Laeuft unabhaengig davon, ob der Hub die
+// Bestaetigung (0x510 Bit5) schon geschickt hat.
+static void tuneCanTick() {
+  if (!g_tuneWantActive) return;
+  if (g_tuneLastPingMs != 0 && (int32_t)(millis() - g_tuneLastPingMs) < 12000) return;   // wrap-sicher
+  g_tuneLastPingMs = millis();
+  sendTuneCmd(0);
 }
 
 // -------- HTTP-Poll-Client --------
@@ -2498,8 +2541,8 @@ static void drawHubPage() {
 
 // Setup-Zeilen: EINE Tabelle fuer Zeichnung UND Touch-Zonen (handleSetupLongPress
 // liest dieselben Y-Werte) - eine verschobene Zeile kann den Touch nicht mehr brechen.
-// 0=UHR 1=HELL 2=ROT 3=WIFI 4=BLE 5=CAN 6=BUZZER 7=IMU0 8=AKKU 9=NACHT
-static const int SETUP_ROW_Y[10] = { 100, 128, 156, 184, 212, 240, 268, 296, 324, 352 };
+// 0=UHR 1=HELL 2=ROT 3=WIFI 4=BLE 5=CAN 6=BUZZER 7=IMU0 8=AKKU 9=NACHT 10=WARN 11=ROT AB
+static const int SETUP_ROW_Y[12] = { 96, 120, 144, 168, 192, 216, 240, 264, 288, 312, 336, 360 };
 static void drawSetupPage() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
@@ -2544,6 +2587,12 @@ static void drawSetupPage() {
   // ist der Wert die echte Zellenspannung. Deshalb neutral: nur Spannung zeigen.
   snprintf(bb, sizeof(bb), "%.2fV", g_boardBattVolt);
   drawDataRow(SETUP_ROW_Y[8], "BAT/USB", bb, RGB565(180, 180, 170));
+  // WARN: Alarme (Lambda/Drehzahl/Temp/Volt) global an/aus, TIP toggelt direkt
+  drawDataRow(SETUP_ROW_Y[10], "WARN", g_alertsOn ? "AN" : "AUS",
+              g_alertsOn ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
+  // ROT AB: Tacho-Grenzdrehzahl fuer den roten Bereich -> eigene Justage-Seite
+  snprintf(buf, sizeof(buf), "%d /min", g_rpmRedline);
+  drawDataRow(SETUP_ROW_Y[11], "ROT AB", buf, RGB565(235, 235, 225));
   // NACHT: TIP an/aus, HALTEN = Grundhelligkeit (Dimmer) einen Schritt weiter
   if (g_nightMode) snprintf(buf, sizeof(buf), "AN %d%%", g_nightFloorPct);
   else             snprintf(buf, sizeof(buf), "AUS");
@@ -2768,6 +2817,85 @@ static void handleNightAdjustTap(uint16_t x, uint16_t y) {
   if (y >= 116 && y < 182)      saveNightMode(!g_nightMode);         // grosse Kachel -> An/Aus
   else if (y >= 288 && y < 334) saveNightFloor(g_nightFloorPct + (x >= 240 ? 5 : -5));  // Dimmer +/-5%
   drawNightAdjustPage();
+}
+
+// Tacho-Justage-Seite: Grenzdrehzahl, ab der der Tacho rot wird (+/-100 /min).
+// Eigene Seite statt nur Setup-Zeile, gleiches Muster wie Nachtmodus - grosse
+// Zahl gut lesbar/treffbar waehrend der Fahrt.
+static void saveRpmRedline(int v) {
+  if (v < 1000) v = 1000;
+  if (v > g_rpmScaleMax) v = g_rpmScaleMax;   // nie ueber das Tacho-Skalenende hinaus
+  g_rpmRedline = v;
+  Preferences p; p.begin("clock", false); p.putInt("rl_rpm", g_rpmRedline); p.end();
+}
+static void drawRpmAdjustPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(180, 60, 50));
+  drawTextCentered(240, 44, "TACHO ROT AB", RGB565(220, 90, 70), 4);
+  drawTextCentered(240, 92, "GRENZDREHZAHL FUER ROTEN BEREICH", RGB565(140, 140, 140), 1);
+  char buf[16];
+  const uint16_t minus = RGB565(210, 120, 60), plus = RGB565(90, 195, 110);
+  snprintf(buf, sizeof(buf), "%d", g_rpmRedline);
+  drawTextCentered(240, 190, buf, RGB565(235, 235, 225), 7);
+  drawTextCentered(240, 240, "/min", RGB565(150, 150, 150), 2);
+  drawAdjBtn(120, 280, 90, 46, "-100", minus);
+  drawAdjBtn(270, 280, 90, 46, "+100", plus);
+  char sc[24]; snprintf(sc, sizeof(sc), "Skalenende: %d /min", g_rpmScaleMax);
+  drawTextCentered(240, 348, sc, RGB565(120, 120, 120), 1);
+  drawTextCentered(240, 414, "TIP UNTEN ZURUECK", RGB565(180, 180, 170), 2);
+  presentFrame();
+}
+static void handleRpmAdjustTap(uint16_t x, uint16_t y) {
+  if (y >= 398) { currentPage = 5; drawSetupPage(); return; }        // unten -> Setup
+  if (y >= 280 && y < 326) saveRpmRedline(g_rpmRedline + (x >= 240 ? 100 : -100));
+  drawRpmAdjustPage();
+}
+
+// Live-Tuning-Seite (Page 17): Zuendwinkel der 123ignition per CAN live verstellen.
+// Erreichbar ueber Setup -> CAN-Zeile HALTEN. Sendet 0x513-Kommandos, zeigt die vom
+// Hub bestaetigten Werte (nicht den lokalen Wunsch - der Hub hat das letzte Wort).
+static void toggleTuneMode() {
+  g_tuneWantActive = !g_tuneWantActive;
+  sendTuneCmd(4);                      // Kommando 4 = Modus umschalten
+  if (g_tuneWantActive) g_tuneLastPingMs = millis();   // Keepalive-Takt startet jetzt
+  Serial.printf("TUNE: Modus gewuenscht=%s (0x513 Kommando 4 gesendet)\n", g_tuneWantActive ? "an" : "aus");
+}
+static void drawTunePage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(80, 170, 220));
+  drawTextCentered(240, 44, "LIVE-TUNING", RGB565(120, 200, 240), 3);
+  drawTextCentered(240, 76, "ZUENDWINKEL PER CAN", RGB565(140, 140, 140), 1);
+  const bool active = g_tuneModeConfirmed;
+  drawAdjBtn(120, 96, 240, 60, active ? "AKTIV" : "AUS",
+             active ? RGB565(60, 210, 100) : RGB565(90, 90, 90));
+  if (g_tuneWantActive != g_tuneModeConfirmed)
+    drawTextCentered(240, 164, "...wartet auf Hub-Bestaetigung", RGB565(220, 160, 60), 1);
+  char buf[16];
+  drawTextCentered(240, 202, "SCHRITTE (bestaetigt)", RGB565(150, 150, 150), 1);
+  snprintf(buf, sizeof(buf), "%+d", (int)g_tuneAdvSteps);
+  drawTextCentered(240, 236, buf, RGB565(235, 235, 225), 6);
+  const uint16_t minus = RGB565(210, 120, 60), plus = RGB565(90, 195, 110);
+  drawAdjBtn(100, 292, 90, 46, "-",     minus);
+  drawAdjBtn(195, 292, 90, 46, "RESET", RGB565(120, 120, 130));
+  drawAdjBtn(290, 292, 90, 46, "+",     plus);
+  if (!g_canReady || g_canListenOnly)
+    drawTextCentered(240, 356, "CAN AUS/LISTEN - kein Senden moeglich", TACH_RED, 1);
+  else if (!canFresh())
+    drawTextCentered(240, 356, "kein CAN-Empfang vom Hub", RGB565(220, 130, 50), 1);
+  drawTextCentered(240, 414, "TIP UNTEN ZURUECK", RGB565(180, 180, 170), 2);
+  presentFrame();
+}
+static void handleTuneTap(uint16_t x, uint16_t y) {
+  if (y >= 398) { currentPage = 5; drawSetupPage(); return; }        // unten -> Setup
+  if (y >= 96 && y < 156) { toggleTuneMode(); drawTunePage(); return; }
+  if (y >= 292 && y < 338) {
+    if      (x < 192) sendTuneCmd(2);   // "-"  Schritt runter
+    else if (x < 288) sendTuneCmd(3);   // RESET
+    else               sendTuneCmd(1);   // "+"  Schritt hoch
+  }
+  drawTunePage();
 }
 
 // ===== On-Screen-Tastatur (Page 10): SSID/Passwort des aktiven Profils tippen =====
@@ -3042,6 +3170,8 @@ static void drawCurrentPage() {
   else if (currentPage == 12) drawScanPage();
   else if (currentPage == 13) drawCanPage();
   else if (currentPage == 14) drawNightAdjustPage();
+  else if (currentPage == 16) drawRpmAdjustPage();
+  else if (currentPage == 17) drawTunePage();
 }
 
 // -------- Preferences --------
@@ -3984,7 +4114,7 @@ static void handleWebPage() {
     int page = webServer.arg("p").toInt();
     // Nur echte Seiten: 8/9 existieren nicht (Display friert ein), 10 (Tastatur)
     // braucht openKeyboard-Kontext, 12 (Scan) einen vorherigen Scan-Lauf.
-    if ((page >= 0 && page <= 7) || page == 11 || page == 13 || page == 14) {
+    if ((page >= 0 && page <= 7) || page == 11 || page == 13 || page == 14 || page == 16 || page == 17) {
       currentPage  = static_cast<uint8_t>(page);
       g_redrawPage = true;
       Serial.printf("Web: page=%u\n", currentPage);
@@ -4253,8 +4383,8 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
   }
   // Zeile aus derselben Tabelle bestimmen, mit der drawSetupPage zeichnet
   int row = -1;
-  for (int i = 0; i < 10; i++)
-    if ((int)y >= SETUP_ROW_Y[i] - 14 && (int)y < SETUP_ROW_Y[i] + 14) { row = i; break; }
+  for (int i = 0; i < 12; i++)
+    if ((int)y >= SETUP_ROW_Y[i] - 11 && (int)y < SETUP_ROW_Y[i] + 11) { row = i; break; }
 
   switch (row) {
     case 0:                             // UHR -> Justage-Seite (Groesse/Rotation fein)
@@ -4280,10 +4410,16 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
       drawSetupPage();
       Serial.printf("setup tap: ble=%s\n", g_featureBle ? "on" : "off");
       break;
-    case 5:                             // CAN -> CAN-Seite (Status + Schalter)
-      currentPage = 13;
-      drawCanPage();
-      Serial.println("setup tap: -> CAN-Seite");
+    case 5:                             // CAN -> CAN-Seite (Status + Schalter); HALTEN -> TUNE
+      if (isLong) {
+        currentPage = 17;
+        drawTunePage();
+        Serial.println("setup hold: -> TUNE-Seite");
+      } else {
+        currentPage = 13;
+        drawCanPage();
+        Serial.println("setup tap: -> CAN-Seite");
+      }
       break;
     case 6:                             // BUZZER an/aus
       saveFeatures(g_featureWifi, g_featureBle, !g_featureBuzzer);
@@ -4303,6 +4439,19 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs, bool isLong) {
       currentPage = 14;
       drawNightAdjustPage();
       Serial.println("setup tap: -> Nacht-Justage");
+      break;
+    case 10: {                          // WARN: Alarme (Lambda/Drehzahl/Temp/Volt) global an/aus
+      g_alertsOn = !g_alertsOn;
+      if (!g_alertsOn) { g_alertMask = 0; g_alertText[0] = 0; }
+      Preferences pw; pw.begin("clock", false); pw.putBool("alerts", g_alertsOn); pw.end();
+      Serial.printf("setup tap: Alarme=%s\n", g_alertsOn ? "an" : "aus");
+      drawSetupPage();
+      break;
+    }
+    case 11:                            // ROT AB -> eigene Justage-Seite (Tacho-Grenzdrehzahl)
+      currentPage = 16;
+      drawRpmAdjustPage();
+      Serial.println("setup tap: -> Tacho-Justage");
       break;
     default:
       drawSetupPage();
@@ -4650,6 +4799,10 @@ void loop() {
         handleCanTap(tapX, tapY);       // CAN-Seite (aktiv/Modus schalten)
       } else if (currentPage == 14) {
         handleNightAdjustTap(tapX, tapY);   // Nacht-Justage (An/Aus + Dimmer)
+      } else if (currentPage == 16) {
+        handleRpmAdjustTap(tapX, tapY);     // Tacho-Justage (Rot-ab-Grenze)
+      } else if (currentPage == 17) {
+        handleTuneTap(tapX, tapY);          // Live-Tuning (Zuendwinkel per CAN)
       } else if (currentPage == 3 && g_lambdaStyle == 1 && tapY < 132) {
         // Verlauf: Tap in den Kopfbereich -> Zeitfenster 60/120/180/300s zyklen
         cycleTrendWindow();
@@ -4840,7 +4993,8 @@ void loop() {
 
   // CAN cockpit tick (0x510)
   cockpitCanTick();
-  imuCanTxTick();     // IMU-Werte auf ID+1 senden (nur im NORMAL/ACK-Modus)
+  imuCanTxTick();     // IMU-Werte auf ID+4 senden (nur im NORMAL/ACK-Modus)
+  tuneCanTick();      // Live-Tuning-Keepalive auf ID+3 (nur wenn g_tuneWantActive)
 
   // HTTP-Poll vom Hub (/api/status)
   httpPollTick();
