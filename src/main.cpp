@@ -2359,7 +2359,7 @@ static void drawMotorPage() {
 #undef M_F
 
 // ===== Lambda-Verlauf (Trend ueber Zeit): Ringpuffer, alle 500ms ein Sample =====
-#define TR_N 600                         // 600 * 500ms = 300 s max. Fenster
+#define TR_N 2400                        // 2400 * 500ms = 1200 s (20 min) max. Fenster
 static uint8_t  g_trLam[TR_N];           // λ*100 (0 = ungueltig/Luecke)
 static uint16_t g_trRpm[TR_N];           // 1/min (Kontextlinie)
 static uint8_t  g_trMap[TR_N];           // Saugrohrdruck kPa (0..250, Kontextlinie)
@@ -2367,7 +2367,7 @@ static uint16_t g_trHead  = 0;           // naechster Schreibindex
 static uint16_t g_trCount = 0;
 static uint8_t  g_lambdaStyle = 0;       // 0 = Gauge, 1 = Verlauf
 // Konfigurierbar (Dev-Tab / Serial / Tap oben auf dem Trend):
-static uint16_t g_trendWindowS = 60;     // sichtbares Fenster in s: 60/120/180/300 (NVS tr_win)
+static uint16_t g_trendWindowS = 60;     // sichtbares Fenster in s: 60/120/180/300/900/1200 (NVS tr_win)
 static bool     g_trendShowMap = false;  // Saugrohrdruck-Linie mit einblenden (NVS tr_map)
 static bool     g_trendShowRpm = true;   // Drehzahl-Kontextlinie zeigen (NVS tr_rpm)
 
@@ -3259,7 +3259,8 @@ static void loadSettings() {
   g_lambdaStyle   = p.getUChar("lstyle", 0);          // 0=Gauge, 1=Verlauf, 2=Live-Tuning
   if (g_lambdaStyle > 2) g_lambdaStyle = 0;
   g_trendWindowS  = p.getUShort("tr_win", 60);        // Lambda-Verlauf: Fensterbreite
-  if (g_trendWindowS != 60 && g_trendWindowS != 120 && g_trendWindowS != 180 && g_trendWindowS != 300) g_trendWindowS = 60;
+  if (g_trendWindowS != 60 && g_trendWindowS != 120 && g_trendWindowS != 180 &&
+      g_trendWindowS != 300 && g_trendWindowS != 900 && g_trendWindowS != 1200) g_trendWindowS = 60;
   g_trendShowMap  = p.getBool("tr_map", false);       // Saugrohrdruck mit anzeigen
   g_trendShowRpm  = p.getBool("tr_rpm", true);        // Drehzahl-Linie zeigen
   g_showCanTemp   = p.getBool("show_ct", true);       // CAN-Status+Abgastemp-Zeile (Motor-Seite)
@@ -3350,7 +3351,8 @@ static void saveLambdaStyle(int s) {       // 0=Gauge, 1=Verlauf, 2=Live-Tuning
 
 // Lambda-Verlauf-Konfig speichern (Fenster/MAP/RPM). win==0 laesst das Fenster unveraendert.
 static void saveTrendCfg(uint16_t win, bool showMap, bool showRpm) {
-  if (win == 60 || win == 120 || win == 180 || win == 300) g_trendWindowS = win;
+  if (win == 60 || win == 120 || win == 180 || win == 300 || win == 900 || win == 1200)
+    g_trendWindowS = win;
   g_trendShowMap = showMap;
   g_trendShowRpm = showRpm;
   Preferences p;
@@ -3360,10 +3362,11 @@ static void saveTrendCfg(uint16_t win, bool showMap, bool showRpm) {
   p.putBool("tr_rpm", g_trendShowRpm);
   p.end();
 }
-// Fenster zyklisch 60->120->180->300->60 (Tap oben auf dem Trend)
+// Fenster zyklisch 60->120->180->300->900->1200->60 (Tap oben auf dem Trend)
 static void cycleTrendWindow() {
   uint16_t next = (g_trendWindowS == 60) ? 120 : (g_trendWindowS == 120) ? 180 :
-                  (g_trendWindowS == 180) ? 300 : 60;
+                  (g_trendWindowS == 180) ? 300 : (g_trendWindowS == 300) ? 900 :
+                  (g_trendWindowS == 900) ? 1200 : 60;
   saveTrendCfg(next, g_trendShowMap, g_trendShowRpm);
 }
 
@@ -3841,8 +3844,8 @@ static void handleWebRoot() {
     "<hr style='border-color:#333'>"
     "<p><b>Lambda-Verlauf</b> &nbsp; Fenster "
     "<select name='trwin' style='padding:6px;border:0;border-radius:6px'>");
-  { const uint16_t ws[4] = { 60, 120, 180, 300 };
-    for (int i = 0; i < 4; i++)
+  { const uint16_t ws[6] = { 60, 120, 180, 300, 900, 1200 };
+    for (int i = 0; i < 6; i++)
       html += "<option value='" + String(ws[i]) + "'" +
               (g_trendWindowS == ws[i] ? " selected" : "") + ">" + String(ws[i]) + "s</option>"; }
   html += F("</select></p>"
@@ -4042,7 +4045,7 @@ static void handleWebSet() {
         if (v >= 1000 && v <= g_rpmScaleMax) { g_rpmRedline = v; p.putInt("rl_rpm", v); } }
       // Lambda-Verlauf (Fenster/MAP/RPM). Checkboxen: fehlt = aus.
       if (webServer.hasArg("trwin")) { int v = webServer.arg("trwin").toInt();
-        if (v == 60 || v == 120 || v == 180 || v == 300) { g_trendWindowS = (uint16_t)v; p.putUShort("tr_win", g_trendWindowS); } }
+        if (v == 60 || v == 120 || v == 180 || v == 300 || v == 900 || v == 1200) { g_trendWindowS = (uint16_t)v; p.putUShort("tr_win", g_trendWindowS); } }
       g_trendShowMap = webServer.hasArg("trmap"); p.putBool("tr_map", g_trendShowMap);
       g_trendShowRpm = webServer.hasArg("trrpm"); p.putBool("tr_rpm", g_trendShowRpm);
       g_showCanTemp  = webServer.hasArg("showct"); p.putBool("show_ct", g_showCanTemp);
@@ -4937,6 +4940,16 @@ void loop() {
         else if (cmd.startsWith("rot:")) { saveRotation(cmd.substring(4).toInt()); g_redrawPage = true; }
         else if (cmd == "clock")   { currentPage = 0; drawVdoClock(); }
         else if (cmd == "reboot")  { Serial.println("Reboot..."); delay(50); ESP.restart(); }
+        else if (cmd == "tune:mode")  { toggleTuneMode(); }
+        else if (cmd == "tune:up")    { sendTuneCmd(1); Serial.println("TUNE: Kommando 1 (Schritt hoch) gesendet"); }
+        else if (cmd == "tune:down")  { sendTuneCmd(2); Serial.println("TUNE: Kommando 2 (Schritt runter) gesendet"); }
+        else if (cmd == "tune:reset") { sendTuneCmd(3); Serial.println("TUNE: Kommando 3 (Reset) gesendet"); }
+        else if (cmd == "tune:ping")  { sendTuneCmd(0); Serial.println("TUNE: Kommando 0 (Ping) gesendet"); }
+        else if (cmd == "tune:status") {
+          Serial.printf("TUNE: want=%d confirmed=%d steps=%d canReady=%d listen=%d canFresh=%d\n",
+                        g_tuneWantActive, g_tuneModeConfirmed, (int)g_tuneAdvSteps,
+                        g_canReady, g_canListenOnly, canFresh());
+        }
         else if (cmd == "can:on" || cmd == "can:off") {
           g_featureCan = (cmd == "can:on");
           Preferences pc; pc.begin("clock", false); pc.putBool("feat_can", g_featureCan); pc.end();
@@ -4998,7 +5011,7 @@ void loop() {
             nightMaskEnsure(); g_redrawPage = true;
             Serial.printf("Nachtmodus-Grundhelligkeit = %d%%\n", v);
           } else Serial.println("night:10..85 (Grundhelligkeit %)"); }
-        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:show | wifi:set <slot> <SSID>|<Pass> | wifi:next|off | wauto:on|off | ap:on | scan | thub:show|on|off | thub:ip <ip> | rot:+|-|NN | clock | motor | style:0..5 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:ping | can:rx | can:normal|listen | lambda:0|1|2 | night:on|off|NN | reboot"); }
+        else { Serial.println("Commands: ble:on|off | 123:on|off | buzzer:on|off | wifi:show | wifi:set <slot> <SSID>|<Pass> | wifi:next|off | wauto:on|off | ap:on | scan | thub:show|on|off | thub:ip <ip> | rot:+|-|NN | clock | motor | style:0..5 | trip:reset | hubtime | hubpull | batt | imu:null | trend:win 60|120|180|300|900|1200 | trend:map on|off | trend:rpm on|off | can:on|off | can:test | can:ping | can:rx | can:normal|listen | lambda:0|1|2 | night:on|off|NN | reboot"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
