@@ -657,7 +657,10 @@ static void applyCockpitCanFrame(const twai_message_t& msg) {
   g_lastSrc     = g_hubLambdaSim ? "SIM" : "CAN";
   // Bit 5 (0x20) = Live-Tuning-Modus gerade aktiv - direkte Antwort auf 0x513-
   // Kommando 4 (Modus umschalten). Siehe sendTuneCmd()/tuneCanTick().
-  g_tuneModeConfirmed = (flags & 0x20) != 0;
+  const bool tuneModeNow = (flags & 0x20) != 0;
+  if (tuneModeNow != g_tuneModeConfirmed)     // nur bei echtem Wechsel loggen (Frame kommt oft/schnell)
+    sdLog(tuneModeNow ? "TUNE aktiv (Hub bestaetigt)" : "TUNE aus (Hub bestaetigt)");
+  g_tuneModeConfirmed = tuneModeNow;
   g_canRx++;
   g_canLastRxMs = millis();
 }
@@ -4305,8 +4308,49 @@ static void startWebServer() {
     webServer.send(200, "text/plain", b);
   });
   webServer.on("/sdwifi", HTTP_POST, handleWebSdWifi);
-  webServer.on("/log", []() {              // ?d=JJJJMMTT waehlt einen Tag, sonst heute
+  webServer.on("/log", []() {              // ?d=JJJJMMTT waehlt einen Tag, ?last=N (default 30 wenn
+                                            // ohne Wert) zeigt nur die letzten N Zeilen tagesuebergreifend
     if (!g_sdMounted) { webServer.send(503, "text/plain", "SD nicht gemountet"); return; }
+    if (webServer.hasArg("last")) {
+      int n = webServer.arg("last").toInt();
+      if (n <= 0) n = 30;                  // Karsten: "min. die letzten 20-30 Logs"
+      if (n > 200) n = 200;                // Heap/Antwortzeit-Grenze
+      String* ring = new String[n];        // zirkulaerer Puffer der letzten n Zeilen
+      int ringLen = 0, ringPos = 0;
+      struct tm today = {};
+      readClockTime(&today);
+      time_t todayEpoch = mktime(&today);
+      const int MAXBACK = 5;               // bis zu 5 Tage rueckwaerts durchsuchen (aelteste zuerst,
+                                            // damit der Ring am Ende in richtiger Zeitreihenfolge steht)
+      for (int back = MAXBACK - 1; back >= 0; back--) {
+        time_t t = todayEpoch - (time_t)back * 86400;
+        struct tm dtm; localtime_r(&t, &dtm);
+        char path[24];
+        snprintf(path, sizeof(path), "/log/%04d%02d%02d.txt", dtm.tm_year + 1900, dtm.tm_mon + 1, dtm.tm_mday);
+        File f = SD_MMC.open(path, FILE_READ);
+        if (!f) continue;
+        char datePfx[12];
+        snprintf(datePfx, sizeof(datePfx), "%02d.%02d. ", dtm.tm_mday, dtm.tm_mon + 1);
+        while (f.available()) {
+          String line = f.readStringUntil('\n');
+          line.trim();
+          if (!line.length()) continue;
+          // Datum voranstellen - eine last=N-Ausgabe kann mehrere Tage umfassen,
+          // die reinen HH:MM:SS-Zeilen (gedacht fuer Einzeltags-Dateien) waeren sonst
+          // ueber Tagesgrenzen hinweg nicht mehr unterscheidbar.
+          ring[ringPos] = String(datePfx) + line;
+          ringPos = (ringPos + 1) % n;
+          if (ringLen < n) ringLen++;
+        }
+        f.close();
+      }
+      String out;
+      int startIdx = (ringLen < n) ? 0 : ringPos;
+      for (int i = 0; i < ringLen; i++) { out += ring[(startIdx + i) % n]; out += '\n'; }
+      delete[] ring;
+      webServer.send(200, "text/plain", out);
+      return;
+    }
     struct tm now = {};
     char path[24];
     if (webServer.hasArg("d") && webServer.arg("d").length() == 8) {
