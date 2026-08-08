@@ -195,6 +195,10 @@ static float     g_imuOffPitch   = 0.0f;   // IMU-Nullung (Einbaulage) - Pitch/R
 static float     g_imuOffRoll    = 0.0f;
 static bool      g_wifiAuto      = true;   // WLAN-Auto-Fallback: S24 > Heim > Hub-AP (verfuegbares Netz)
 static bool      g_apOn          = false;  // Setup-AP aktiv?
+static String    g_apIp          = "192.168.4.1";  // Setup-AP eigene IP (Gateway), NVS ap_ip
+                                          // Echtes DHCP-an/aus fuer den SoftAP bietet die Arduino-
+                                          // WiFi-Klasse nicht - der DHCP-Server laeuft bei aktivem
+                                          // AP immer automatisch mit (ESP-IDF-Verhalten).
 static bool      g_webStarted   = false;
 static bool      g_redrawPage   = false;
 static uint8_t   g_wifiProfile  = 0;
@@ -2886,7 +2890,12 @@ static void drawTunePage() {
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(80, 170, 220));
   drawTextCentered(240, 44, "LIVE-TUNING", RGB565(120, 200, 240), 3);
-  drawTextCentered(240, 76, "ZUENDWINKEL PER CAN", RGB565(140, 140, 140), 1);
+  // Live-RPM + tatsaechlicher Zuendwinkel (von der 123 gemeldet, ueber 0x510) - wichtig
+  // beim Tunen zu sehen, WAS die Zuendbox gerade wirklich macht, nicht nur den Offset.
+  { char hdr[28];
+    if (canFresh()) snprintf(hdr, sizeof(hdr), "%d /min   ZZP %.1f", (int)g_rpm, g_adv);
+    else            snprintf(hdr, sizeof(hdr), "--/min   ZZP --");
+    drawTextCentered(240, 76, hdr, RGB565(200, 200, 210), 2); }
   const bool active = g_tuneModeConfirmed;
   drawAdjBtn(120, 96, 240, 60, active ? "AKTIV" : "AUS",
              active ? RGB565(60, 210, 100) : RGB565(90, 90, 90));
@@ -3243,6 +3252,8 @@ static void loadSettings() {
   g_imuOffPitch   = p.getFloat("imu_off_p", 0.0f);     // IMU-Nullung
   g_imuOffRoll    = p.getFloat("imu_off_r", 0.0f);
   g_wifiAuto      = p.getBool("wifi_auto", true);      // WLAN-Auto-Fallback default AN
+  { char aip[20] = ""; p.getString("ap_ip", aip, sizeof(aip));
+    if (aip[0]) g_apIp = aip; }                          // Setup-AP-IP (Dev-Tab), default 192.168.4.1
   g_canListenOnly = p.getBool("can_listen", true);     // CAN: listen-only default (NORMAL = ACK)
   g_canId         = p.getUShort("can_id", 0x510);      // CAN: Frame-ID (Dev-Tab)
   g_canKbps       = p.getUShort("can_kbps", 500);      // CAN: Bitrate (Dev-Tab)
@@ -3742,6 +3753,14 @@ static void handleWebRoot() {
     "<b>Nachteil:</b> pendelt am Schreibtisch st&auml;ndig Heim&harr;Hub-AP &rarr; kurze "
     "&quot;kein Hub&quot;-Aussetzer. F&uuml;r festen Betrieb an EINEM Netz (z.B. nur Hub-AP im "
     "Bus): <b>AUS</b> und Profil per Setup/WLAN-Tab fest w&auml;hlen.</span></p>"
+    "<p>Eigener Setup-AP (<i>VDO-Clock-Setup</i>), IP: <input name='apip' value='");
+  html += g_apIp;
+  html += F("' style='width:130px;padding:6px;border:0;border-radius:6px'>"
+    "<span class='i' onclick='ih(this)'>i</span>"
+    "<span class='ht'>Feste IP, unter der das Display erreichbar ist, wenn es SELBST den "
+    "Setup-AP aufspannt (kein Hub/Heimnetz in Reichweite oder <b>ap:on</b>/Setup-Zeile). "
+    "Standard <b>192.168.4.1</b>. Ein echtes DHCP-an/aus gibt's dafuer nicht - der DHCP-Server "
+    "fuer verbundene Clients laeuft bei aktivem AP immer automatisch mit.</span></p>"
     "<button type='submit'>Speichern</button></form></div>");
   html += F("<div class='card'><h3>Firmware-Update (OTA)</h3>"
     "<form method='POST' action='/update' enctype='multipart/form-data'>"
@@ -3790,8 +3809,15 @@ static void handleWebRoot() {
     if (SD_MMC.exists("/update.bad"))  html += F(" &middot; update.bad da");
     html += F("</div></div>");
     html += F("<div class='card'><h3>System-Log</h3>"
-      "<div style='color:#888;text-align:left'>Ereignisse (Boot/WLAN/Alarm/OTA) je Tag als "
-      "<b>/log/JJJJMMTT.txt</b>. <a href='/log'>Heutiges Log ansehen</a></div></div>");
+      "<div style='color:#888;text-align:left'>Ereignisse (Boot/WLAN/Alarm/CAN/Tune/OTA) je Tag als "
+      "<b>/log/JJJJMMTT.txt</b>."
+      "<br><a href='/log?last=30'>Letzte 30 Eintr&auml;ge</a> (tages&uuml;bergreifend, mit Datum)"
+      " &middot; <a href='/log'>Heutiges Log</a>"
+      "<br>Bestimmter Tag: <input type='date' id='logday' style='padding:4px;border:0;border-radius:6px'>"
+      " <button type='button' onclick=\"var d=document.getElementById('logday').value.replace(/-/g,'');"
+      "if(d)window.open('/log?d='+d)\">ansehen</button>"
+      "<br><span style='font-size:0.85em'>Zum Speichern: Seite &ouml;ffnen, dann Strg+S "
+      "(PC) bzw. &uuml;ber das Browser-Men&uuml; teilen/sichern (Handy).</span></div></div>");
   } else {
     html += F("<div>Status: <b style='color:#c66'>nicht gemountet</b> &ndash; keine Karte erkannt.</div></div>");
   }
@@ -4131,6 +4157,15 @@ static void handleWebFeatures() {
     g_wifiAuto = wauto;
     Preferences p; p.begin("clock", false); p.putBool("wifi_auto", g_wifiAuto); p.end();
   }
+  if (webServer.hasArg("apip")) {
+    String v = webServer.arg("apip"); v.trim();
+    IPAddress test;
+    if (v.length() && test.fromString(v) && (uint32_t)test != 0 && v != g_apIp) {
+      g_apIp = v;
+      Preferences p; p.begin("clock", false); p.putString("ap_ip", g_apIp); p.end();
+      Serial.printf("Web: Setup-AP-IP = %s (wirkt beim naechsten AP-Start)\n", g_apIp.c_str());
+    }
+  }
   Serial.printf("Web: Funktionen wifi=%s ble=%s buzzer=%s 123=%s can=%s\n",
                 g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off",
                 g_featureBuzzer ? "on" : "off", g_feature123 ? "on" : "off", g_featureCan ? "on" : "off");
@@ -4434,6 +4469,9 @@ static void manageWifiAp() {
     Serial.println("WiFi: STA verbunden -> Setup-AP aus");
   } else if (!conn && !g_apOn && millis() > 15000) {
     WiFi.mode(WIFI_AP_STA);
+    IPAddress apIp; apIp.fromString(g_apIp);              // ungueltiger String -> 0.0.0.0, dann faellt
+    if ((uint32_t)apIp == 0) apIp.fromString("192.168.4.1"); // ESP-IDF auf seinen eigenen Default zurueck
+    WiFi.softAPConfig(apIp, apIp, IPAddress(255, 255, 255, 0));
     WiFi.softAP("VDO-Clock-Setup", "vdoclock");
     g_apOn = true;
     Serial.printf("WiFi: Setup-AP an -> http://%s  (SSID VDO-Clock-Setup / vdoclock)\n",
