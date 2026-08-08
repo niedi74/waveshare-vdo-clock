@@ -68,6 +68,7 @@ static int   g_lambdaStatusCode = -1;   // 0=ERR,1=WAIT,2=HEAT,3=OK, -1=unbekann
 static bool  g_hubLambdaSim = false;    // Hub selbst im lambda_test-Modus (Sonde simuliert statt echt) - NVS-unabhaengig, kommt live vom Hub
 static bool  g_hubCanReady = false;     // Hub<->Spartan-CAN-Bus aktiv (Hub-eigenes "CAN aktiv", NICHT die Display<->Hub-Verbindung)
 static float g_hubExhaustTempC = 0;     // Abgastemperatur an der Lambdasonde (Hub-Feld "temperature")
+static uint32_t g_exhaustTempCanMs = 0; // letzter frischer Empfang ueber 0x514 (Ext3-Frame)
 static bool  g_showCanTemp = true;      // Dev-Tab: CAN-Status+Abgastemp-Zeile ein/aus (NVS show_ct)
 static const char* lambdaStatusText() {
   switch (g_lambdaStatusCode) {
@@ -694,6 +695,22 @@ static void applyCockpitExtFrame(const twai_message_t& msg) {
   g_tuneAdvSteps = (int8_t)msg.data[7];
 }
 
+// Ext3-Frame (ID = g_canId+4, z.B. 0x514) - Abgastemperatur an der Lambdasonde,
+// mit Hub-Team abgestimmt 19.7. (docs/lambda-status-logik.md, "Ext3-Cockpit-Frame"):
+//   [0-1] exhaustTempC_x10 (int16 BE)   [2] flags: Bit0=Fresh   [3-7] reserviert
+// Fresh nutzt dieselbe Frische-Bedingung wie die Lambda-Messung (identisches
+// Spartan-Quellframe) - bei Fresh=0 ist der Wert wie ein ungueltiges Lambda zu
+// behandeln, NICHT als aktuell anzeigen.
+static void applyCockpitExhaustFrame(const twai_message_t& msg) {
+  const int16_t tempX10 = (int16_t)(((uint16_t)msg.data[0] << 8) | msg.data[1]);
+  const uint8_t flags   = msg.data[2];
+  if (flags & 0x01) {
+    g_hubExhaustTempC = tempX10 / 10.0f;
+    g_exhaustTempCanMs = millis();
+  }
+}
+static bool exhaustTempCanFresh() { return g_exhaustTempCanMs != 0 && millis() - g_exhaustTempCanMs < 3000; }
+
 static void cockpitCanTick() {
   if (!g_canReady) return;
   twai_status_info_t st;                          // Treiber wirklich installiert?
@@ -726,6 +743,7 @@ static void cockpitCanTick() {
     if (msg.extd || msg.rtr || msg.data_length_code != 8) { g_canIgnored++; continue; }
     if      (msg.identifier == g_canId)                            applyCockpitCanFrame(msg);
     else if (msg.identifier == (uint32_t)(g_canId + 1) && g_canId < 0x7FE) applyCockpitExtFrame(msg);
+    else if (msg.identifier == (uint32_t)(g_canId + 4) && g_canId < 0x7FB) applyCockpitExhaustFrame(msg);
     else { g_canIgnored++; continue; }
   }
 }
@@ -2305,16 +2323,22 @@ static void drawMotorPage() {
   if (g123) snprintf(buf, sizeof(buf), "%.1f", g_g123Volt); else strcpy(buf, "--");
   drawMiniGauge(M_X(332), M_Y(324), M_R(36), g_g123Volt, 10, 15, "VOLT", buf, RGB565(210, 180, 60), g123, t);
 
-  // CAN-Status + Abgastemp vom Hub (klein, Luecke zwischen TEMP/VOLT-Gauges) - nur
-  // ueber HTTP verfuegbar, das 0x510-CAN-Frame hat dafuer (noch) keinen Platz.
-  if (httpFresh() && g_showCanTemp) {   // Werte kommen NUR ueber HTTP - bei totem WLAN keine stale Temp als aktuell zeigen
+  // CAN-Status + Abgastemp vom Hub (klein, Luecke zwischen TEMP/VOLT-Gauges).
+  // Seit 19.7. auch per CAN verfuegbar (Ext3-Frame 0x514, mit Hub-Team abgestimmt) -
+  // vorher nur HTTP, im Live-Betrieb ohne WLAN waere die Temp sonst nie aktuell.
+  if ((httpFresh() || exhaustTempCanFresh()) && g_showCanTemp) {
     char ct[12];
     // Zweizeilig, direkt unter dem Lambda-Wert (Karsten 16.7.: gehoert zusammen -
-    // CAN-Status + Abgastemp SIND die Lambda-Messkette)
-    drawTextCentered(240, M_Y(280), g_hubCanReady ? "CAN OK" : "CAN --",
-                     g_hubCanReady ? t.txtDim : TACH_RED, M_F(2));
+    // CAN-Status + Abgastemp SIND die Lambda-Messkette). "CAN OK/--" zeigte bisher
+    // g_hubCanReady (Hub<->Spartan, NUR per HTTP) - im Live-Betrieb ohne WLAN stand
+    // da immer "--", obwohl die Temp laengst per CAN aktuell ankam. Zeigt jetzt
+    // stattdessen, ob GENAU DIESER Wert gerade frisch per CAN (0x514) reinkommt -
+    // die fuer diese Zeile tatsaechlich relevante Frage.
+    const bool viaCan = exhaustTempCanFresh();
+    drawTextCentered(240, M_Y(280), viaCan ? "CAN OK" : "CAN --",
+                     viaCan ? t.txtDim : TACH_RED, M_F(2));
     snprintf(ct, sizeof(ct), "%dC", (int)g_hubExhaustTempC);
-    drawTextCentered(240, M_Y(302), ct, g_hubCanReady ? t.txtDim : TACH_RED, M_F(2));
+    drawTextCentered(240, M_Y(302), ct, viaCan ? t.txtDim : TACH_RED, M_F(2));
   }
 
   // Lambda zentral
@@ -3889,7 +3913,7 @@ static void handleWebRoot() {
     "<hr style='border-color:#333'>"
     "<p><label><input type='checkbox' name='showct' value='1' ");
   html += g_showCanTemp ? "checked" : "";
-  html += F("> CAN-Status + Abgastemp auf Motor-Seite (nur ueber HTTP verfuegbar)</label></p>"
+  html += F("> CAN-Status + Abgastemp auf Motor-Seite</label></p>"
     "<hr style='border-color:#333'>"
     "<p><label><input type='checkbox' name='nightm' value='1' ");
   html += g_nightMode ? "checked" : "";
@@ -5033,6 +5057,11 @@ void loop() {
           Serial.printf("TUNE: want=%d confirmed=%d steps=%d canReady=%d listen=%d canFresh=%d\n",
                         g_tuneWantActive, g_tuneModeConfirmed, (int)g_tuneAdvSteps,
                         g_canReady, g_canListenOnly, canFresh());
+        }
+        else if (cmd == "extemp:status") {
+          Serial.printf("EXTEMP: tempC=%.1f canMs=%lu canFresh=%d showCanTemp=%d httpFresh=%d canRx=%lu canIgnored=%lu\n",
+                        g_hubExhaustTempC, (unsigned long)g_exhaustTempCanMs, exhaustTempCanFresh(),
+                        g_showCanTemp, httpFresh(), (unsigned long)g_canRx, (unsigned long)g_canIgnored);
         }
         else if (cmd == "can:on" || cmd == "can:off") {
           g_featureCan = (cmd == "can:on");
