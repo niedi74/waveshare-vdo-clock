@@ -2889,32 +2889,34 @@ static void drawTunePage() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(80, 170, 220));
-  drawTextCentered(240, 44, "LIVE-TUNING", RGB565(120, 200, 240), 3);
+  // Kopfblock (Titel/RPM-ZZP/Kachel) hing zu dicht an der oberen Rundung (Karsten-
+  // Screenshot) - kompletter Block um 16px nach unten verschoben.
+  drawTextCentered(240, 60, "LIVE-TUNING", RGB565(120, 200, 240), 3);
   // Live-RPM + tatsaechlicher Zuendwinkel (von der 123 gemeldet, ueber 0x510) - wichtig
   // beim Tunen zu sehen, WAS die Zuendbox gerade wirklich macht, nicht nur den Offset.
   { char hdr[28];
     if (canFresh()) snprintf(hdr, sizeof(hdr), "%d /min   ZZP %.1f", (int)g_rpm, g_adv);
     else            snprintf(hdr, sizeof(hdr), "--/min   ZZP --");
-    drawTextCentered(240, 76, hdr, RGB565(200, 200, 210), 2); }
+    drawTextCentered(240, 92, hdr, RGB565(200, 200, 210), 2); }
   const bool active = g_tuneModeConfirmed;
-  drawAdjBtn(120, 96, 240, 60, active ? "AKTIV" : "AUS",
+  drawAdjBtn(120, 112, 240, 60, active ? "AKTIV" : "AUS",
              active ? RGB565(60, 210, 100) : RGB565(90, 90, 90));
   // Kein Bit5 trotz Wunsch = Hub hat abgelehnt (kein BLE-Streaming zur 123), nicht
   // nur "wartet" - Hub-Team 19.7.: sendTuneRaw() lehnt sauber ab, Bit5 bleibt 0.
   if (g_tuneWantActive && !g_tuneModeConfirmed)
-    drawTextCentered(240, 164, "abgelehnt - 123 nicht verbunden?", TACH_RED, 1);
+    drawTextCentered(240, 180, "abgelehnt - 123 nicht verbunden?", TACH_RED, 1);
   char buf[16];
-  drawTextCentered(240, 202, "SCHRITTE (bestaetigt, max +-10)", RGB565(150, 150, 150), 1);
+  drawTextCentered(240, 214, "SCHRITTE (bestaetigt, max +-10)", RGB565(150, 150, 150), 1);
   snprintf(buf, sizeof(buf), "%+d", (int)g_tuneAdvSteps);
-  drawTextCentered(240, 236, buf, RGB565(235, 235, 225), 6);
+  drawTextCentered(240, 248, buf, RGB565(235, 235, 225), 6);
   const uint16_t minus = RGB565(210, 120, 60), plus = RGB565(90, 195, 110);
-  drawAdjBtn(100, 292, 90, 46, "-",     minus);
-  drawAdjBtn(195, 292, 90, 46, "RESET", RGB565(120, 120, 130));
-  drawAdjBtn(290, 292, 90, 46, "+",     plus);
+  drawAdjBtn(100, 300, 90, 46, "-",     minus);
+  drawAdjBtn(195, 300, 90, 46, "RESET", RGB565(120, 120, 130));
+  drawAdjBtn(290, 300, 90, 46, "+",     plus);
   if (!g_canReady || g_canListenOnly)
-    drawTextCentered(240, 356, "CAN AUS/LISTEN - kein Senden moeglich", TACH_RED, 1);
+    drawTextCentered(240, 364, "CAN AUS/LISTEN - kein Senden moeglich", TACH_RED, 1);
   else if (!canFresh())
-    drawTextCentered(240, 356, "kein CAN-Empfang vom Hub", RGB565(220, 130, 50), 1);
+    drawTextCentered(240, 364, "kein CAN-Empfang vom Hub", RGB565(220, 130, 50), 1);
   drawTextCentered(240, 414, "LANGER DRUCK MITTE = NAECHSTER STIL", RGB565(120, 120, 120), 1);
   presentFrame();
 }
@@ -2922,8 +2924,8 @@ static void drawTunePage() {
 // currentPage==3-Block im Hauptloop) - andere Taps auf dieser Lambda-Seite blaettern
 // wie gewohnt zur naechsten Datenseite weiter.
 static void handleTuneTap(uint16_t x, uint16_t y) {
-  if (y >= 96 && y < 156) { toggleTuneMode(); }
-  else if (y >= 292 && y < 338) {
+  if (y >= 112 && y < 172) { toggleTuneMode(); }
+  else if (y >= 300 && y < 346) {
     if      (x < 192) sendTuneCmd(2);   // "-"  Schritt runter
     else if (x < 288) sendTuneCmd(3);   // RESET
     else               sendTuneCmd(1);   // "+"  Schritt hoch
@@ -4932,7 +4934,7 @@ void loop() {
       } else if (currentPage == 18) {
         handleSetupPage2Tap(tapY);          // Setup Seite 2 (IMU0/BAT/NACHT/WARN/ROT AB)
       } else if (currentPage == 3 && g_lambdaStyle == 2 &&
-                 ((tapY >= 96 && tapY < 156) || (tapY >= 292 && tapY < 338))) {
+                 ((tapY >= 112 && tapY < 172) || (tapY >= 300 && tapY < 346))) {
         handleTuneTap(tapX, tapY);          // Live-Tuning: nur in den Bedienzonen, sonst Seiten-Weiterblaettern
       } else if (currentPage == 3 && g_lambdaStyle == 1 && tapY < 132) {
         // Verlauf: Tap in den Kopfbereich -> Zeitfenster 60/120/180/300s zyklen
