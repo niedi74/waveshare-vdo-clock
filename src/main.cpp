@@ -3882,7 +3882,7 @@ static void handleWebRoot() {
     "<input name='allmax' type='number' step='0.01' min='0.5' max='1.5' value='");
   html += String(g_alLamMax, 2);
   html += F("' style='width:70px;padding:6px;border:0;border-radius:6px'></p>"
-    "<p>Drehzahl &gt; <input name='alrpm' type='number' min='1000' max='9000' step='100' value='");
+    "<p>Drehzahl &gt; <input name='alrpm' type='number' min='1000' max='9000' step='50' value='");
   html += String(g_alRpmMax);
   html += F("' style='width:80px;padding:6px;border:0;border-radius:6px'> 1/min &nbsp; "
     "Temp &gt; <input name='altemp' type='number' min='40' max='150' value='");
@@ -3892,10 +3892,10 @@ static void handleWebRoot() {
   html += String(g_alVoltMin, 1);
   html += F("' style='width:70px;padding:6px;border:0;border-radius:6px'> V (Motor l&auml;uft)</p>"
     "<hr style='border-color:#333'>"
-    "<p>Tacho: rot ab <input name='rlrpm' type='number' min='1000' max='12000' step='500' value='");
+    "<p>Tacho: rot ab <input name='rlrpm' type='number' min='1000' max='12000' step='50' value='");
   html += String(g_rpmRedline);
   html += F("' style='width:80px;padding:6px;border:0;border-radius:6px'> &nbsp; Skala bis "
-    "<input name='scrpm' type='number' min='3000' max='12000' step='1000' value='");
+    "<input name='scrpm' type='number' min='3000' max='12000' step='50' value='");
   html += String(g_rpmScaleMax);
   html += F("' style='width:80px;padding:6px;border:0;border-radius:6px'> 1/min</p>"
     "<hr style='border-color:#333'>"
