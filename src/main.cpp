@@ -3839,13 +3839,20 @@ static void handleWebRoot() {
     html += F("<div class='card'><h3>System-Log</h3>"
       "<div style='color:#888;text-align:left'>Ereignisse (Boot/WLAN/Alarm/CAN/Tune/OTA) je Tag als "
       "<b>/log/JJJJMMTT.txt</b>."
-      "<br><a href='/log?last=30'>Letzte 30 Eintr&auml;ge</a> (tages&uuml;bergreifend, mit Datum)"
+      "<br>Letzte <input type='number' id='logn' value='30' min='5' max='200' style='width:60px;"
+      "padding:4px;border:0;border-radius:6px'> Eintr&auml;ge (tages&uuml;bergreifend, mit Datum)"
+      " <button type='button' onclick=\"window.open('/log?last='+document.getElementById('logn').value)\">"
+      "ansehen</button>"
+      " <button type='button' onclick=\"window.open('/log?last='+document.getElementById('logn').value+"
+      "'&dl=1')\">herunterladen</button>"
       " &middot; <a href='/log'>Heutiges Log</a>"
       "<br>Bestimmter Tag: <input type='date' id='logday' style='padding:4px;border:0;border-radius:6px'>"
       " <button type='button' onclick=\"var d=document.getElementById('logday').value.replace(/-/g,'');"
       "if(d)window.open('/log?d='+d)\">ansehen</button>"
-      "<br><span style='font-size:0.85em'>Zum Speichern: Seite &ouml;ffnen, dann Strg+S "
-      "(PC) bzw. &uuml;ber das Browser-Men&uuml; teilen/sichern (Handy).</span></div></div>");
+      " <button type='button' onclick=\"var d=document.getElementById('logday').value.replace(/-/g,'');"
+      "if(d)window.open('/log?d='+d+'&dl=1')\">herunterladen</button>"
+      "<br><span style='font-size:0.85em'>&quot;herunterladen&quot; l&ouml;st einen echten Speichern-Dialog "
+      "aus (auch am Handy) &ndash; &quot;ansehen&quot; zeigt es nur im Browser an.</span></div></div>");
   } else {
     html += F("<div>Status: <b style='color:#c66'>nicht gemountet</b> &ndash; keine Karte erkannt.</div></div>");
   }
@@ -4386,6 +4393,10 @@ static void startWebServer() {
   webServer.on("/log", []() {              // ?d=JJJJMMTT waehlt einen Tag, ?last=N (default 30 wenn
                                             // ohne Wert) zeigt nur die letzten N Zeilen tagesuebergreifend
     if (!g_sdMounted) { webServer.send(503, "text/plain", "SD nicht gemountet"); return; }
+    const bool download = webServer.hasArg("dl");   // erzwingt echten Speichern-Dialog (auch am Handy) statt
+                                                      // Inline-Anzeige - reiner text/plain-Content-Type
+                                                      // wird von mobilen Browsern nur angezeigt, nicht angeboten.
+    if (download) webServer.sendHeader("Content-Disposition", "attachment; filename=\"vdo-log.txt\"");
     if (webServer.hasArg("last")) {
       int n = webServer.arg("last").toInt();
       if (n <= 0) n = 30;                  // Karsten: "min. die letzten 20-30 Logs"
