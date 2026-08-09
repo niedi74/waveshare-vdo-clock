@@ -795,9 +795,11 @@ static void runCanPing() {
 
 // IMU-Werte periodisch aufs CAN senden, damit der Hub sie mitloggen kann. Nur im
 // NORMAL-Modus moeglich: TWAI_MODE_LISTEN_ONLY verbietet jede eigene Uebertragung
-// (ESP-IDF-Doku). ID = Cockpit-ID+4 (NICHT +1/+2 - die sind laut Hub-Repo
-// include/hub_can.h als Hub->Display-Ext-Frames belegt, 0x511/0x512; +3 gehoert seit
-// 19.7. dem Live-Tuning-Kommando 0x513, s.u. - IMU deshalb auf +4 verschoben, wandert
+// (ESP-IDF-Doku). ID = Cockpit-ID+5 (NICHT +1/+2/+4 - die sind laut Hub-Team-Liste
+// (8.8.) als Hub->Display-Ext-Frames belegt: 0x511 Ext, 0x512 Ext2, 0x514 Ext3/
+// Abgastemp; +3 gehoert seit 19.7. dem Live-Tuning-Kommando 0x513, s.u. - IMU war
+// zunaechst auf +4 verschoben, das kollidierte aber mit dem neuen Ext3-Frame (beide
+// TX auf derselben ID, echter Bus-Konflikt) - deshalb 8.8. weiter auf +5, wandert
 // automatisch mit, falls g_canId je umgestellt wird). Fire-and-forget (Timeout 0):
 // blockiert den Loop nie.
 static void imuCanTxTick() {
@@ -810,7 +812,7 @@ static void imuCanTxTick() {
   int16_t  rollX10  = (int16_t)lroundf((g_imuRoll  - g_imuOffRoll)  * 10.0f);
   uint16_t gX100    = (uint16_t)constrain((int)lroundf(g_imuGForce * 100.0f), 0, 65535);
   twai_message_t m = {};
-  m.identifier = (g_canId < 0x7FB) ? (uint32_t)(g_canId + 4) : g_canId;
+  m.identifier = (g_canId < 0x7FA) ? (uint32_t)(g_canId + 5) : g_canId;
   m.data_length_code = 6;
   m.data[0] = (uint8_t)(pitchX10 >> 8); m.data[1] = (uint8_t)pitchX10;
   m.data[2] = (uint8_t)(rollX10  >> 8); m.data[3] = (uint8_t)rollX10;
