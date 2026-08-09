@@ -85,6 +85,32 @@ Wenn beides gleichzeitig auftritt = zwei Baustellen, getrennt abarbeiten.
 - **WLAN-Auto**: nur wenn mehrere Netze automatisch gewählt werden sollen; im festen
   Bus-Betrieb aus.
 
+## CAN-ID-Belegung (relativ zur Cockpit-ID, Default 0x510)
+
+Mit dem Hub-Team abgestimmt (8.8.) — bei neuen Frames diese Liste zuerst prüfen,
+bevor eine neue ID vergeben wird (0x514 kollidierte bis 8.8. mit der IMU-TX, siehe
+unten):
+
+| ID (rel.) | Richtung | Frame | Inhalt |
+|---|---|---|---|
+| +0 (0x510) | Hub→Display | Cockpit | Lambda/RPM/Advance/MAP/Flags |
+| +1 (0x511) | Hub→Display | Ext | Volt/Temp/Coil/Speed + Byte7 tune_adv_steps |
+| +2 (0x512) | Hub→Display | Ext2 | Odo/Trip/Motorstunden |
+| +3 (0x513) | Display→Hub | Live-Tune-Kommando | Ping/Up/Down/Reset/Mode-Toggle |
+| +4 (0x514) | Hub→Display | Ext3 | Abgastemperatur |
+| +5 (0x515) | Display→Hub | IMU-Telemetrie | Pitch/Roll/GForce |
+| 0x400 (eigene ID) | Spartan→Hub | Spartan3-Lambda-Frame | nicht am Display sichtbar |
+
+**Historie der ID-Kollisionen (zur Warnung, nicht wiederholen):**
+- 19.7.: IMU-TX lag zunächst auf +3 (0x513), kollidierte mit dem neu eingeführten
+  Live-Tune-Kommando (ebenfalls Display→Hub) → IMU auf +4 verschoben.
+- 8.8.: Neuer Hub→Display-Frame Ext3 (Abgastemperatur) kam ebenfalls auf +4 (0x514)
+  — echte Bus-Kollision mit der IMU-TX (beide TX auf derselben ID), keine reine
+  Verdachtslage. Hub-Team hat die vollständige Liste bestätigt, IMU-TX auf +5
+  (0x515) verschoben (aktuell unbelegt).
+
+Auch im WebGUI sichtbar: Dev-Tab → CAN → Info-Icon neben Bitrate.
+
 ## Schnell-Diagnose per HTTP (wenn Display im WLAN erreichbar)
 
 - `http://<display>/version` → Firmware-Stand, Profil, Feature-Schalter, `canRx`/`httpRx`

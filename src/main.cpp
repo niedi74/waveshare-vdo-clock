@@ -3975,7 +3975,19 @@ static void handleWebRoot() {
               (g_canKbps == rates[i] ? " selected" : "") + ">" + String(rates[i]) + "k</option>";
     }
   }
-  html += F("</select></p>"
+  html += F("</select>"
+    "<span class='i' onclick='ih(this)'>i</span>"
+    "<span class='ht'><b>Belegte CAN-IDs (relativ zur Cockpit-ID oben, Stand 8.8., "
+    "mit Hub-Team abgestimmt):</b><br>"
+    "+0 Cockpit (Hub&rarr;Display): Lambda/RPM/Advance/MAP/Flags<br>"
+    "+1 Ext (Hub&rarr;Display): Volt/Temp/Coil/Speed + Tune-Best&auml;tigung<br>"
+    "+2 Ext2 (Hub&rarr;Display): Odo/Trip/Motorstunden<br>"
+    "+3 Live-Tune-Kommando (Display&rarr;Hub): Ping/Up/Down/Reset/Mode<br>"
+    "+4 Ext3 (Hub&rarr;Display): Abgastemperatur<br>"
+    "+5 IMU-Telemetrie (Display&rarr;Hub): Pitch/Roll/GForce<br>"
+    "0x400 (eigene ID, Spartan&rarr;Hub, nicht Display): Lambda-Frame<br>"
+    "<b>Neue IDs nur au&szlig;erhalb dieser Liste vergeben</b> &ndash; +4 kollidierte "
+    "bis 8.8. mit der IMU (beide TX auf derselben ID), seitdem IMU auf +5.</span></p>"
     "<button type='submit'>Speichern</button></form>"
     "<div style='color:#888;text-align:left'>Auto-Cockpit: ab dieser Drehzahl (Hub/CAN/123) springt "
     "das Display automatisch aufs Motor-Cockpit; Motor aus &rarr; zur&uuml;ck zur Uhr. "
