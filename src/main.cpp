@@ -70,6 +70,9 @@ static bool  g_hubCanReady = false;     // Hub<->Spartan-CAN-Bus aktiv (Hub-eige
 static float g_hubExhaustTempC = 0;     // Abgastemperatur an der Lambdasonde (Hub-Feld "temperature")
 static uint32_t g_exhaustTempCanMs = 0; // letzter frischer Empfang ueber 0x514 (Ext3-Frame)
 static bool  g_showCanTemp = true;      // Dev-Tab: CAN-Status+Abgastemp-Zeile ein/aus (NVS show_ct)
+static bool  g_dataLogOn = false;       // Dev-Tab: CSV-Datenlogger 1x/s ein/aus (NVS datalog), Default AUS -
+                                         // bewusst opt-in, siehe sdLog()-Kommentar zur urspruenglichen
+                                         // Ereignis-only-Entscheidung. Karsten wollte 9.8. Telemetrie wie am Hub.
 static const char* lambdaStatusText() {
   switch (g_lambdaStatusCode) {
     case 0:  return "ERR";
@@ -3306,6 +3309,7 @@ static void loadSettings() {
   g_trendShowMap  = p.getBool("tr_map", false);       // Saugrohrdruck mit anzeigen
   g_trendShowRpm  = p.getBool("tr_rpm", true);        // Drehzahl-Linie zeigen
   g_showCanTemp   = p.getBool("show_ct", true);       // CAN-Status+Abgastemp-Zeile (Motor-Seite)
+  g_dataLogOn     = p.getBool("datalog", false);      // CSV-Datenlogger (Dev-Tab), Default AUS
   g_gearR12       = p.getFloat("gr12", 90.0f);        // Ganganzeige: Grenze 1./2. Gang
   g_gearR23       = p.getFloat("gr23", 46.0f);        // Ganganzeige: Grenze 2./3. Gang
   g_nightMode     = p.getBool("night", false);        // gruene Nachtbeleuchtung
@@ -3526,6 +3530,42 @@ static void sdLog(const char* msg) {
     return;                       // sdLog-Aufruf (z.B. Alarm-Flanke) erneut in SDMMC-Timeouts
   }
   f.printf("%02d:%02d:%02d  %s\n", now.tm_hour, now.tm_min, now.tm_sec, msg);
+  f.close();
+}
+
+// ===== SD-Datenlogger: Telemetrie 1x/s als CSV (opt-in, Dev-Tab) =====
+// Anders als sdLog() oben bewusst KEINE Ereignisse, sondern genau die Werte, die auch
+// /live liefert - Karsten wollte 9.8. "alles im Log haben wie am Hub" (der Hub hat
+// einen eigenen CSV-Logger mit fixen Spalten). Eine Datei pro Tag (/datalog/JJJJMMTT.csv),
+// Header nur beim Neuanlegen. Geo/Hoehe bewusst NICHT dabei - kein GPS-Modul verbaut
+// (Karsten 9.8., "vorerst weglassen").
+static void dataLogTick() {
+  if (!g_dataLogOn || !g_sdMounted) return;
+  static uint32_t at = 0;
+  if ((int32_t)(millis() - at) < 0) return;
+  at = millis() + 1000;
+  struct tm now = {};
+  readClockTime(&now);
+  char path[28];
+  snprintf(path, sizeof(path), "/datalog/%04d%02d%02d.csv",
+           now.tm_year + 1900, now.tm_mon + 1, now.tm_mday);
+  const bool isNew = !SD_MMC.exists(path);
+  File f = SD_MMC.open(path, FILE_APPEND);
+  if (!f) { g_sdMounted = false; return; }   // Karte gezogen - wie sdLog() still abmelden
+  if (isNew) {
+    f.println("Zeit;Quelle;Lambda;RPM;ADV;MAP;Temp;AbgasTemp;Volt;Amp;Speed;Trip;Pitch;Roll;GForce;Alarm");
+  }
+  const bool anyFresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
+  f.printf("%02d:%02d:%02d;%s;%s;%d;%.1f;%d;%d;%d;%.1f;%.1f;%s;%s;%.1f;%.1f;%.2f;%s\n",
+    now.tm_hour, now.tm_min, now.tm_sec,
+    anyFresh ? g_lastSrc : "---",
+    g_lambdaValid ? String(g_lambda, 2).c_str() : "",
+    (int)g_rpm, g_adv, (int)g_map, (int)g_g123Temp, (int)g_hubExhaustTempC,
+    g_g123Volt, g_g123Coil,
+    g_speedValid ? String(g_speedKmh, 1).c_str() : "",
+    g_tripValid  ? String(g_tripKm, 1).c_str()   : "",
+    g_imuPitch, g_imuRoll, g_imuGForce,
+    g_alertMask ? g_alertText : "");
   f.close();
 }
 
@@ -3852,7 +3892,11 @@ static void handleWebRoot() {
       " <button type='button' onclick=\"var d=document.getElementById('logday').value.replace(/-/g,'');"
       "if(d)window.open('/log?d='+d+'&dl=1')\">herunterladen</button>"
       "<br><span style='font-size:0.85em'>&quot;herunterladen&quot; l&ouml;st einen echten Speichern-Dialog "
-      "aus (auch am Handy) &ndash; &quot;ansehen&quot; zeigt es nur im Browser an.</span></div></div>");
+      "aus (auch am Handy) &ndash; &quot;ansehen&quot; zeigt es nur im Browser an.</span></div></div>"
+      "<div class='card'><h3>Datenlogger (CSV)</h3><div style='color:#888;text-align:left'>"
+      "Nur wenn im Dev-Tab aktiviert: Telemetrie 1x/s als <b>/datalog/JJJJMMTT.csv</b>."
+      "<br><a href='/datalog'>Heutige CSV ansehen</a>"
+      " &middot; <a href='/datalog?dl=1'>herunterladen</a></div></div>");
   } else {
     html += F("<div>Status: <b style='color:#c66'>nicht gemountet</b> &ndash; keine Karte erkannt.</div></div>");
   }
@@ -3923,6 +3967,15 @@ static void handleWebRoot() {
     "<p><label><input type='checkbox' name='showct' value='1' ");
   html += g_showCanTemp ? "checked" : "";
   html += F("> CAN-Status + Abgastemp auf Motor-Seite</label></p>"
+    "<hr style='border-color:#333'>"
+    "<p><label><input type='checkbox' name='datalog' value='1' ");
+  html += g_dataLogOn ? "checked" : "";
+  html += F("> <b>Datenlogger</b> (CSV, 1x/s auf SD)</label>"
+    "<span class='i' onclick='ih(this)'>i</span>"
+    "<span class='ht'>Schreibt Lambda/RPM/ADV/MAP/Temp/Abgastemp/Volt/Amp/Speed/Trip/IMU jede "
+    "Sekunde nach <b>/datalog/JJJJMMTT.csv</b> &ndash; wie der CSV-Logger am Hub, nur ohne "
+    "Geo/H&ouml;he (kein GPS verbaut). Kann bei Dauerbetrieb gro&szlig;e Dateien erzeugen, "
+    "deshalb Default AUS.</span></p>"
     "<hr style='border-color:#333'>"
     "<p><label><input type='checkbox' name='nightm' value='1' ");
   html += g_nightMode ? "checked" : "";
@@ -4125,6 +4178,7 @@ static void handleWebSet() {
       g_trendShowMap = webServer.hasArg("trmap"); p.putBool("tr_map", g_trendShowMap);
       g_trendShowRpm = webServer.hasArg("trrpm"); p.putBool("tr_rpm", g_trendShowRpm);
       g_showCanTemp  = webServer.hasArg("showct"); p.putBool("show_ct", g_showCanTemp);
+      g_dataLogOn    = webServer.hasArg("datalog"); p.putBool("datalog", g_dataLogOn);
       g_nightMode = webServer.hasArg("nightm"); p.putBool("night", g_nightMode);
       if (webServer.hasArg("nfloor")) { int v = webServer.arg("nfloor").toInt();
         if (v >= 10 && v <= 85) { g_nightFloorPct = (uint8_t)v; p.putUChar("night_min", g_nightFloorPct); } }
@@ -4450,6 +4504,23 @@ static void startWebServer() {
     webServer.streamFile(f, "text/plain");
     f.close();
   });
+  webServer.on("/datalog", []() {          // CSV-Datenlogger-Datei ansehen/laden. ?d=JJJJMMTT waehlt
+                                            // einen Tag (Default heute), &dl=1 erzwingt Speichern-Dialog.
+    if (!g_sdMounted) { webServer.send(503, "text/plain", "SD nicht gemountet"); return; }
+    struct tm now = {};
+    char path[28];
+    if (webServer.hasArg("d") && webServer.arg("d").length() == 8) {
+      snprintf(path, sizeof(path), "/datalog/%s.csv", webServer.arg("d").c_str());
+    } else {
+      readClockTime(&now);
+      snprintf(path, sizeof(path), "/datalog/%04d%02d%02d.csv", now.tm_year + 1900, now.tm_mon + 1, now.tm_mday);
+    }
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) { webServer.send(404, "text/plain", String(path) + " nicht gefunden"); return; }
+    if (webServer.hasArg("dl")) webServer.sendHeader("Content-Disposition", "attachment; filename=\"vdo-datalog.csv\"");
+    webServer.streamFile(f, "text/csv");
+    f.close();
+  });
   webServer.on("/imu", []() {              // IMU-Werte als JSON - fuer Hub-Polling/Logging
     char j[160];
     if (!g_imuPresent) {
@@ -4715,6 +4786,7 @@ static void setupSdCard() {
   Serial.printf("SD: OK %s %luMB (frei %lluMB)\n", g_sdType, (unsigned long)g_sdSizeMB,
                 (unsigned long long)((SD_MMC.totalBytes() - SD_MMC.usedBytes()) / (1024ULL * 1024ULL)));
   if (!SD_MMC.exists("/log")) SD_MMC.mkdir("/log");
+  if (!SD_MMC.exists("/datalog")) SD_MMC.mkdir("/datalog");
   loadWifiFromSd();
   char bootMsg[64];
   snprintf(bootMsg, sizeof(bootMsg), "BOOT fw=%s git=%s reset=%d", FW_BUILD, GIT_REV, (int)esp_reset_reason());
@@ -5191,8 +5263,9 @@ void loop() {
 
   // CAN cockpit tick (0x510)
   cockpitCanTick();
-  imuCanTxTick();     // IMU-Werte auf ID+4 senden (nur im NORMAL/ACK-Modus)
+  imuCanTxTick();     // IMU-Werte auf ID+5 senden (nur im NORMAL/ACK-Modus)
   tuneCanTick();      // Live-Tuning-Keepalive auf ID+3 (nur wenn g_tuneWantActive)
+  dataLogTick();      // CSV-Datenlogger 1x/s auf SD (Dev-Tab, Default AUS)
 
   // HTTP-Poll vom Hub (/api/status)
   httpPollTick();
