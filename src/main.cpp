@@ -3903,11 +3903,6 @@ static void handleWebRoot() {
             String(g_sdWifiLoaded == -1 ? "Vorlage angelegt" :
                    g_sdWifiLoaded >= 0 ? String(g_sdWifiLoaded) + " Profil(e) geladen" : "keine Datei") +
             "</div></div>";
-    html += F("<div class='card'><h3>Datei-Explorer (SD)</h3>"
-      "<div id='feCur' style='color:#888;font-size:0.85em;margin-bottom:4px'>/</div>"
-      "<div id='feList' style='text-align:left'></div>"
-      "<div style='color:#888;font-size:0.85em;margin-top:4px'>Ordner antippen zum Reinschauen, "
-      "Datei antippen zum Herunterladen.</div></div>");
     html += F("<div class='card'><h3>WLAN per wifi.txt</h3>"
       "<form action='/sdwifi' method='post'>"
       "<textarea name='txt' spellcheck='false' style='width:92%;height:130px;background:#111;color:#eee;"
@@ -3952,6 +3947,13 @@ static void handleWebRoot() {
       "if(d)window.open('/datalog?d='+d)\">ansehen</button>"
       " <button type='button' onclick=\"var d=document.getElementById('dataday').value.replace(/-/g,'');"
       "if(d)window.open('/datalog?d='+d+'&dl=1')\">herunterladen</button></div></div>");
+    html += F("<div class='card'><h3 style='cursor:pointer' onclick='feToggle()'>"
+      "Datei-Explorer (SD) <span id='feArrow' style='float:right'>&#9654;</span></h3>"
+      "<div id='feBody' style='display:none'>"
+      "<div id='feCur' style='color:#888;font-size:0.85em;margin-bottom:4px'>/</div>"
+      "<div id='feList' style='text-align:left'></div>"
+      "<div style='color:#888;font-size:0.85em;margin-top:4px'>Ordner antippen zum Reinschauen, "
+      "Datei antippen zum Herunterladen.</div></div></div>");
   } else {
     html += F("<div>Status: <b style='color:#c66'>nicht gemountet</b> &ndash; keine Karte erkannt.</div></div>");
   }
@@ -4150,8 +4152,10 @@ static void handleWebRoot() {
     "for(var i=0;i<x.length;i++)x[i].className='tab';"
     "document.getElementById('t-'+t).className='tab on';"
     "var y=document.querySelectorAll('.tabbtn');"
-    "for(var i=0;i<y.length;i++)y[i].style.background='';b.style.background='#6c6';"
-    "if(t=='sd'&&document.getElementById('feList'))feLoad('/');}"
+    "for(var i=0;i<y.length;i++)y[i].style.background='';b.style.background='#6c6';}"
+    "function feToggle(){var b=document.getElementById('feBody'),a=document.getElementById('feArrow');"
+    "var open=b.style.display!=='none';b.style.display=open?'none':'block';"
+    "a.innerHTML=open?'&#9654;':'&#9660;';if(!open)feLoad('/');}"
     "function feFmt(n){return n>1048576?(n/1048576).toFixed(1)+' MB':n>1024?(n/1024).toFixed(1)+' KB':n+' B';}"
     "function feLoad(dir){fetch('/files?dir='+encodeURIComponent(dir)).then(function(r){return r.json();})"
     ".then(function(d){if(d.err){document.getElementById('feList').textContent=d.err;return;}"
