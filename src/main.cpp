@@ -3592,18 +3592,22 @@ static void dataLogTick() {
   const bool anyFresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
   char ts[10];
   snprintf(ts, sizeof(ts), "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
+  // Dezimal-Komma statt -Punkt: Excel (deutsche Locale) liest "1.09"/"13.7" in einer
+  // ";"-CSV sonst als Datum (1. September / 13. Juli) statt als Zahl - Karsten 10.8.,
+  // Screenshot zeigte genau das. Komma ist bei ";"-getrennten CSVs der Excel-DE-Standard.
+  auto dec = [](float v, int digits) { String s = String(v, digits); s.replace('.', ','); return s; };
   String row = String(ts) + ";" + (anyFresh ? g_lastSrc : "---");
-  if (g_logColMask & 1)    row += ";" + (g_lambdaValid ? String(g_lambda, 2) : String(""));
+  if (g_logColMask & 1)    row += ";" + (g_lambdaValid ? dec(g_lambda, 2) : String(""));
   if (g_logColMask & 2)    row += ";" + String((int)g_rpm);
-  if (g_logColMask & 4)    row += ";" + String(g_adv, 1);
+  if (g_logColMask & 4)    row += ";" + dec(g_adv, 1);
   if (g_logColMask & 8)    row += ";" + String((int)g_map);
   if (g_logColMask & 16)   row += ";" + String((int)g_g123Temp);
   if (g_logColMask & 32)   row += ";" + String((int)g_hubExhaustTempC);
-  if (g_logColMask & 64)   row += ";" + String(g_g123Volt, 1);
-  if (g_logColMask & 128)  row += ";" + String(g_g123Coil, 1);
-  if (g_logColMask & 256)  row += ";" + (g_speedValid ? String(g_speedKmh, 1) : String(""));
-  if (g_logColMask & 512)  row += ";" + (g_tripValid  ? String(g_tripKm, 1)   : String(""));
-  if (g_logColMask & 1024) row += ";" + String(g_imuPitch, 1) + ";" + String(g_imuRoll, 1) + ";" + String(g_imuGForce, 2);
+  if (g_logColMask & 64)   row += ";" + dec(g_g123Volt, 1);
+  if (g_logColMask & 128)  row += ";" + dec(g_g123Coil, 1);
+  if (g_logColMask & 256)  row += ";" + (g_speedValid ? dec(g_speedKmh, 1) : String(""));
+  if (g_logColMask & 512)  row += ";" + (g_tripValid  ? dec(g_tripKm, 1)   : String(""));
+  if (g_logColMask & 1024) row += ";" + dec(g_imuPitch, 1) + ";" + dec(g_imuRoll, 1) + ";" + dec(g_imuGForce, 2);
   row += ";"; row += (g_alertMask ? g_alertText : "");
   f.println(row);
   f.close();
@@ -3934,9 +3938,15 @@ static void handleWebRoot() {
       "<br><span style='font-size:0.85em'>&quot;herunterladen&quot; l&ouml;st einen echten Speichern-Dialog "
       "aus (auch am Handy) &ndash; &quot;ansehen&quot; zeigt es nur im Browser an.</span></div></div>"
       "<div class='card'><h3>Datenlogger (CSV)</h3><div style='color:#888;text-align:left'>"
-      "Nur wenn im Dev-Tab aktiviert: Telemetrie 1x/s als <b>/datalog/JJJJMMTT.csv</b>."
+      "Nur wenn im Dev-Tab aktiviert: Telemetrie 1x/s als <b>/datalog/JJJJMMTT.csv</b>. "
+      "Dezimaltrennzeichen Komma (Excel-DE liest sonst Zahlen als Datum)."
       "<br><a href='/datalog'>Heutige CSV ansehen</a>"
-      " &middot; <a href='/datalog?dl=1'>herunterladen</a></div></div>");
+      " &middot; <a href='/datalog?dl=1'>herunterladen</a>"
+      "<br>Bestimmter Tag: <input type='date' id='dataday' style='padding:4px;border:0;border-radius:6px'>"
+      " <button type='button' onclick=\"var d=document.getElementById('dataday').value.replace(/-/g,'');"
+      "if(d)window.open('/datalog?d='+d)\">ansehen</button>"
+      " <button type='button' onclick=\"var d=document.getElementById('dataday').value.replace(/-/g,'');"
+      "if(d)window.open('/datalog?d='+d+'&dl=1')\">herunterladen</button></div></div>");
   } else {
     html += F("<div>Status: <b style='color:#c66'>nicht gemountet</b> &ndash; keine Karte erkannt.</div></div>");
   }
