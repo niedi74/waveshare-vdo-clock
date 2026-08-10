@@ -3953,7 +3953,15 @@ static void handleWebRoot() {
       "<div id='feCur' style='color:#888;font-size:0.85em;margin-bottom:4px'>/</div>"
       "<div id='feList' style='text-align:left'></div>"
       "<div style='color:#888;font-size:0.85em;margin-top:4px'>Ordner antippen zum Reinschauen, "
-      "Datei antippen zum Herunterladen.</div></div></div>");
+      "Datei antippen zum Herunterladen."
+      "<br><br><b>F&uuml;r eigene Sync-Skripte</b> (z.B. Synology-Aufgabenplaner, curl/wget) "
+      "&ndash; keine Extra-Freigabe (FTP/SMB/WebDAV) n&ouml;tig, die normale HTTP-API reicht:"
+      "<br><code>GET /files?dir=/pfad</code> &rarr; JSON-Verzeichnisliste (Name, Ordner-Flag, Gr&ouml;&szlig;e)"
+      "<br><code>GET /raw?f=/pfad/datei&amp;dl=1</code> &rarr; Rohdatei zum Download"
+      "<br>Beispiel: <code>curl \"http://");
+    html += String(g_ipStr);
+    html += F("/raw?f=/datalog/20260810.csv\" -o heute.csv</code>"
+      "</div></div></div>");
   } else {
     html += F("<div>Status: <b style='color:#c66'>nicht gemountet</b> &ndash; keine Karte erkannt.</div></div>");
   }
