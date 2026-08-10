@@ -3903,6 +3903,11 @@ static void handleWebRoot() {
             String(g_sdWifiLoaded == -1 ? "Vorlage angelegt" :
                    g_sdWifiLoaded >= 0 ? String(g_sdWifiLoaded) + " Profil(e) geladen" : "keine Datei") +
             "</div></div>";
+    html += F("<div class='card'><h3>Datei-Explorer (SD)</h3>"
+      "<div id='feCur' style='color:#888;font-size:0.85em;margin-bottom:4px'>/</div>"
+      "<div id='feList' style='text-align:left'></div>"
+      "<div style='color:#888;font-size:0.85em;margin-top:4px'>Ordner antippen zum Reinschauen, "
+      "Datei antippen zum Herunterladen.</div></div>");
     html += F("<div class='card'><h3>WLAN per wifi.txt</h3>"
       "<form action='/sdwifi' method='post'>"
       "<textarea name='txt' spellcheck='false' style='width:92%;height:130px;background:#111;color:#eee;"
@@ -4145,7 +4150,23 @@ static void handleWebRoot() {
     "for(var i=0;i<x.length;i++)x[i].className='tab';"
     "document.getElementById('t-'+t).className='tab on';"
     "var y=document.querySelectorAll('.tabbtn');"
-    "for(var i=0;i<y.length;i++)y[i].style.background='';b.style.background='#6c6';}"
+    "for(var i=0;i<y.length;i++)y[i].style.background='';b.style.background='#6c6';"
+    "if(t=='sd'&&document.getElementById('feList'))feLoad('/');}"
+    "function feFmt(n){return n>1048576?(n/1048576).toFixed(1)+' MB':n>1024?(n/1024).toFixed(1)+' KB':n+' B';}"
+    "function feLoad(dir){fetch('/files?dir='+encodeURIComponent(dir)).then(function(r){return r.json();})"
+    ".then(function(d){if(d.err){document.getElementById('feList').textContent=d.err;return;}"
+    "document.getElementById('feCur').textContent=d.dir;"
+    "var h='';"
+    "if(d.dir!=='/'){var up=d.dir.substring(0,d.dir.lastIndexOf('/',d.dir.length-2)+1)||'/';"
+    "h+=\"<div style='padding:4px 0;cursor:pointer;color:#6cf' onclick=\\\"feLoad('\"+up+\"')\\\">.. (hoch)</div>\";}"
+    "d.entries.sort(function(a,b){return (b.dir-a.dir)||a.name.localeCompare(b.name);});"
+    "for(var i=0;i<d.entries.length;i++){var e=d.entries[i];"
+    "var p=(d.dir==='/'?'':d.dir)+'/'+e.name;"
+    "if(e.dir){h+=\"<div style='padding:4px 0;cursor:pointer;color:#6cf' onclick=\\\"feLoad('\"+p+\"')\\\">\\uD83D\\uDCC1 \"+e.name+\"</div>\";}"
+    "else{h+=\"<div style='padding:4px 0'><a href='/raw?f=\"+encodeURIComponent(p)+\"&dl=1'>\\uD83D\\uDCC4 \"+e.name+\"</a>"
+    "<span style='color:#888;font-size:0.85em'> (\"+feFmt(e.size)+\")</span></div>\";}}"
+    "document.getElementById('feList').innerHTML=h||'<span style=\"color:#888\">leer</span>';"
+    "}).catch(function(){document.getElementById('feList').textContent='Fehler beim Laden';});}"
     "window.addEventListener('load',function(){var b=document.getElementById('b-live');if(b)b.style.background='#6c6';});"
     "function drawScreen(){var c=document.getElementById('scr');if(!c)return;"
     "fetch('/screen?t='+Date.now()).then(function(r){return r.arrayBuffer();}).then(function(ab){"
@@ -4622,6 +4643,43 @@ static void startWebServer() {
     if (!f) { webServer.send(404, "text/plain", String(path) + " nicht gefunden"); return; }
     if (webServer.hasArg("dl")) webServer.sendHeader("Content-Disposition", "attachment; filename=\"vdo-datalog.csv\"");
     webServer.streamFile(f, "text/csv");
+    f.close();
+  });
+  webServer.on("/files", []() {            // Datei-Explorer (SD): ?dir=/pfad listet ein Verzeichnis als JSON
+    if (!g_sdMounted) { webServer.send(503, "application/json", "{\"err\":\"SD nicht gemountet\"}"); return; }
+    String dir = webServer.hasArg("dir") ? webServer.arg("dir") : "/";
+    if (!dir.length() || dir[0] != '/') dir = "/";
+    File d = SD_MMC.open(dir);
+    if (!d || !d.isDirectory()) { webServer.send(404, "application/json", "{\"err\":\"kein Verzeichnis\"}"); return; }
+    String j = "{\"dir\":\"" + htmlEscape(dir) + "\",\"entries\":[";
+    bool first = true;
+    File e = d.openNextFile();
+    while (e) {
+      if (!first) j += ",";
+      first = false;
+      String name = e.name();                       // liefert bei dieser Lib schon den vollen Pfad
+      int slash = name.lastIndexOf('/');
+      String base = slash >= 0 ? name.substring(slash + 1) : name;
+      j += "{\"name\":\"" + htmlEscape(base) + "\",\"dir\":" + (e.isDirectory() ? "true" : "false") +
+           ",\"size\":" + String((unsigned long)e.size()) + "}";
+      e.close();
+      e = d.openNextFile();
+    }
+    d.close();
+    j += "]}";
+    webServer.send(200, "application/json", j);
+  });
+  webServer.on("/raw", []() {              // Datei-Explorer (SD): rohen Dateiinhalt laden/downloaden (?f=/pfad, &dl=1)
+    if (!g_sdMounted) { webServer.send(503, "text/plain", "SD nicht gemountet"); return; }
+    if (!webServer.hasArg("f")) { webServer.send(400, "text/plain", "f fehlt"); return; }
+    String path = webServer.arg("f");
+    if (!path.length() || path[0] != '/') { webServer.send(400, "text/plain", "ungueltiger Pfad"); return; }
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f || f.isDirectory()) { webServer.send(404, "text/plain", path + " nicht gefunden"); return; }
+    int slash = path.lastIndexOf('/');
+    String base = slash >= 0 ? path.substring(slash + 1) : path;
+    if (webServer.hasArg("dl")) webServer.sendHeader("Content-Disposition", "attachment; filename=\"" + base + "\"");
+    webServer.streamFile(f, "application/octet-stream");
     f.close();
   });
   webServer.on("/imu", []() {              // IMU-Werte als JSON - fuer Hub-Polling/Logging
