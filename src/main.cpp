@@ -73,6 +73,14 @@ static bool  g_showCanTemp = true;      // Dev-Tab: CAN-Status+Abgastemp-Zeile e
 static bool  g_dataLogOn = false;       // Dev-Tab: CSV-Datenlogger 1x/s ein/aus (NVS datalog), Default AUS -
                                          // bewusst opt-in, siehe sdLog()-Kommentar zur urspruenglichen
                                          // Ereignis-only-Entscheidung. Karsten wollte 9.8. Telemetrie wie am Hub.
+// Event-Log-Kategorie-Filter (Dev-Tab, Bits 1=BOOT 2=WIFI 4=ALARM 8=CAN 16=TUNE 32=OTA),
+// Default alle an (NVS log_cat). Erkennung in sdLog() ueber das Praefix der Nachricht -
+// die Aufrufer schreiben ohnehin konsistent "BOOT ...", "WIFI ...", "ALARM ...", "CAN ...",
+// "TUNE ...", "OTA...". Nachrichten ohne eines dieser Praefixe (TRIP/HUB-ZEIT) laufen
+// unkategorisiert immer durch - kein Filter-Kaestchen dafuer, sind selten und klein.
+static uint8_t g_logCatMask = 0x3F;
+// CSV-Datenlogger-Spalten (Dev-Tab, Bits siehe dataLogTick()), Default alle an (NVS log_col).
+static uint16_t g_logColMask = 0xFFFF;
 static const char* lambdaStatusText() {
   switch (g_lambdaStatusCode) {
     case 0:  return "ERR";
@@ -3310,6 +3318,8 @@ static void loadSettings() {
   g_trendShowRpm  = p.getBool("tr_rpm", true);        // Drehzahl-Linie zeigen
   g_showCanTemp   = p.getBool("show_ct", true);       // CAN-Status+Abgastemp-Zeile (Motor-Seite)
   g_dataLogOn     = p.getBool("datalog", false);      // CSV-Datenlogger (Dev-Tab), Default AUS
+  g_logCatMask    = (uint8_t)p.getUChar("log_cat", 0x3F);   // Event-Log-Kategorien, Default alle an
+  g_logColMask    = p.getUShort("log_col", 0xFFFF);         // Datenlogger-Spalten, Default alle an
   g_gearR12       = p.getFloat("gr12", 90.0f);        // Ganganzeige: Grenze 1./2. Gang
   g_gearR23       = p.getFloat("gr23", 46.0f);        // Ganganzeige: Grenze 2./3. Gang
   g_nightMode     = p.getBool("night", false);        // gruene Nachtbeleuchtung
@@ -3519,6 +3529,14 @@ static String sdReadWifiTxt() {
 // eigentlichen Betrieb nie stoeren, auch nicht durch g_sdMounted=false-Flapping.
 static void sdLog(const char* msg) {
   if (!g_sdMounted) return;
+  uint8_t cat = 0;
+  if      (!strncmp(msg, "BOOT",  4)) cat = 1;
+  else if (!strncmp(msg, "WIFI",  4)) cat = 2;
+  else if (!strncmp(msg, "ALARM", 5)) cat = 4;
+  else if (!strncmp(msg, "CAN",   3)) cat = 8;
+  else if (!strncmp(msg, "TUNE",  4)) cat = 16;
+  else if (!strncmp(msg, "OTA",   3)) cat = 32;
+  if (cat && !(g_logCatMask & cat)) return;   // Kategorie im Dev-Tab abgewaehlt
   struct tm now = {};
   readClockTime(&now);
   char path[24];
@@ -3552,20 +3570,42 @@ static void dataLogTick() {
   const bool isNew = !SD_MMC.exists(path);
   File f = SD_MMC.open(path, FILE_APPEND);
   if (!f) { g_sdMounted = false; return; }   // Karte gezogen - wie sdLog() still abmelden
+  // Spalten laut g_logColMask (Dev-Tab) - Zeit/Quelle/Alarm immer dabei, Rest waehlbar.
+  // Aendern der Auswahl mitten am Tag laesst Header und spaetere Zeilen auseinanderlaufen
+  // (wie am Hub) - im WebGUI entsprechend vermerkt, kein automatischer Dateiwechsel hier.
   if (isNew) {
-    f.println("Zeit;Quelle;Lambda;RPM;ADV;MAP;Temp;AbgasTemp;Volt;Amp;Speed;Trip;Pitch;Roll;GForce;Alarm");
+    String h = "Zeit;Quelle";
+    if (g_logColMask & 1)    h += ";Lambda";
+    if (g_logColMask & 2)    h += ";RPM";
+    if (g_logColMask & 4)    h += ";ADV";
+    if (g_logColMask & 8)    h += ";MAP";
+    if (g_logColMask & 16)   h += ";Temp";
+    if (g_logColMask & 32)   h += ";AbgasTemp";
+    if (g_logColMask & 64)   h += ";Volt";
+    if (g_logColMask & 128)  h += ";Amp";
+    if (g_logColMask & 256)  h += ";Speed";
+    if (g_logColMask & 512)  h += ";Trip";
+    if (g_logColMask & 1024) h += ";Pitch;Roll;GForce";
+    h += ";Alarm";
+    f.println(h);
   }
   const bool anyFresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
-  f.printf("%02d:%02d:%02d;%s;%s;%d;%.1f;%d;%d;%d;%.1f;%.1f;%s;%s;%.1f;%.1f;%.2f;%s\n",
-    now.tm_hour, now.tm_min, now.tm_sec,
-    anyFresh ? g_lastSrc : "---",
-    g_lambdaValid ? String(g_lambda, 2).c_str() : "",
-    (int)g_rpm, g_adv, (int)g_map, (int)g_g123Temp, (int)g_hubExhaustTempC,
-    g_g123Volt, g_g123Coil,
-    g_speedValid ? String(g_speedKmh, 1).c_str() : "",
-    g_tripValid  ? String(g_tripKm, 1).c_str()   : "",
-    g_imuPitch, g_imuRoll, g_imuGForce,
-    g_alertMask ? g_alertText : "");
+  char ts[10];
+  snprintf(ts, sizeof(ts), "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
+  String row = String(ts) + ";" + (anyFresh ? g_lastSrc : "---");
+  if (g_logColMask & 1)    row += ";" + (g_lambdaValid ? String(g_lambda, 2) : String(""));
+  if (g_logColMask & 2)    row += ";" + String((int)g_rpm);
+  if (g_logColMask & 4)    row += ";" + String(g_adv, 1);
+  if (g_logColMask & 8)    row += ";" + String((int)g_map);
+  if (g_logColMask & 16)   row += ";" + String((int)g_g123Temp);
+  if (g_logColMask & 32)   row += ";" + String((int)g_hubExhaustTempC);
+  if (g_logColMask & 64)   row += ";" + String(g_g123Volt, 1);
+  if (g_logColMask & 128)  row += ";" + String(g_g123Coil, 1);
+  if (g_logColMask & 256)  row += ";" + (g_speedValid ? String(g_speedKmh, 1) : String(""));
+  if (g_logColMask & 512)  row += ";" + (g_tripValid  ? String(g_tripKm, 1)   : String(""));
+  if (g_logColMask & 1024) row += ";" + String(g_imuPitch, 1) + ";" + String(g_imuRoll, 1) + ";" + String(g_imuGForce, 2);
+  row += ";"; row += (g_alertMask ? g_alertText : "");
+  f.println(row);
   f.close();
 }
 
@@ -3976,6 +4016,34 @@ static void handleWebRoot() {
     "Sekunde nach <b>/datalog/JJJJMMTT.csv</b> &ndash; wie der CSV-Logger am Hub, nur ohne "
     "Geo/H&ouml;he (kein GPS verbaut). Kann bei Dauerbetrieb gro&szlig;e Dateien erzeugen, "
     "deshalb Default AUS.</span></p>"
+    "<div style='font-size:0.9em;color:#ccc'>Spalten: ");
+  {
+    struct { uint16_t bit; const char* arg; const char* lbl; } cols[] = {
+      {1,"dc_lam","Lambda"},{2,"dc_rpm","RPM"},{4,"dc_adv","ADV"},{8,"dc_map","MAP"},
+      {16,"dc_temp","Temp"},{32,"dc_extmp","Abgastemp"},{64,"dc_volt","Volt"},{128,"dc_amp","Amp"},
+      {256,"dc_speed","Speed"},{512,"dc_trip","Trip"},{1024,"dc_imu","IMU"}
+    };
+    for (auto& c : cols) {
+      html += "<label style='margin-right:8px'><input type='checkbox' name='" + String(c.arg) + "' value='1' " +
+              ((g_logColMask & c.bit) ? "checked" : "") + "> " + c.lbl + "</label>";
+    }
+  }
+  html += F("<br><span style='font-size:0.85em'>Zeit/Quelle/Alarm immer dabei. &Auml;ndern mitten am Tag "
+    "l&auml;sst Header und Zeilen der laufenden CSV auseinanderlaufen (wie am Hub) - wirkt sauber "
+    "erst ab der n&auml;chsten Tagesdatei.</span></div>"
+    "<hr style='border-color:#333'>"
+    "<p><b>System-Log</b> (/log) - Kategorien: ");
+  {
+    struct { uint8_t bit; const char* arg; const char* lbl; } cats[] = {
+      {1,"lc_boot","Boot"},{2,"lc_wifi","WLAN"},{4,"lc_alarm","Alarm"},
+      {8,"lc_can","CAN"},{16,"lc_tune","Tune"},{32,"lc_ota","OTA"}
+    };
+    for (auto& c : cats) {
+      html += "<label style='margin-right:8px'><input type='checkbox' name='" + String(c.arg) + "' value='1' " +
+              ((g_logCatMask & c.bit) ? "checked" : "") + "> " + c.lbl + "</label>";
+    }
+  }
+  html += F("</p>"
     "<hr style='border-color:#333'>"
     "<p><label><input type='checkbox' name='nightm' value='1' ");
   html += g_nightMode ? "checked" : "";
@@ -4179,6 +4247,31 @@ static void handleWebSet() {
       g_trendShowRpm = webServer.hasArg("trrpm"); p.putBool("tr_rpm", g_trendShowRpm);
       g_showCanTemp  = webServer.hasArg("showct"); p.putBool("show_ct", g_showCanTemp);
       g_dataLogOn    = webServer.hasArg("datalog"); p.putBool("datalog", g_dataLogOn);
+      { // Event-Log-Kategorien (Bits 1=BOOT 2=WIFI 4=ALARM 8=CAN 16=TUNE 32=OTA)
+        uint8_t lc = 0;
+        if (webServer.hasArg("lc_boot"))  lc |= 1;
+        if (webServer.hasArg("lc_wifi"))  lc |= 2;
+        if (webServer.hasArg("lc_alarm")) lc |= 4;
+        if (webServer.hasArg("lc_can"))   lc |= 8;
+        if (webServer.hasArg("lc_tune"))  lc |= 16;
+        if (webServer.hasArg("lc_ota"))   lc |= 32;
+        g_logCatMask = lc; p.putUChar("log_cat", lc);
+      }
+      { // Datenlogger-Spalten (Bits siehe dataLogTick())
+        uint16_t lo = 0;
+        if (webServer.hasArg("dc_lam"))   lo |= 1;
+        if (webServer.hasArg("dc_rpm"))   lo |= 2;
+        if (webServer.hasArg("dc_adv"))   lo |= 4;
+        if (webServer.hasArg("dc_map"))   lo |= 8;
+        if (webServer.hasArg("dc_temp"))  lo |= 16;
+        if (webServer.hasArg("dc_extmp")) lo |= 32;
+        if (webServer.hasArg("dc_volt"))  lo |= 64;
+        if (webServer.hasArg("dc_amp"))   lo |= 128;
+        if (webServer.hasArg("dc_speed")) lo |= 256;
+        if (webServer.hasArg("dc_trip"))  lo |= 512;
+        if (webServer.hasArg("dc_imu"))   lo |= 1024;
+        g_logColMask = lo; p.putUShort("log_col", lo);
+      }
       g_nightMode = webServer.hasArg("nightm"); p.putBool("night", g_nightMode);
       if (webServer.hasArg("nfloor")) { int v = webServer.arg("nfloor").toInt();
         if (v >= 10 && v <= 85) { g_nightFloorPct = (uint8_t)v; p.putUChar("night_min", g_nightFloorPct); } }
