@@ -4151,7 +4151,19 @@ static void handleWebRoot() {
     "<br><b>Alarme:</b> bei Verletzung blinkt auf jeder Seite ein roter Ring + Grund oben; "
     "Buzzer piept alle 2s (wenn Buzzer-Feature an). &lambda;-Band gilt nur bei laufendem Motor "
     "und f&auml;rbt auch das gr&uuml;ne Band im Lambda-Verlauf."
-    "<br><b>Tacho:</b> roter Bereich + Skalenende wirken auf alle Kombi-Stile.</div></div></div>");
+    "<br><b>Tacho:</b> roter Bereich + Skalenende wirken auf alle Kombi-Stile.</div></div>");
+  html += F("<div class='card'><h3>HTTP-API (Kurz&uuml;bersicht)</h3>"
+    "<div style='color:#888;text-align:left;font-size:0.9em'>"
+    "<code>/version</code> Ger&auml;te-/Feature-Status (JSON)<br>"
+    "<code>/live</code> aktuelle Cockpitwerte, 1x/s (JSON)<br>"
+    "<code>/imu</code> IMU Pitch/Roll/GForce (JSON)<br>"
+    "<code>/screen</code> 160x160 Screenshot (roh, RGB565)<br>"
+    "<code>/log?last=N|d=JJJJMMTT&amp;dl=1</code> Event-Log (Text)<br>"
+    "<code>/datalog?d=JJJJMMTT&amp;dl=1</code> CSV-Datenlogger<br>"
+    "<code>/files?dir=/pfad</code> SD-Verzeichnisliste (JSON)<br>"
+    "<code>/raw?f=/pfad&amp;dl=1</code> SD-Rohdatei"
+    "<br><span style='font-size:0.85em'>Alle GET, kein Login. <code>&amp;dl=1</code> erzwingt "
+    "Download-Header statt Inline-Anzeige.</span></div></div></div>");
 
   html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p>"
     "<script>function ih(e){var d=e.nextElementSibling;"
