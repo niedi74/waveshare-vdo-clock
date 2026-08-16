@@ -3591,6 +3591,34 @@ static String sdReadWifiTxt() {
   f.close();
   return s;
 }
+// Bestaetigt, dass ein Schreibvorgang tatsaechlich auf der Karte gelandet ist - ein
+// SD-Bus-Timeout (16.8., ESP-IDF meldete "sdmmc_send_cmd 0x107" auf einer sterbenden
+// Karte) laesst SD_MMC.open()/print() sonst klaglos "erfolgreich" aussehen, obwohl NICHTS
+// geschrieben wurde - Log/Datenlogger liefen damals tagelang unbemerkt leer mit. Reopnet
+// die Datei read-only und vergleicht die tatsaechliche Groesse mit dem erwarteten Stand
+// (Groesse vor dem Schreiben + Bytes, die geschrieben werden sollten). Nach 3 Fehlschlaegen
+// in Folge wird die Karte wie ein fehlgeschlagenes open() behandelt (g_sdMounted=false,
+// erst ein Neustart versucht es wieder) und der Datenlogger sicherheitshalber abgeschaltet.
+static uint8_t g_sdWriteFails = 0;
+static bool sdVerifyWrite(const char* path, size_t expectSize, const char* where) {
+  File chk = SD_MMC.open(path, FILE_READ);
+  size_t got = chk ? chk.size() : 0;
+  if (chk) chk.close();
+  if (got == expectSize) { g_sdWriteFails = 0; return true; }
+  g_sdWriteFails++;
+  Serial.printf("SD-Schreibfehler (%s): erwartet %u Bytes, echt %u, Serie=%u\n",
+                where, (unsigned)expectSize, (unsigned)got, g_sdWriteFails);
+  if (g_sdWriteFails >= 3) {
+    g_sdMounted = false;
+    if (g_dataLogOn) {
+      g_dataLogOn = false;
+      Preferences p; p.begin("clock", false); p.putBool("datalog", false); p.end();
+    }
+    Serial.println("SD wiederholt fehlgeschlagen - als nicht gemountet markiert, Datenlogger aus");
+  }
+  return false;
+}
+
 // ===== SD-Systemlog: Ereignisse (Boot/WLAN/Alarm/OTA) fuer spaetere Auswertung =====
 // Eine Datei pro Tag (/log/YYYYMMDD.txt), Zeile "HH:MM:SS  Ereignis". Bewusst nur
 // Ereignisse (Kanten), keine Telemetrie - Lambda/RPM jede Sekunde waere Datenflut
@@ -3616,8 +3644,12 @@ static void sdLog(const char* msg) {
     g_sdMounted = false;          // wie sdSyncWifiTxt abmelden, sonst rennt jeder weitere
     return;                       // sdLog-Aufruf (z.B. Alarm-Flanke) erneut in SDMMC-Timeouts
   }
-  f.printf("%02d:%02d:%02d  %s\n", now.tm_hour, now.tm_min, now.tm_sec, msg);
+  size_t before = f.position();   // FILE_APPEND positioniert schon auf die bisherige Groesse
+  char line[80];
+  int n = snprintf(line, sizeof(line), "%02d:%02d:%02d  %s\n", now.tm_hour, now.tm_min, now.tm_sec, msg);
+  f.print(line);
   f.close();
+  if (n > 0) sdVerifyWrite(path, before + (size_t)n, "log");
 }
 
 // ===== SD-Datenlogger: Telemetrie 1x/s als CSV (opt-in, Dev-Tab) =====
@@ -3626,11 +3658,38 @@ static void sdLog(const char* msg) {
 // einen eigenen CSV-Logger mit fixen Spalten). Eine Datei pro Tag (/datalog/JJJJMMTT.csv),
 // Header nur beim Neuanlegen. Geo/Hoehe bewusst NICHT dabei - kein GPS-Modul verbaut
 // (Karsten 9.8., "vorerst weglassen").
-static void dataLogTick() {
-  if (!g_dataLogOn || !g_sdMounted) return;
-  static uint32_t at = 0;
-  if ((int32_t)(millis() - at) < 0) return;
-  at = millis() + 1000;
+//
+// 16.8.: Nach tagelangem Dauerbetrieb auf dem Schreibtisch ist eine SD-Karte am
+// Test-Board kaputtgegangen (SDMMC-Bus-Timeout) - vermutlich durch die schiere Menge an
+// Schreibzyklen (1x/s, jede Sekunde eigenes open/write/close). Drei Gegenmassnahmen:
+// (1) Zeilen werden erst im RAM gesammelt und nur alle DATALOG_FLUSH_MS am Stueck
+//     geschrieben - deutlich weniger SD-Schreibzyklen als vorher.
+// (2) Ohne jede lebende Datenquelle (Hub/CAN/BLE/123 alle tot, z.B. Test-Hub aus am
+//     Schreibtisch) wird gar nichts gepuffert - nichts Sinnvolles zu loggen.
+// (3) sdVerifyWrite() erkennt einen lautlos fehlgeschlagenen Flush und schaltet nach
+//     3 Fehlschlagen in Folge automatisch ab, statt tagelang leer weiterzulaufen.
+#define DATALOG_FLUSH_MS 20000
+static String   g_dataLogBuf;
+static uint32_t g_dataLogFlushAt = 0;
+static String dataLogHeader() {
+  String h = "Zeit;Quelle";
+  if (g_logColMask & 1)    h += ";Lambda";
+  if (g_logColMask & 2)    h += ";RPM";
+  if (g_logColMask & 4)    h += ";ADV";
+  if (g_logColMask & 8)    h += ";MAP";
+  if (g_logColMask & 16)   h += ";Temp";
+  if (g_logColMask & 32)   h += ";AbgasTemp";
+  if (g_logColMask & 64)   h += ";Volt";
+  if (g_logColMask & 128)  h += ";Amp";
+  if (g_logColMask & 256)  h += ";Speed";
+  if (g_logColMask & 512)  h += ";Trip";
+  if (g_logColMask & 1024) h += ";Pitch;Roll;GForce";
+  h += ";Alarm\n";
+  return h;
+}
+static void dataLogFlush() {
+  if (!g_dataLogBuf.length()) return;             // nichts zu tun -> kein unnoetiger SD-Zugriff
+  if (!g_sdMounted) { g_dataLogBuf = ""; return; }
   struct tm now = {};
   readClockTime(&now);
   char path[28];
@@ -3638,48 +3697,48 @@ static void dataLogTick() {
            now.tm_year + 1900, now.tm_mon + 1, now.tm_mday);
   const bool isNew = !SD_MMC.exists(path);
   File f = SD_MMC.open(path, FILE_APPEND);
-  if (!f) { g_sdMounted = false; return; }   // Karte gezogen - wie sdLog() still abmelden
-  // Spalten laut g_logColMask (Dev-Tab) - Zeit/Quelle/Alarm immer dabei, Rest waehlbar.
-  // Aendern der Auswahl mitten am Tag laesst Header und spaetere Zeilen auseinanderlaufen
-  // (wie am Hub) - im WebGUI entsprechend vermerkt, kein automatischer Dateiwechsel hier.
-  if (isNew) {
-    String h = "Zeit;Quelle";
-    if (g_logColMask & 1)    h += ";Lambda";
-    if (g_logColMask & 2)    h += ";RPM";
-    if (g_logColMask & 4)    h += ";ADV";
-    if (g_logColMask & 8)    h += ";MAP";
-    if (g_logColMask & 16)   h += ";Temp";
-    if (g_logColMask & 32)   h += ";AbgasTemp";
-    if (g_logColMask & 64)   h += ";Volt";
-    if (g_logColMask & 128)  h += ";Amp";
-    if (g_logColMask & 256)  h += ";Speed";
-    if (g_logColMask & 512)  h += ";Trip";
-    if (g_logColMask & 1024) h += ";Pitch;Roll;GForce";
-    h += ";Alarm";
-    f.println(h);
-  }
-  const bool anyFresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
-  char ts[10];
-  snprintf(ts, sizeof(ts), "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
-  // Dezimal-Komma statt -Punkt: Excel (deutsche Locale) liest "1.09"/"13.7" in einer
-  // ";"-CSV sonst als Datum (1. September / 13. Juli) statt als Zahl - Karsten 10.8.,
-  // Screenshot zeigte genau das. Komma ist bei ";"-getrennten CSVs der Excel-DE-Standard.
-  auto dec = [](float v, int digits) { String s = String(v, digits); s.replace('.', ','); return s; };
-  String row = String(ts) + ";" + (anyFresh ? g_lastSrc : "---");
-  if (g_logColMask & 1)    row += ";" + (g_lambdaValid ? dec(g_lambda, 2) : String(""));
-  if (g_logColMask & 2)    row += ";" + String((int)g_rpm);
-  if (g_logColMask & 4)    row += ";" + dec(g_adv, 1);
-  if (g_logColMask & 8)    row += ";" + String((int)g_map);
-  if (g_logColMask & 16)   row += ";" + String((int)g_g123Temp);
-  if (g_logColMask & 32)   row += ";" + String((int)g_hubExhaustTempC);
-  if (g_logColMask & 64)   row += ";" + dec(g_g123Volt, 1);
-  if (g_logColMask & 128)  row += ";" + dec(g_g123Coil, 1);
-  if (g_logColMask & 256)  row += ";" + (g_speedValid ? dec(g_speedKmh, 1) : String(""));
-  if (g_logColMask & 512)  row += ";" + (g_tripValid  ? dec(g_tripKm, 1)   : String(""));
-  if (g_logColMask & 1024) row += ";" + dec(g_imuPitch, 1) + ";" + dec(g_imuRoll, 1) + ";" + dec(g_imuGForce, 2);
-  row += ";"; row += (g_alertMask ? g_alertText : "");
-  f.println(row);
+  if (!f) { g_sdMounted = false; g_dataLogBuf = ""; return; }
+  size_t before = f.position();
+  String out = isNew ? dataLogHeader() + g_dataLogBuf : g_dataLogBuf;
+  f.print(out);
   f.close();
+  sdVerifyWrite(path, before + out.length(), "datalog");
+  g_dataLogBuf = "";
+}
+static void dataLogTick() {
+  if (!g_dataLogOn || !g_sdMounted) return;
+  static uint32_t at = 0;
+  if ((int32_t)(millis() - at) >= 0) {
+    at = millis() + 1000;
+    const bool anyFresh = bleFresh() || canFresh() || httpFresh() || tune123Fresh();
+    if (anyFresh) {   // ohne lebende Quelle nichts puffern (Schreibtisch-Idle, Test-Hub aus)
+      struct tm now = {};
+      readClockTime(&now);
+      char ts[10];
+      snprintf(ts, sizeof(ts), "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
+      // Dezimal-Komma statt -Punkt: Excel (deutsche Locale) liest "1.09"/"13.7" in einer
+      // ";"-CSV sonst als Datum (1. September / 13. Juli) statt als Zahl - Karsten 10.8.
+      auto dec = [](float v, int digits) { String s = String(v, digits); s.replace('.', ','); return s; };
+      String row = String(ts) + ";" + g_lastSrc;
+      if (g_logColMask & 1)    row += ";" + (g_lambdaValid ? dec(g_lambda, 2) : String(""));
+      if (g_logColMask & 2)    row += ";" + String((int)g_rpm);
+      if (g_logColMask & 4)    row += ";" + dec(g_adv, 1);
+      if (g_logColMask & 8)    row += ";" + String((int)g_map);
+      if (g_logColMask & 16)   row += ";" + String((int)g_g123Temp);
+      if (g_logColMask & 32)   row += ";" + String((int)g_hubExhaustTempC);
+      if (g_logColMask & 64)   row += ";" + dec(g_g123Volt, 1);
+      if (g_logColMask & 128)  row += ";" + dec(g_g123Coil, 1);
+      if (g_logColMask & 256)  row += ";" + (g_speedValid ? dec(g_speedKmh, 1) : String(""));
+      if (g_logColMask & 512)  row += ";" + (g_tripValid  ? dec(g_tripKm, 1)   : String(""));
+      if (g_logColMask & 1024) row += ";" + dec(g_imuPitch, 1) + ";" + dec(g_imuRoll, 1) + ";" + dec(g_imuGForce, 2);
+      row += ";"; row += (g_alertMask ? g_alertText : ""); row += "\n";
+      g_dataLogBuf += row;
+    }
+  }
+  if ((int32_t)(millis() - g_dataLogFlushAt) >= 0) {
+    dataLogFlush();
+    g_dataLogFlushAt = millis() + DATALOG_FLUSH_MS;
+  }
 }
 
 // Aktuelle Profile -> /wifi.txt spiegeln. Ohne das ueberschreibt eine alte SD-Datei
@@ -4128,10 +4187,13 @@ static void handleWebRoot() {
   html += g_dataLogOn ? "checked" : "";
   html += F("> <b>Datenlogger</b> (CSV, 1x/s auf SD)</label>"
     "<span class='i' onclick='ih(this)'>i</span>"
-    "<span class='ht'>Schreibt Lambda/RPM/ADV/MAP/Temp/Abgastemp/Volt/Amp/Speed/Trip/IMU jede "
-    "Sekunde nach <b>/datalog/JJJJMMTT.csv</b> &ndash; wie der CSV-Logger am Hub, nur ohne "
-    "Geo/H&ouml;he (kein GPS verbaut). Kann bei Dauerbetrieb gro&szlig;e Dateien erzeugen, "
-    "deshalb Default AUS.</span></p>"
+    "<span class='ht'>Sammelt Lambda/RPM/ADV/MAP/Temp/Abgastemp/Volt/Amp/Speed/Trip/IMU jede "
+    "Sekunde und schreibt alle 20s gesammelt nach <b>/datalog/JJJJMMTT.csv</b> &ndash; wie der "
+    "CSV-Logger am Hub, nur ohne Geo/H&ouml;he (kein GPS verbaut). Bei Stromausfall gehen "
+    "max. 20s ungespeichert verloren. Ohne lebende Datenquelle (Hub/CAN/BLE/123 alle tot) "
+    "wird nichts gesammelt - kein sinnloses Dauerschreiben im Leerlauf auf dem Schreibtisch. "
+    "Nach wiederholtem SD-Schreibfehler schaltet sich der Logger automatisch ab (16.8.: eine "
+    "Testkarte ist an Dauerlast kaputtgegangen).</span></p>"
     "<div style='font-size:0.9em;color:#ccc'>Spalten: ");
   {
     struct { uint16_t bit; const char* arg; const char* lbl; } cols[] = {
