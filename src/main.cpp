@@ -182,6 +182,15 @@ static bool      g_autoCockpit    = true;  // Drehzahl > Schwelle -> automatisch
 static int       g_autoCockpitRpm = 600;   // Schwelle, per WebGUI variabel einstellbar
 static bool      g_testHub        = false; // Dev: Daten vom Test-Hub (feste IP) statt Profil-Hub; Quelle heisst dann "TEST"
 static char      g_testHubIp[40]  = "192.168.0.87";  // Test-Hub im Heimnetz, per Dev-Tab einstellbar
+// ---- Vergaser-Kenndaten (Karsten 13.8., Solex PDSIT am T2b) - reine Referenzwerte,
+// keine Funktion beeinflusst sie. Editierbar per WebGUI (System-Tab) UND am Touchscreen
+// (Setup 2 -> VERGASER), damit unterwegs ohne WLAN nachtragbar. Typ/Venturi bewusst nur
+// im WebGUI aenderbar (Freitext), HD/LDK/LLD auch per Touch (+/-1, siehe drawCarbPage()).
+static char      g_carbType[24]   = "Solex PDSIT";
+static int       g_carbVenturi    = 32;    // mm
+static int       g_carbHD         = 142;   // Hauptduese
+static int       g_carbLDK        = 90;    // Leerlauf-Luftduese/-korrekturduese
+static int       g_carbLLD        = 63;
 // ---- Alarme (Grenzwerte per Dev-Tab, NVS-persistent). Bei Verletzung blinkt auf
 // ---- JEDER Seite ein roter Ring (Overlay in presentFrame) + optional Buzzer-Piep.
 static bool      g_alertsOn  = true;       // Alarme global an/aus
@@ -2625,8 +2634,8 @@ static void drawSetupPage() {
   presentFrame();
 }
 
-// Seite 2 (Page 18): 0=IMU0 1=BAT/USB 2=NACHT 3=WARN 4=ROT AB
-static const int SETUP2_ROW_Y[5] = { 120, 176, 232, 288, 344 };
+// Seite 2 (Page 18): 0=IMU0 1=BAT/USB 2=NACHT 3=WARN 4=ROT AB 5=VERGASER
+static const int SETUP2_ROW_Y[6] = { 112, 158, 204, 250, 296, 342 };
 static void drawSetupPage2() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
@@ -2658,6 +2667,9 @@ static void drawSetupPage2() {
   // ROT AB: Tacho-Grenzdrehzahl fuer den roten Bereich -> eigene Justage-Seite
   snprintf(buf, sizeof(buf), "%d /min", g_rpmRedline);
   drawDataRow(SETUP2_ROW_Y[4], "ROT AB", buf, RGB565(235, 235, 225));
+  // VERGASER: HD/LDK/LLD -> eigene Seite (Page 19), TIP springt hin
+  snprintf(buf, sizeof(buf), "%d/%d/%d", g_carbHD, g_carbLDK, g_carbLLD);
+  drawDataRow(SETUP2_ROW_Y[5], "VERGASER", buf, RGB565(200, 170, 90));
   drawTextCentered(240, 402, "TIP UNTEN ZURUECK", RGB565(180, 180, 170), 2);
   presentFrame();
 }
@@ -2911,6 +2923,56 @@ static void handleRpmAdjustTap(uint16_t x, uint16_t y) {
   if (y >= 398) { currentPage = 18; drawSetupPage2(); return; }      // unten -> Setup Seite 2
   if (y >= 280 && y < 326) saveRpmRedline(g_rpmRedline + (x >= 240 ? 100 : -100));
   drawRpmAdjustPage();
+}
+
+// Vergaser-Seite (Page 19): HD/LDK/LLD am Touchscreen nachtragbar (unterwegs, ohne WLAN).
+// Typ/Venturi bewusst nur im WebGUI aenderbar (Freitext, selten geaendert). Reine
+// Referenzwerte ohne Funktionseinfluss - Karsten 13.8.
+static void saveCarbJet(char which, int v) {
+  if (v < 30) v = 30;
+  if (v > 300) v = 300;   // grosszuegiger Rahmen, deckt uebliche Duesen-Groessen ab
+  int* target = (which == 'H') ? &g_carbHD : (which == 'D') ? &g_carbLDK : &g_carbLLD;
+  if (*target == v) return;
+  *target = v;
+  const char* key = (which == 'H') ? "carb_hd" : (which == 'D') ? "carb_ldk" : "carb_lld";
+  Preferences p; p.begin("clock", false); p.putInt(key, v); p.end();
+  char msg[40];
+  snprintf(msg, sizeof(msg), "VERGASER %s=%d",
+           which == 'H' ? "HD" : which == 'D' ? "LDK" : "LLD", v);
+  sdLog(msg);
+}
+static void drawCarbPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
+  drawTextCentered(240, 46, "VERGASER", RGB565(230, 190, 70), 4);
+  { char sub[32]; snprintf(sub, sizeof(sub), "%s - %d MM", g_carbType, g_carbVenturi);
+    drawTextCentered(240, 84, sub, RGB565(140, 140, 140), 1); }
+  const uint16_t minus = RGB565(210, 120, 60), plus = RGB565(90, 195, 110);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "HD  %d", g_carbHD);
+  drawTextCentered(150, 138, buf, RGB565(235, 235, 225), 3);
+  drawAdjBtn(290, 118, 55, 40, "-", minus);
+  drawAdjBtn(355, 118, 55, 40, "+", plus);
+  snprintf(buf, sizeof(buf), "LDK %d", g_carbLDK);
+  drawTextCentered(150, 238, buf, RGB565(235, 235, 225), 3);
+  drawAdjBtn(290, 218, 55, 40, "-", minus);
+  drawAdjBtn(355, 218, 55, 40, "+", plus);
+  snprintf(buf, sizeof(buf), "LLD %d", g_carbLLD);
+  drawTextCentered(150, 338, buf, RGB565(235, 235, 225), 3);
+  drawAdjBtn(290, 318, 55, 40, "-", minus);
+  drawAdjBtn(355, 318, 55, 40, "+", plus);
+  drawTextCentered(240, 414, "TIP UNTEN ZURUECK", RGB565(180, 180, 170), 2);
+  presentFrame();
+}
+static void handleCarbTap(uint16_t x, uint16_t y) {
+  if (y >= 398) { currentPage = 18; drawSetupPage2(); return; }      // unten -> Setup Seite 2
+  const bool plus = (x >= 355);
+  const bool btnCol = (x >= 290 && x < 410);
+  if (btnCol && y >= 118 && y < 158) saveCarbJet('H', g_carbHD  + (plus ? 1 : -1));
+  else if (btnCol && y >= 218 && y < 258) saveCarbJet('D', g_carbLDK + (plus ? 1 : -1));
+  else if (btnCol && y >= 318 && y < 358) saveCarbJet('L', g_carbLLD + (plus ? 1 : -1));
+  drawCarbPage();
 }
 
 // Live-Tuning-Seite (Page 17): Zuendwinkel der 123ignition per CAN live verstellen.
@@ -3244,6 +3306,7 @@ static void drawCurrentPage() {
   else if (currentPage == 13) drawCanPage();
   else if (currentPage == 14) drawNightAdjustPage();
   else if (currentPage == 16) drawRpmAdjustPage();
+  else if (currentPage == 19) drawCarbPage();
 }
 
 // -------- Preferences --------
@@ -3318,6 +3381,12 @@ static void loadSettings() {
   g_trendShowRpm  = p.getBool("tr_rpm", true);        // Drehzahl-Linie zeigen
   g_showCanTemp   = p.getBool("show_ct", true);       // CAN-Status+Abgastemp-Zeile (Motor-Seite)
   g_dataLogOn     = p.getBool("datalog", false);      // CSV-Datenlogger (Dev-Tab), Default AUS
+  { String cty = p.getString("carb_typ", g_carbType);
+    if (cty.length() && cty.length() < sizeof(g_carbType)) strcpy(g_carbType, cty.c_str()); }
+  g_carbVenturi   = p.getInt("carb_ven", g_carbVenturi);
+  g_carbHD        = p.getInt("carb_hd",  g_carbHD);
+  g_carbLDK       = p.getInt("carb_ldk", g_carbLDK);
+  g_carbLLD       = p.getInt("carb_lld", g_carbLLD);
   g_logCatMask    = (uint8_t)p.getUChar("log_cat", 0x3F);   // Event-Log-Kategorien, Default alle an
   g_logColMask    = p.getUShort("log_col", 0xFFFF);         // Datenlogger-Spalten, Default alle an
   g_gearR12       = p.getFloat("gr12", 90.0f);        // Ganganzeige: Grenze 1./2. Gang
@@ -3874,6 +3943,28 @@ static void handleWebRoot() {
     "Standard <b>192.168.4.1</b>. Ein echtes DHCP-an/aus gibt's dafuer nicht - der DHCP-Server "
     "fuer verbundene Clients laeuft bei aktivem AP immer automatisch mit.</span></p>"
     "<button type='submit'>Speichern</button></form></div>");
+  html += F("<div class='card'><h3>Vergaser-Kenndaten</h3>"
+    "<form action='/set' method='get'><input type='hidden' name='carbsave' value='1'>"
+    "<p>Typ: <input name='carbtyp' value='");
+  html += htmlEscape(g_carbType);
+  html += F("' style='width:150px;padding:6px;border:0;border-radius:6px'> &nbsp; Venturi "
+    "<input name='carbven' type='number' min='10' max='60' value='");
+  html += String(g_carbVenturi);
+  html += F("' style='width:60px;padding:6px;border:0;border-radius:6px'> mm</p>"
+    "<p>HD <input name='carbhd' type='number' min='30' max='300' value='");
+  html += String(g_carbHD);
+  html += F("' style='width:70px;padding:6px;border:0;border-radius:6px'> &nbsp; LDK "
+    "<input name='carbldk' type='number' min='30' max='300' value='");
+  html += String(g_carbLDK);
+  html += F("' style='width:70px;padding:6px;border:0;border-radius:6px'> &nbsp; LLD "
+    "<input name='carblld' type='number' min='30' max='300' value='");
+  html += String(g_carbLLD);
+  html += F("' style='width:70px;padding:6px;border:0;border-radius:6px'></p>"
+    "<button type='submit'>Speichern</button></form>"
+    "<div style='color:#888;font-size:0.85em;text-align:left;margin-top:6px'>Reine Referenzwerte "
+    "(keine Funktion), auch am Touchscreen editierbar (Setup 2 &rarr; VERGASER, nur HD/LDK/LLD). "
+    "Bei Vergaserwechsel (z.B. Weber, mehr Einstellm&ouml;glichkeiten) auch "
+    "<code>docs/VERGASER.md</code> aktualisieren.</div></div>");
   html += F("<div class='card'><h3>Firmware-Update (OTA)</h3>"
     "<form method='POST' action='/update' enctype='multipart/form-data'>"
     "<input type='file' name='firmware' accept='.bin' style='width:88%;margin:6px'><br>"
@@ -4256,6 +4347,32 @@ static void handleWebSet() {
   if (webServer.hasArg("imunull")) {
     saveImuNull();
     g_redrawPage = true;
+  }
+  if (webServer.hasArg("carbsave")) {                // Vergaser-Kenndaten (System-Tab, reine Referenz)
+    Preferences p; p.begin("clock", false);
+    bool changed = false;
+    if (webServer.hasArg("carbtyp")) {
+      String v = webServer.arg("carbtyp"); v.trim();
+      if (v.length() && v.length() < sizeof(g_carbType) && v != g_carbType) {
+        strcpy(g_carbType, v.c_str()); p.putString("carb_typ", v); changed = true;
+      }
+    }
+    if (webServer.hasArg("carbven")) { int v = webServer.arg("carbven").toInt();
+      if (v >= 10 && v <= 60 && v != g_carbVenturi) { g_carbVenturi = v; p.putInt("carb_ven", v); changed = true; } }
+    if (webServer.hasArg("carbhd"))  { int v = webServer.arg("carbhd").toInt();
+      if (v >= 30 && v <= 300 && v != g_carbHD)  { g_carbHD  = v; p.putInt("carb_hd",  v); changed = true; } }
+    if (webServer.hasArg("carbldk")) { int v = webServer.arg("carbldk").toInt();
+      if (v >= 30 && v <= 300 && v != g_carbLDK) { g_carbLDK = v; p.putInt("carb_ldk", v); changed = true; } }
+    if (webServer.hasArg("carblld")) { int v = webServer.arg("carblld").toInt();
+      if (v >= 30 && v <= 300 && v != g_carbLLD) { g_carbLLD = v; p.putInt("carb_lld", v); changed = true; } }
+    p.end();
+    if (changed) {
+      char msg[64];
+      snprintf(msg, sizeof(msg), "VERGASER %s %dmm HD=%d LDK=%d LLD=%d",
+               g_carbType, g_carbVenturi, g_carbHD, g_carbLDK, g_carbLLD);
+      sdLog(msg);
+      Serial.printf("Web: %s\n", msg);
+    }
   }
   if (webServer.hasArg("devsave")) {                 // Dev-Tab: Auto-Cockpit + Test-Hub
     bool ac = webServer.hasArg("acock");
@@ -4856,7 +4973,7 @@ static void handleSetupPage2Tap(uint16_t y) {
     return;
   }
   int row = -1;
-  for (int i = 0; i < 5; i++)
+  for (int i = 0; i < 6; i++)
     if ((int)y >= SETUP2_ROW_Y[i] - 22 && (int)y < SETUP2_ROW_Y[i] + 22) { row = i; break; }
 
   switch (row) {
@@ -4886,6 +5003,11 @@ static void handleSetupPage2Tap(uint16_t y) {
       currentPage = 16;
       drawRpmAdjustPage();
       Serial.println("setup2 tap: -> Tacho-Justage");
+      break;
+    case 5:                             // VERGASER -> eigene Seite (HD/LDK/LLD)
+      currentPage = 19;
+      drawCarbPage();
+      Serial.println("setup2 tap: -> Vergaser");
       break;
     default:
       drawSetupPage2();
@@ -5238,7 +5360,9 @@ void loop() {
       } else if (currentPage == 16) {
         handleRpmAdjustTap(tapX, tapY);     // Tacho-Justage (Rot-ab-Grenze)
       } else if (currentPage == 18) {
-        handleSetupPage2Tap(tapY);          // Setup Seite 2 (IMU0/BAT/NACHT/WARN/ROT AB)
+        handleSetupPage2Tap(tapY);          // Setup Seite 2 (IMU0/BAT/NACHT/WARN/ROT AB/VERGASER)
+      } else if (currentPage == 19) {
+        handleCarbTap(tapX, tapY);          // Vergaser-Seite (HD/LDK/LLD)
       } else if (currentPage == 3 && g_lambdaStyle == 2 &&
                  ((tapY >= 112 && tapY < 172) || (tapY >= 300 && tapY < 346))) {
         handleTuneTap(tapX, tapY);          // Live-Tuning: nur in den Bedienzonen, sonst Seiten-Weiterblaettern
